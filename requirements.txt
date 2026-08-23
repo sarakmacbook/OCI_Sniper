@@ -1,0 +1,5 @@
+Flask==3.0.3
+oci==2.134.0
+requests==2.32.3
+Werkzeug==3.0.3
+gunicorn==23.0.0

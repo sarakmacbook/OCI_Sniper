@@ -1,0 +1,1537 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OCI Sniper v5</title>
+    <style>
+        :root {
+            --bg: #0f0f12;
+            --surface: #1a1a1f;
+            --surface-raised: #222228;
+            --border: #2a2a32;
+            --text: #e8e8ec;
+            --text-secondary: #a0a0a8;
+            --text-muted: #6a6a72;
+            --accent: #6366f1;
+            --accent-dim: #4f46e5;
+            --positive: #22c55e;
+            --danger: #ef4444;
+            --warning: #f59e0b;
+            --radius-sm: 6px;
+            --radius-md: 10px;
+            --radius-lg: 12px;
+            --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            --font-mono: "SF Mono", Monaco, "Cascadia Code", "Roboto Mono", Consolas, monospace;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: var(--font-sans);
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.5;
+            padding: 20px;
+            min-height: 100vh;
+        }
+        .container { max-width: 680px; margin: 0 auto; }
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 20px;
+        }
+        .header h1 { font-size: 22px; font-weight: 600; letter-spacing: -0.3px; }
+        .header p { font-size: 13px; color: var(--text-muted); margin-top: 2px; }
+        .status-badge {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 500;
+            border: 1px solid;
+            transition: all 0.2s ease;
+        }
+        .status-badge.stopped {
+            background: rgba(239, 68, 68, 0.08);
+            border-color: rgba(239, 68, 68, 0.2);
+            color: var(--danger);
+        }
+        .status-badge.running {
+            background: rgba(34, 197, 94, 0.08);
+            border-color: rgba(34, 197, 94, 0.2);
+            color: var(--positive);
+        }
+        .status-dot {
+            width: 7px; height: 7px; border-radius: 50%;
+            display: inline-block;
+        }
+        .status-dot.running {
+            background: var(--positive);
+            box-shadow: 0 0 8px rgba(34, 197, 94, 0.5);
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+        .panel {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            margin-bottom: 14px;
+            overflow: hidden;
+        }
+        .panel-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 14px 16px;
+            cursor: pointer;
+            background: none;
+            border: none;
+            width: 100%;
+            color: var(--text);
+            font-size: 15px;
+            font-weight: 500;
+            text-align: left;
+            transition: background 0.15s;
+        }
+        .panel-header:hover { background: rgba(255,255,255,0.02); }
+        .panel-header .icon-group { display: flex; align-items: center; gap: 10px; }
+        .panel-header svg { color: var(--text-muted); }
+        .chevron { transition: transform 0.2s ease; color: var(--text-muted); }
+        .chevron.collapsed { transform: rotate(-90deg); }
+        .panel-body { padding: 0 16px 16px; }
+        .panel-body.collapsed { display: none; }
+        .form-group { margin-bottom: 14px; }
+        .form-label {
+            display: block;
+            font-size: 12px;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+        }
+        .form-input, .form-select, .form-textarea {
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            background: var(--surface-raised);
+            color: var(--text);
+            font-size: 13px;
+            font-family: var(--font-sans);
+            transition: border-color 0.15s, box-shadow 0.15s;
+        }
+        .form-input:focus, .form-select:focus, .form-textarea:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+        }
+        .form-textarea {
+            min-height: 60px;
+            resize: vertical;
+            font-family: var(--font-mono);
+            font-size: 12px;
+        }
+        .form-textarea.ssh-area {
+            min-height: 50px;
+            margin-top: 8px;
+        }
+        .upload-zone {
+            padding: 16px;
+            border: 1.5px dashed var(--border);
+            border-radius: var(--radius-md);
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            position: relative;
+        }
+        .upload-zone:hover {
+            border-color: var(--accent-dim);
+            background: rgba(99, 102, 241, 0.03);
+        }
+        .upload-zone.success {
+            border-color: var(--positive);
+            background: rgba(34, 197, 94, 0.05);
+        }
+        .upload-zone input[type="file"] {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            opacity: 0;
+            cursor: pointer;
+        }
+        .btn-row { display: flex; gap: 8px; margin-bottom: 12px; }
+        .btn {
+            flex: 1;
+            padding: 10px 14px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            background: var(--surface-raised);
+            color: var(--text);
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.15s;
+            text-align: center;
+        }
+        .btn:hover { background: rgba(255,255,255,0.05); }
+        .btn:active { transform: translateY(1px); }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-primary {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: #fff;
+        }
+        .btn-primary:hover { background: var(--accent-dim); }
+        .btn-danger { color: var(--danger); border-color: rgba(239,68,68,0.3); }
+        .btn-danger:hover { background: rgba(239,68,68,0.08); }
+        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+        .toggle-group {
+            display: flex;
+            gap: 4px;
+            padding: 4px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            background: var(--surface-raised);
+        }
+        .toggle-btn {
+            flex: 1;
+            padding: 7px 8px;
+            border: none;
+            border-radius: var(--radius-sm);
+            background: transparent;
+            color: var(--text-muted);
+            font-size: 12px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        .toggle-btn.active {
+            background: var(--accent);
+            color: #fff;
+        }
+        .checkbox-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 12px;
+        }
+        .checkbox-row input[type="checkbox"] {
+            width: 16px; height: 16px;
+            accent-color: var(--accent);
+            cursor: pointer;
+        }
+        .checkbox-row label {
+            font-size: 13px;
+            color: var(--text-secondary);
+            cursor: pointer;
+        }
+        .warning-text {
+            font-size: 11px;
+            color: var(--warning);
+            margin-top: 4px;
+            display: none;
+        }
+        .action-bar {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 16px;
+        }
+        .action-bar .btn { padding: 14px 20px; font-size: 15px; }
+        .action-bar .btn-primary { flex: 2; }
+        .action-bar .btn-danger { flex: 1; }
+        .terminal {
+            background: #0a0a0c;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            overflow: hidden;
+        }
+        .terminal-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 14px;
+            background: var(--surface-raised);
+            border-bottom: 1px solid var(--border);
+        }
+        .terminal-title {
+            font-size: 12px;
+            font-weight: 500;
+            color: var(--text-muted);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .terminal-body {
+            padding: 12px 14px;
+            min-height: 220px;
+            max-height: 320px;
+            overflow-y: auto;
+            font-family: var(--font-mono);
+            font-size: 12px;
+            line-height: 1.7;
+            color: var(--text-secondary);
+        }
+        .log-line { margin-bottom: 3px; }
+        .log-time { color: var(--text-muted); }
+        .log-info { color: var(--text-secondary); }
+        .log-success { color: var(--positive); }
+        .log-error { color: var(--danger); }
+        .log-warn { color: var(--warning); }
+        .quota-panel {
+            padding: 14px;
+            border-radius: var(--radius-md);
+            background: var(--surface-raised);
+            margin-bottom: 12px;
+            display: none;
+        }
+        .quota-item { margin-bottom: 12px; }
+        .quota-item:last-child { margin-bottom: 0; }
+        .quota-header {
+            display: flex;
+            justify-content: space-between;
+            font-size: 12px;
+            margin-bottom: 5px;
+        }
+        .quota-bar {
+            height: 5px;
+            background: var(--border);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+        .quota-fill {
+            height: 100%;
+            border-radius: 3px;
+            transition: width 0.4s ease;
+        }
+        .tg-result { margin-top: 8px; font-size: 12px; }
+        .hidden { display: none; }
+        .instance-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 6px 8px;
+            background: var(--bg);
+            border-radius: 6px;
+            margin-bottom: 6px;
+            font-size: 12px;
+        }
+        .instance-info { overflow: hidden; flex: 1; }
+        .instance-name { color: var(--text); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .instance-meta { color: var(--text-muted); font-size: 11px; }
+        .instance-delete {
+            padding: 3px 8px;
+            border: 1px solid rgba(239,68,68,0.3);
+            border-radius: 4px;
+            background: transparent;
+            color: var(--danger);
+            font-size: 11px;
+            cursor: pointer;
+            flex-shrink: 0;
+            margin-left: 8px;
+        }
+        .instance-delete:hover { background: rgba(239,68,68,0.1); }
+        @media (max-width: 560px) {
+            .grid-2, .grid-3 { grid-template-columns: 1fr; }
+            .action-bar { flex-direction: column; }
+        }
+    </style>
+<base target="_blank">
+<base target="_blank">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div>
+                <h1>🎯 OCI Sniper</h1>
+                <p>Always Free capacity hunter · v5</p>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;">
+                <button onclick="clearAll()" style="padding:5px 12px;border:1px solid var(--border);border-radius:20px;background:var(--surface-raised);color:var(--text-muted);font-size:11px;font-weight:500;cursor:pointer;">Clear all</button>
+                <div id="statusBadge" class="status-badge stopped">
+                    <span id="statusDot" class="status-dot"></span>
+                    <span id="statusText">Stopped</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Credentials Panel -->
+        <div class="panel">
+            <button class="panel-header" onclick="togglePanel('conn')">
+                <span class="icon-group">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                    1. Credentials & config
+                </span>
+                <svg id="connChevron" class="chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+            </button>
+            <div id="connBody" class="panel-body">
+                <div class="form-group">
+                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+                        <label class="form-label" style="margin-bottom:0;">Raw config block</label>
+                        <input type="file" id="configFile" style="display:none;" onchange="handleConfigFile()">
+                        <span onclick="document.getElementById('configFile').click()" style="cursor:pointer;font-size:11px;color:var(--accent);font-weight:500;display:flex;align-items:center;gap:4px;padding:3px 8px;border-radius:4px;border:1px solid color-mix(in srgb,var(--accent) 25%,transparent);">
+                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                                Upload .txt
+                            </span>
+                    </div>
+                    <textarea id="rawConfig" class="form-textarea" oninput="parseConfig()" placeholder="Paste OCI config here or upload a .txt file..."></textarea>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Private key (.pem)</label>
+                    <input type="file" id="keyFile" style="display:none;" onchange="handleKeyFile()">
+                    <div class="upload-zone" id="keyZone" onclick="document.getElementById('keyFile').click()">
+                        <div id="keyZoneContent">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="color:var(--text-muted);margin-bottom:6px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                            <div style="font-size:12px;color:var(--text-muted);">Click to upload .pem, .txt, or .key</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="btn-row">
+                    <button class="btn" id="quotaBtn" onclick="checkQuota()">Check free tier</button>
+                    <button class="btn" id="scanBtn" onclick="scanImages()">Scan OS images</button>
+                </div>
+                <div id="quotaPanel" class="quota-panel"></div>
+                <div class="checkbox-row">
+                    <input type="checkbox" id="allOS" onchange="onAllOSChange()">
+                    <label for="allOS">All OS mode (not just Ubuntu)</label>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Target OS image</label>
+                    <select id="imageSelect" class="form-select">
+                        <option value="">-- Scan images first --</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+                        <label class="form-label" style="margin-bottom:0;">Target subnet</label>
+                        <button class="btn" id="scanSubnetBtn2" onclick="scanSubnets()" style="padding:3px 10px;font-size:11px;flex:none;">Scan subnets</button>
+                    </div>
+                    <select id="subnetSelect" class="form-select">
+                        <option value="">-- Auto-select first available --</option>
+                    </select>
+                    <div id="subnetInfo" style="margin-top:6px;font-size:11px;color:var(--text-muted);display:none;"></div>
+                </div>
+                <div class="form-group">
+                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+                        <label class="form-label" style="margin-bottom:0;">Target VNIC</label>
+                        <button class="btn" id="scanVnicBtn" onclick="scanVnics()" style="padding:3px 10px;font-size:11px;flex:none;">Scan VNICs</button>
+                    </div>
+                    <select id="vnicSelect" class="form-select">
+                        <option value="">-- Scan VNICs first --</option>
+                    </select>
+                    <div id="vnicInfo" style="margin-top:6px;font-size:11px;color:var(--text-muted);display:none;"></div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Availability domain preference</label>
+                    <select id="adSelect" class="form-select">
+                        <option value="">-- Random (fastest) --</option>
+                    </select>
+                    <div id="adInfo" style="margin-top:6px;font-size:11px;color:var(--text-muted);display:none;"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Instance Config Panel -->
+        <div class="panel">
+            <button class="panel-header" onclick="togglePanel('inst')">
+                <span class="icon-group">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+                    2. Instance configuration
+                </span>
+                <svg id="instChevron" class="chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+            </button>
+            <div id="instBody" class="panel-body">
+                <div class="grid-2">
+                    <div class="form-group">
+                        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+                            <label class="form-label" style="margin-bottom:0;">Shape</label>
+                            <button class="btn" id="scanShapeBtn" onclick="scanShapes()" style="padding:3px 10px;font-size:11px;flex:none;">Scan shapes</button>
+                        </div>
+                        <select id="shapeSelect" class="form-select" onchange="onShapeChange()">
+                            <option value="VM.Standard.A1.Flex">Ampere A1 Flex (ARM)</option>
+                            <option value="VM.Standard.E2.1.Micro">AMD E2 Micro</option>
+                        </select>
+                        <div id="shapeInfo" style="margin-top:6px;font-size:11px;color:var(--text-muted);display:none;"></div>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">VM name</label>
+                        <input type="text" id="vmName" class="form-input" value="Arm">
+                    </div>
+                </div>
+                <div class="grid-3">
+                    <div class="form-group">
+                        <label class="form-label">OCPUs</label>
+                        <input type="number" id="ocpus" class="form-input" value="2" min="1" max="4">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">RAM (GB)</label>
+                        <input type="number" id="memory" class="form-input" value="12" min="1" max="24">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Boot vol (GB)</label>
+                        <div style="display:flex;gap:4px;">
+                            <input type="number" id="bootVol" class="form-input" value="50" min="50" max="200" style="flex:1;">
+                            <button class="btn" onclick="setMaxBoot()" style="padding:0 10px;font-size:11px;white-space:nowrap;">Max</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">SSH public key</label>
+                    <input type="file" id="sshFile" style="display:none;" onchange="handleSSHFile()">
+                    <div class="upload-zone" id="sshZone" onclick="document.getElementById('sshFile').click()">
+                        <div id="sshZoneContent">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="color:var(--text-muted);margin-bottom:6px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                            <div style="font-size:12px;color:var(--text-muted);">Click to upload .pub or .txt</div>
+                        </div>
+                    </div>
+                    <textarea id="sshKey" class="form-textarea ssh-area" placeholder="ssh-rsa AAAAB3..."></textarea>
+                </div>
+                <div class="form-group" style="background:var(--surface-raised);padding:12px;border-radius:var(--radius-md);border:1px solid var(--border);">
+                    <label class="form-label" style="color:var(--text-secondary);">Firewall / Security Rules</label>
+                    <div style="display:flex;gap:8px;margin-bottom:10px;">
+                        <div style="flex:1;">
+                            <label style="font-size:11px;color:var(--text-muted);margin-bottom:4px;display:block;">Port(s) to open</label>
+                            <input type="text" id="firewallPorts" class="form-input" value="all" placeholder="e.g. 22,80,443 or all" style="font-size:12px;">
+                        </div>
+                        <div style="flex:1;">
+                            <label style="font-size:11px;color:var(--text-muted);margin-bottom:4px;display:block;">Source CIDR</label>
+                            <input type="text" id="firewallCidr" class="form-input" value="0.0.0.0/0" placeholder="e.g. 0.0.0.0/0" style="font-size:12px;">
+                        </div>
+                        <div style="flex:1;">
+                            <label style="font-size:11px;color:var(--text-muted);margin-bottom:4px;display:block;">Direction</label>
+                            <select id="firewallDirection" class="form-select" style="font-size:12px;">
+                                <option value="ingress">Ingress (inbound)</option>
+                                <option value="egress">Egress (outbound)</option>
+                                <option value="both">Both</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div style="display:flex;gap:8px;">
+                        <button class="btn" id="scanRulesBtn" onclick="scanSecurityRules()" style="flex:1;padding:8px 12px;font-size:12px;">Scan existing rules</button>
+                        <button class="btn" id="openFirewallBtn" onclick="openFirewallNow()" style="flex:1;padding:8px 12px;font-size:12px;">Open port(s) now</button>
+                    </div>
+                    <div id="firewallResult" style="margin-top:8px;font-size:11px;display:none;"></div>
+                </div>
+                <div class="grid-2">
+                    <div class="form-group">
+                        <label class="form-label">Retry delay (s)</label>
+                        <input type="number" id="retryDelay" class="form-input" value="60" min="10" max="3600" onchange="validateDelay()">
+                        <div id="delayWarning" class="warning-text">Delays under 30s risk rate limiting</div>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Mode</label>
+                        <div class="toggle-group">
+                            <button id="modeFixed" class="toggle-btn active" onclick="setDelayMode('fixed')">Fixed</button>
+                            <button id="modeRandom" class="toggle-btn" onclick="setDelayMode('random')">Random 25-60s</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Alerts Panel -->
+        <div class="panel">
+            <button class="panel-header" onclick="togglePanel('alert')">
+                <span class="icon-group">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+                    3. Telegram alerts
+                </span>
+                <svg id="alertChevron" class="chevron collapsed" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+            </button>
+            <div id="alertBody" class="panel-body collapsed">
+                <div class="grid-2">
+                    <div class="form-group">
+                        <label class="form-label">Bot token</label>
+                        <input type="password" id="tgToken" class="form-input" placeholder="123456:ABC...">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Chat ID</label>
+                        <input type="text" id="tgChat" class="form-input" placeholder="@channel or ID">
+                    </div>
+                </div>
+                <div class="checkbox-row" style="margin-top:8px;">
+                    <input type="checkbox" id="tgLiveLog" onchange="onTgLiveLogChange()">
+                    <label for="tgLiveLog">Stream all live output logs to Telegram</label>
+                </div>
+                <div id="tgLiveWarning" style="display:none;font-size:11px;color:var(--warning);margin-bottom:10px;padding-left:24px;">
+                    Warning: High message volume. Telegram may rate-limit (throttled to 1 msg / 3s).
+                </div>
+                <button class="btn" id="tgTestBtn" onclick="testTelegram()" style="width:100%;">Test connection</button>
+                <div id="tgResult" class="tg-result"></div>
+            </div>
+        </div>
+
+        <!-- Action Bar -->
+        <div class="action-bar">
+            <button id="startBtn" class="btn btn-primary" onclick="startLoop()">Start provisioning loop</button>
+            <button id="stopBtn" class="btn btn-danger" onclick="stopLoop()">Stop</button>
+        </div>
+
+        <!-- Terminal -->
+        <div class="terminal">
+            <div class="terminal-header">
+                <span class="terminal-title">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+                    Live output
+                </span>
+                <button onclick="clearLogs()" style="font-size:11px;color:var(--text-muted);background:none;border:none;cursor:pointer;padding:2px 6px;border-radius:4px;">Clear</button>
+            </div>
+            <div id="terminalBody" class="terminal-body">
+                <div style="color:var(--text-muted);">Ready. Configure credentials and click start.</div>
+            </div>
+        </div>
+    </div>
+
+    <input type="hidden" id="cfgUser">
+    <input type="hidden" id="cfgTenancy">
+    <input type="hidden" id="cfgFingerprint">
+    <input type="hidden" id="cfgRegion">
+    <label title="Keep OCI identifiers in this browser's localStorage. Private key is NEVER saved."><input type="checkbox" id="rememberCreds"> Remember account info</label>
+    <button type="button" onclick="wipeCreds()" style="display:none;" id="wipeCredsBtn"></button>
+    <textarea id="cfgKey" style="display:none;"></textarea>
+
+    <script>
+    let isRunning = false;
+    let delayMode = 'fixed';
+    let logOffset = 0;
+    let pollInterval = null;
+    let statusInterval = null;
+    let userTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+    addLog('Timezone detected: ' + userTimezone, 'info');
+    loadCreds();
+
+    function togglePanel(name) {
+        const body = document.getElementById(name + 'Body');
+        const chev = document.getElementById(name + 'Chevron');
+        body.classList.toggle('collapsed');
+        chev.classList.toggle('collapsed');
+    }
+
+    // ---- Credential persistence (localStorage, opt-in) ----
+    const CFG_FIELDS = ['cfgUser', 'cfgTenancy', 'cfgFingerprint', 'cfgRegion'];
+    function saveCreds() {
+        try {
+            if (!document.getElementById('rememberCreds') || !document.getElementById('rememberCreds').checked) return;
+            const blob = {};
+            CFG_FIELDS.forEach(id => { const el = document.getElementById(id); if (el) blob[id] = el.value; });
+            localStorage.setItem('oci_prov_cfg', JSON.stringify(blob));
+        } catch (e) {}
+    }
+    function loadCreds() {
+        try {
+            const raw = localStorage.getItem('oci_prov_cfg');
+            if (!raw) return;
+            const blob = JSON.parse(raw);
+            CFG_FIELDS.forEach(id => { const el = document.getElementById(id); if (el && blob[id]) el.value = blob[id]; });
+            const cb = document.getElementById('rememberCreds');
+            if (cb) cb.checked = true;
+            parseConfig && parseConfig();
+        } catch (e) {}
+    }
+    function wipeCreds() {
+        try { localStorage.removeItem('oci_prov_cfg'); } catch (e) {}
+        CFG_FIELDS.forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+        const cb = document.getElementById('rememberCreds');
+        if (cb) cb.checked = false;
+        addLog('Saved credentials wiped', 'warn');
+    }
+    function parseConfig() {
+        const text = document.getElementById('rawConfig').value;
+        const user = text.match(/user\s*=\s*(ocid1\.user\.[^\s#\n,]+)/i);
+        const tenancy = text.match(/tenancy\s*=\s*(ocid1\.tenancy\.[^\s#\n,]+)/i);
+        const fp = text.match(/fingerprint\s*=\s*([a-fA-F0-9:]{32,47})/i);
+        const region = text.match(/region\s*=\s*([a-zA-Z0-9-]+)/i);
+        if (user) document.getElementById('cfgUser').value = user[1].trim();
+        if (tenancy) document.getElementById('cfgTenancy').value = tenancy[1].trim();
+        if (fp) document.getElementById('cfgFingerprint').value = fp[1].trim();
+        if (region) document.getElementById('cfgRegion').value = region[1].trim();
+        saveCreds();
+    }
+
+    function handleConfigFile() {
+        const file = document.getElementById('configFile').files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = function(e) {
+            document.getElementById('rawConfig').value = e.target.result;
+            parseConfig();
+            addLog('Config loaded from: ' + file.name, 'success');
+        };
+        reader.onerror = function() {
+            addLog('Failed to read config file', 'error');
+        };
+        reader.readAsText(file);
+    }
+
+    function handleKeyFile() {
+        console.log('handleKeyFile called');
+        const fileInput = document.getElementById('keyFile');
+        const file = fileInput.files[0];
+        if (!file) { console.log('No file selected'); return; }
+        console.log('File selected:', file.name, file.size);
+        const reader = new FileReader();
+        reader.onload = e => {
+            document.getElementById('cfgKey').value = e.target.result;
+            const zone = document.getElementById('keyZone');
+            const content = document.getElementById('keyZoneContent');
+            content.innerHTML = '<span style="color:var(--positive);font-size:12px;">&#9989; Key loaded: ' + file.name + '</span>';
+            zone.classList.add('success');
+            addLog('Private key loaded: ' + file.name, 'success');
+        };
+        reader.onerror = () => addLog('Failed to read key file', 'error');
+        reader.readAsText(file);
+        fileInput.value = '';
+    }
+
+    document.getElementById('keyZone').addEventListener('dblclick', function(e) {
+        e.preventDefault();
+        document.getElementById('cfgKey').value = '';
+        this.classList.remove('success');
+        document.getElementById('keyZoneContent').innerHTML =
+            '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="color:var(--text-muted);margin-bottom:6px;">' +
+            '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>' +
+            '<div style="font-size:12px;color:var(--text-muted);">Click to upload .pem, .txt, or .key</div>';
+        document.getElementById('keyFile').value = '';
+        addLog('Private key cleared', 'warn');
+    });
+
+    function handleSSHFile() {
+        console.log('handleSSHFile called');
+        const fileInput = document.getElementById('sshFile');
+        const file = fileInput.files[0];
+        if (!file) { console.log('No file selected'); return; }
+        console.log('File selected:', file.name, file.size);
+        const reader = new FileReader();
+        reader.onload = e => {
+            document.getElementById('sshKey').value = e.target.result.trim();
+            const zone = document.getElementById('sshZone');
+            const content = document.getElementById('sshZoneContent');
+            content.innerHTML = '<span style="color:var(--positive);font-size:12px;">&#9989; Key loaded: ' + file.name + '</span>';
+            zone.classList.add('success');
+            addLog('SSH key loaded: ' + file.name, 'success');
+        };
+        reader.onerror = () => addLog('Failed to read SSH file', 'error');
+        reader.readAsText(file);
+        fileInput.value = '';
+    }
+
+    document.getElementById('sshZone').addEventListener('dblclick', function(e) {
+        e.preventDefault();
+        document.getElementById('sshKey').value = '';
+        this.classList.remove('success');
+        document.getElementById('sshZoneContent').innerHTML =
+            '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="color:var(--text-muted);margin-bottom:6px;">' +
+            '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>' +
+            '<div style="font-size:12px;color:var(--text-muted);">Click to upload .pub or .txt</div>';
+        document.getElementById('sshFile').value = '';
+        addLog('SSH key cleared', 'warn');
+    });
+
+    function onShapeChange() {
+        const shape = document.getElementById('shapeSelect').value;
+        const cpu = document.getElementById('ocpus');
+        const ram = document.getElementById('memory');
+        const vmName = document.getElementById('vmName');
+        if (shape === 'VM.Standard.E2.1.Micro') {
+            cpu.value = 1; cpu.disabled = true;
+            ram.value = 1; ram.disabled = true;
+            vmName.value = 'VM-AMD';
+        } else {
+            cpu.value = 2; cpu.disabled = false;
+            ram.value = 12; ram.disabled = false;
+            vmName.value = 'Arm';
+        }
+    }
+
+    async function setMaxBoot() {
+        parseConfig();
+        const btn = event.target;
+        const input = document.getElementById('bootVol');
+        const user = document.getElementById('cfgUser').value;
+        const key = document.getElementById('cfgKey').value;
+        if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
+        btn.textContent = '...'; btn.disabled = true;
+        try {
+            const res = await fetch('/api/free-tier-status', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user: user, tenancy: document.getElementById('cfgTenancy').value,
+                    fingerprint: document.getElementById('cfgFingerprint').value,
+                    region: document.getElementById('cfgRegion').value,
+                    private_key: key, timezone: userTimezone
+                })
+            });
+            const data = await res.json();
+            if (data.success) {
+                const remaining = data.usage.storage.remaining_gb;
+                const maxBoot = Math.min(200, Math.max(50, remaining));
+                input.value = maxBoot;
+                btn.textContent = 'Max (' + maxBoot + ' GB)';
+                addLog('Max boot volume set to ' + maxBoot + ' GB', 'success');
+                setTimeout(() => { btn.textContent = 'Max'; }, 3000);
+            } else {
+                addLog('Could not detect storage: ' + data.error, 'error');
+                btn.textContent = 'Max';
+            }
+        } catch (err) {
+            addLog('Request error: ' + err.message, 'error');
+            btn.textContent = 'Max';
+        }
+        btn.disabled = false;
+    }
+
+    function validateDelay() {
+        const val = parseInt(document.getElementById('retryDelay').value);
+        document.getElementById('delayWarning').style.display = val < 30 ? 'block' : 'none';
+    }
+
+    function setDelayMode(mode) {
+        delayMode = mode;
+        document.getElementById('modeFixed').classList.toggle('active', mode === 'fixed');
+        document.getElementById('modeRandom').classList.toggle('active', mode === 'random');
+        const input = document.getElementById('retryDelay');
+        input.disabled = mode === 'random';
+        input.style.opacity = mode === 'random' ? '0.4' : '1';
+    }
+
+    function addLog(msg, type) {
+        const now = new Date().toLocaleTimeString();
+        const term = document.getElementById('terminalBody');
+        const line = document.createElement('div');
+        line.className = 'log-line';
+        let cls = 'log-info';
+        if (type === 'success') cls = 'log-success';
+        if (type === 'error') cls = 'log-error';
+        if (type === 'warn') cls = 'log-warn';
+        line.innerHTML = '<span class="log-time">[' + now + ']</span> <span class="' + cls + '">' + msg + '</span>';
+        term.appendChild(line);
+        term.scrollTop = term.scrollHeight;
+    }
+
+    function clearLogs() {
+        document.getElementById('terminalBody').innerHTML = '';
+        logOffset = 0;
+    }
+
+    function updateStatus(running) {
+        isRunning = running;
+        const badge = document.getElementById('statusBadge');
+        const dot = document.getElementById('statusDot');
+        const text = document.getElementById('statusText');
+        const startBtn = document.getElementById('startBtn');
+        if (running) {
+            badge.className = 'status-badge running';
+            dot.className = 'status-dot running';
+            text.textContent = 'Running';
+            startBtn.disabled = true;
+            startBtn.style.opacity = '0.5';
+        } else {
+            badge.className = 'status-badge stopped';
+            dot.className = 'status-dot';
+            text.textContent = 'Stopped';
+            startBtn.disabled = false;
+            startBtn.style.opacity = '1';
+        }
+    }
+
+    async function checkQuota() {
+        parseConfig();
+        const btn = document.getElementById('quotaBtn');
+        const panel = document.getElementById('quotaPanel');
+        const user = document.getElementById('cfgUser').value;
+        const key = document.getElementById('cfgKey').value;
+        if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
+        btn.disabled = true; btn.textContent = 'Scanning...';
+        panel.style.display = 'block';
+        panel.innerHTML = '<div style="font-size:12px;color:var(--text-muted);">Fetching quota usage...</div>';
+        try {
+            const res = await fetch('/api/free-tier-status', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user: user, tenancy: document.getElementById('cfgTenancy').value,
+                    fingerprint: document.getElementById('cfgFingerprint').value,
+                    region: document.getElementById('cfgRegion').value,
+                    private_key: key, timezone: userTimezone
+                })
+            });
+            const data = await res.json();
+            if (data.success) {
+                const u = data.usage;
+                let html = '';
+                const sColor = u.storage.percent >= 90 ? 'var(--danger)' : u.storage.percent >= 70 ? 'var(--warning)' : 'var(--positive)';
+                html += '<div class="quota-item"><div class="quota-header"><span style="color:var(--text-secondary)">Storage</span><span style="color:var(--text);font-weight:500">' + u.storage.used_gb + ' / ' + u.storage.limit_gb + ' GB</span></div><div class="quota-bar"><div class="quota-fill" style="width:' + u.storage.percent + '%;background:' + sColor + '"></div></div></div>';
+                const mColor = u.micro.percent >= 100 ? 'var(--danger)' : u.micro.percent >= 50 ? 'var(--warning)' : 'var(--positive)';
+                html += '<div class="quota-item"><div class="quota-header"><span style="color:var(--text-secondary)">Micro instances</span><span style="color:var(--text);font-weight:500">' + u.micro.used + ' / ' + u.micro.limit + '</span></div><div class="quota-bar"><div class="quota-fill" style="width:' + u.micro.percent + '%;background:' + mColor + '"></div></div></div>';
+                const aColor = u.arm.ocpu_percent >= 100 ? 'var(--danger)' : u.arm.ocpu_percent >= 70 ? 'var(--warning)' : 'var(--positive)';
+                html += '<div class="quota-item"><div class="quota-header"><span style="color:var(--text-secondary)">ARM OCPUs</span><span style="color:var(--text);font-weight:500">' + u.arm.used_ocpus + ' / ' + u.arm.limit_ocpus + '</span></div><div class="quota-bar"><div class="quota-fill" style="width:' + u.arm.ocpu_percent + '%;background:' + aColor + '"></div></div></div>';
+                if (u.all_instances && u.all_instances.length > 0) {
+                    html += '<div style="margin-top:16px;border-top:1px solid var(--border);padding-top:12px;">';
+                    html += '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">';
+                    html += '<span style="font-size:13px;font-weight:600;color:var(--text);">Instances (' + u.all_instances.length + ')</span>';
+                    html += '<button onclick="deleteAllInstances()" style="padding:4px 10px;border:1px solid var(--danger);border-radius:4px;background:rgba(239,68,68,0.1);color:var(--danger);font-size:11px;font-weight:600;cursor:pointer;">&#128293; DELETE ALL</button>';
+                    html += '</div>';
+                    u.all_instances.forEach(inst => {
+                        const shapeInfo = inst.ocpus ? ' (' + inst.ocpus + ' OCPU, ' + inst.memory + ' GB)' : '';
+                        const stateColor = inst.state === 'RUNNING' ? 'var(--positive)' : 'var(--warning)';
+                        const ipLine = inst.public_ip ? '<span style="color:var(--accent);font-weight:500;">IP: ' + inst.public_ip + '</span> | ' : '';
+                        html += '<div class="instance-row">';
+                        html += '<div class="instance-info">';
+                        html += '<div class="instance-name">' + inst.name + '</div>';
+                        html += '<div class="instance-meta">' + ipLine + inst.shape + shapeInfo + ' | <span style="color:' + stateColor + '">' + inst.state + '</span></div>';
+                        html += '</div>';
+                        html += '<button class="instance-delete" onclick="rebootInstance(' + "'" + inst.id + "'" + ',' + "'" + inst.name + "'" + ')" title="Reboot this instance" style="border-color:rgba(245,158,11,0.3);color:var(--warning);margin-right:4px;">&#8635;</button>';
+                        html += '<button class="instance-delete" onclick="deleteInstance(' + "'" + inst.id + "'" + ',' + "'" + inst.name + "'" + ')" title="Delete this instance">&#128465;</button>';
+                        html += '</div>';
+                    });
+                    html += '</div>';
+                } else {
+                    html += '<div style="margin-top:12px;font-size:12px;color:var(--text-muted);">No instances found.</div>';
+                }
+                panel.innerHTML = html;
+                addLog('Free tier quota loaded', 'success');
+            } else {
+                panel.innerHTML = '<div style="color:var(--danger);font-size:12px;">Error: ' + data.error + '</div>';
+                addLog('Quota check failed: ' + data.error, 'error');
+            }
+        } catch (err) {
+            panel.innerHTML = '<div style="color:var(--danger);font-size:12px;">Request error: ' + err.message + '</div>';
+            addLog('Quota request error: ' + err.message, 'error');
+        }
+        btn.disabled = false; btn.textContent = 'Check free tier';
+    }
+
+    async function scanImages() {
+        parseConfig();
+        const btn = document.getElementById('scanBtn');
+        const select = document.getElementById('imageSelect');
+        const user = document.getElementById('cfgUser').value;
+        const key = document.getElementById('cfgKey').value;
+        if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
+        btn.disabled = true; btn.textContent = 'Scanning...';
+        select.innerHTML = '<option>Scanning...</option>';
+        try {
+            const res = await fetch('/api/list-images', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user: user, tenancy: document.getElementById('cfgTenancy').value,
+                    fingerprint: document.getElementById('cfgFingerprint').value,
+                    region: document.getElementById('cfgRegion').value,
+                    private_key: key, shape: document.getElementById('shapeSelect').value,
+                    all_os_mode: document.getElementById('allOS').checked,
+                    timezone: userTimezone
+                })
+            });
+            const data = await res.json();
+            if (data.success && data.images.length > 0) {
+                select.innerHTML = '';
+                data.images.forEach(img => {
+                    const opt = document.createElement('option');
+                    opt.value = img.id;
+                    opt.textContent = document.getElementById('allOS').checked ? '[' + img.os + '] ' + img.name : img.name;
+                    select.appendChild(opt);
+                });
+                addLog('Found ' + data.images.length + ' compatible images', 'success');
+            } else {
+                select.innerHTML = '<option value="">-- No images found --</option>';
+                addLog('No images found: ' + (data.error || 'None available'), 'warn');
+            }
+        } catch (err) {
+            select.innerHTML = '<option value="">-- Error --</option>';
+            addLog('Image scan error: ' + err.message, 'error');
+        }
+        btn.disabled = false; btn.textContent = 'Scan OS images';
+    }
+
+    async function scanSubnets() {
+        parseConfig();
+        const btn = document.getElementById('scanSubnetBtn2');
+        const select = document.getElementById('subnetSelect');
+        const info = document.getElementById('subnetInfo');
+        const user = document.getElementById('cfgUser').value;
+        const key = document.getElementById('cfgKey').value;
+        if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
+        btn.disabled = true; btn.textContent = 'Scanning...';
+        select.innerHTML = '<option>Scanning...</option>'; info.style.display = 'none';
+        try {
+            const res = await fetch('/api/list-subnets', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user: user, tenancy: document.getElementById('cfgTenancy').value,
+                    fingerprint: document.getElementById('cfgFingerprint').value,
+                    region: document.getElementById('cfgRegion').value,
+                    private_key: key, timezone: userTimezone
+                })
+            });
+            const data = await res.json();
+            if (data.success && data.subnets.length > 0) {
+                select.innerHTML = '<option value="">-- Auto-select first available --</option>';
+                data.subnets.forEach(sn => {
+                    const opt = document.createElement('option');
+                    opt.value = sn.id;
+                    const pub = sn.public ? 'Public' : 'Private';
+                    opt.textContent = sn.name + ' (' + sn.cidr + ', ' + pub + ', ' + sn.ad + ')';
+                    select.appendChild(opt);
+                });
+                info.innerHTML = 'Found ' + data.subnets.length + ' subnet(s). Select one or leave auto-selected.';
+                info.style.display = 'block';
+                addLog('Found ' + data.subnets.length + ' subnet(s)', 'success');
+            } else {
+                select.innerHTML = '<option value="">-- No subnets found --</option>';
+                info.innerHTML = '<span style="color:var(--warning)">No subnets found.</span> <button onclick="createSubnet()" style="padding:3px 10px;border:1px solid var(--border);border-radius:4px;background:var(--accent);color:#fff;font-size:11px;cursor:pointer;margin-left:6px;">Create subnet</button>';
+                info.style.display = 'block';
+                addLog('No subnets found: ' + (data.error || 'None available'), 'warn');
+            }
+        } catch (err) {
+            select.innerHTML = '<option value="">-- Error --</option>';
+            addLog('Subnet scan error: ' + err.message, 'error');
+        }
+        btn.disabled = false; btn.textContent = 'Scan subnets';
+    }
+
+    async function scanVnics() {
+        parseConfig();
+        const btn = document.getElementById('scanVnicBtn');
+        const user = document.getElementById('cfgUser').value;
+        const key = document.getElementById('cfgKey').value;
+        const subnetId = document.getElementById('subnetSelect').value;
+        const vnicSelect = document.getElementById('vnicSelect');
+        const vnicInfo = document.getElementById('vnicInfo');
+        if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
+        btn.disabled = true; btn.textContent = 'Scanning...';
+        try {
+            const payload = {
+                user: user, tenancy: document.getElementById('cfgTenancy').value,
+                fingerprint: document.getElementById('cfgFingerprint').value,
+                region: document.getElementById('cfgRegion').value,
+                private_key: key, timezone: userTimezone
+            };
+            if (subnetId) payload.subnet_id = subnetId;
+            const res = await fetch('/api/list-vnics', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const data = await res.json();
+            if (data.success && data.vnics && data.vnics.length > 0) {
+                const filterLabel = data.filtered_by_subnet ? ' (target subnet)' : '';
+                addLog('Found ' + data.vnics.length + ' VNIC(s)' + filterLabel + ':', 'success');
+                vnicSelect.innerHTML = '<option value="">-- Select a VNIC --</option>';
+                data.vnics.forEach(v => {
+                    const primaryBadge = v.is_primary ? ' [PRIMARY]' : '';
+                    addLog('  ' + v.display_name + primaryBadge + ' | Instance: ' + v.instance_name + ' | IP: ' + v.private_ip + ' | Public: ' + (v.public_ip || 'None'));
+                    const opt = document.createElement('option');
+                    opt.value = v.id;
+                    opt.textContent = v.display_name + primaryBadge + ' (' + v.private_ip + ', ' + v.instance_name + ')';
+                    vnicSelect.appendChild(opt);
+                });
+                vnicInfo.innerHTML = 'Found ' + data.vnics.length + ' VNIC(s). Select one to target.';
+                vnicInfo.style.display = 'block';
+            } else if (data.success) {
+                vnicSelect.innerHTML = '<option value="">-- No VNICs found --</option>';
+                vnicInfo.style.display = 'none';
+                addLog('No VNICs found' + (data.filtered_by_subnet ? ' in target subnet' : ''), 'warn');
+            } else {
+                vnicSelect.innerHTML = '<option value="">-- Error --</option>';
+                addLog('VNIC scan failed: ' + (data.error || 'Unknown error'), 'error');
+            }
+        } catch (err) {
+            vnicSelect.innerHTML = '<option value="">-- Error --</option>';
+            addLog('VNIC scan error: ' + err.message, 'error');
+        }
+        btn.disabled = false; btn.textContent = 'Scan VNICs';
+    }
+
+    async function scanShapes() {
+        parseConfig();
+        const btn = document.getElementById('scanShapeBtn');
+        const select = document.getElementById('shapeSelect');
+        const info = document.getElementById('shapeInfo');
+        const user = document.getElementById('cfgUser').value;
+        const key = document.getElementById('cfgKey').value;
+        if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
+        btn.disabled = true; btn.textContent = 'Scanning...';
+        select.innerHTML = '<option>Scanning...</option>'; info.style.display = 'none';
+        try {
+            const res = await fetch('/api/list-shapes', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user: user, tenancy: document.getElementById('cfgTenancy').value,
+                    fingerprint: document.getElementById('cfgFingerprint').value,
+                    region: document.getElementById('cfgRegion').value,
+                    private_key: key, timezone: userTimezone
+                })
+            });
+            const data = await res.json();
+            if (data.success && data.shapes.length > 0) {
+                select.innerHTML = '';
+                let freeCount = 0;
+                data.shapes.forEach(sh => {
+                    const opt = document.createElement('option');
+                    opt.value = sh.name;
+                    const isFree = sh.name === 'VM.Standard.A1.Flex' || sh.name === 'VM.Standard.E2.1.Micro';
+                    const freeTag = isFree ? ' [FREE TIER]' : '';
+                    const flexTag = sh.is_flex ? ' (Flex)' : '';
+                    const cpuMem = (sh.ocpus && sh.memory) ? ' - ' + sh.ocpus + ' OCPU, ' + sh.memory + ' GB' : '';
+                    const proc = sh.processor ? ' | ' + sh.processor : '';
+                    opt.textContent = sh.name + freeTag + flexTag + cpuMem + proc;
+                    select.appendChild(opt);
+                    if (isFree) freeCount++;
+                });
+                info.innerHTML = 'Found ' + data.shapes.length + ' shape(s) across ' + data.ad_count + ' AD(s). ' + freeCount + ' free tier.';
+                info.style.display = 'block';
+                addLog('Found ' + data.shapes.length + ' shape(s) (' + freeCount + ' free tier)', 'success');
+                onShapeChange();
+            } else {
+                select.innerHTML = '<option value="VM.Standard.A1.Flex">Ampere A1 Flex (ARM)</option><option value="VM.Standard.E2.1.Micro">AMD E2 Micro</option>';
+                addLog('No shapes found: ' + (data.error || 'None available'), 'warn');
+            }
+        } catch (err) {
+            select.innerHTML = '<option value="VM.Standard.A1.Flex">Ampere A1 Flex (ARM)</option><option value="VM.Standard.E2.1.Micro">AMD E2 Micro</option>';
+            addLog('Shape scan error: ' + err.message, 'error');
+        }
+        btn.disabled = false; btn.textContent = 'Scan shapes';
+    }
+
+    async function createSubnet() {
+        parseConfig();
+        const btn = event.target;
+        const info = document.getElementById('subnetInfo');
+        const select = document.getElementById('subnetSelect');
+        const user = document.getElementById('cfgUser').value;
+        const key = document.getElementById('cfgKey').value;
+        if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
+        btn.disabled = true; btn.textContent = 'Creating...';
+        addLog('Creating subnet via OCI API...', 'info');
+        try {
+            const res = await fetch('/api/create-subnet', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user: user, tenancy: document.getElementById('cfgTenancy').value,
+                    fingerprint: document.getElementById('cfgFingerprint').value,
+                    region: document.getElementById('cfgRegion').value,
+                    private_key: key, timezone: userTimezone
+                })
+            });
+            const data = await res.json();
+            if (data.success) {
+                select.innerHTML = '';
+                const opt = document.createElement('option');
+                opt.value = data.subnet.id;
+                const pub = data.subnet.public ? 'Public' : 'Private';
+                opt.textContent = data.subnet.name + ' (' + data.subnet.cidr + ', ' + pub + ', ' + data.subnet.ad + ')';
+                select.appendChild(opt);
+                if (data.created) {
+                    info.innerHTML = '<span style="color:var(--positive)">Created subnet: ' + data.subnet.name + ' (' + data.subnet.cidr + ')</span>';
+                    addLog('Subnet created: ' + data.subnet.name + ' (' + data.subnet.cidr + ')', 'success');
+                } else {
+                    info.innerHTML = '<span style="color:var(--positive)">Using existing subnet: ' + data.subnet.name + ' (' + data.subnet.cidr + ')</span>';
+                    addLog('Using existing subnet: ' + data.subnet.name, 'success');
+                }
+                info.style.display = 'block';
+            } else {
+                info.innerHTML = '<span style="color:var(--danger)">Failed to create subnet: ' + data.error + '</span>';
+                info.style.display = 'block';
+                addLog('Subnet creation failed: ' + data.error, 'error');
+            }
+        } catch (err) {
+            info.innerHTML = '<span style="color:var(--danger)">Error: ' + err.message + '</span>';
+            info.style.display = 'block';
+            addLog('Subnet creation error: ' + err.message, 'error');
+        }
+        btn.disabled = false; btn.textContent = 'Create subnet';
+    }
+
+    async function openFirewallNow() {
+        parseConfig();
+        const btn = document.getElementById('openFirewallBtn');
+        const result = document.getElementById('firewallResult');
+        const user = document.getElementById('cfgUser').value;
+        const key = document.getElementById('cfgKey').value;
+        const subnetId = document.getElementById('subnetSelect').value;
+        const ports = document.getElementById('firewallPorts').value.trim() || 'all';
+        const cidr = document.getElementById('firewallCidr').value.trim() || '0.0.0.0/0';
+        const direction = document.getElementById('firewallDirection').value;
+        if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
+        if (!subnetId) {
+            addLog('Error: Select a subnet first', 'error');
+            result.style.display = 'block';
+            result.innerHTML = '<span style="color:var(--warning)">Select a subnet first</span>';
+            return;
+        }
+        const dirLabel = direction === 'ingress' ? 'INBOUND' : direction === 'egress' ? 'OUTBOUND' : 'BOTH';
+        if (!confirm('Open ' + ports + ' ' + dirLabel + ' from ' + cidr + '?')) {
+            addLog('Firewall action cancelled', 'warn'); return;
+        }
+        btn.disabled = true; btn.textContent = 'Opening...'; result.style.display = 'none';
+        try {
+            const res = await fetch('/api/open-firewall', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user: user, tenancy: document.getElementById('cfgTenancy').value,
+                    fingerprint: document.getElementById('cfgFingerprint').value,
+                    region: document.getElementById('cfgRegion').value,
+                    private_key: key, subnet_id: subnetId, ports: ports, cidr: cidr,
+                    direction: direction, timezone: userTimezone
+                })
+            });
+            const data = await res.json();
+            result.style.display = 'block';
+            if (data.success) {
+                if (data.already_open) {
+                    result.innerHTML = '<span style="color:var(--positive)">Rule(s) already exist for ' + data.ports + ' from ' + data.cidr + '</span>';
+                } else {
+                    result.innerHTML = '<span style="color:var(--positive)">Opened ' + data.ports + ' (' + data.direction + ') from ' + data.cidr + ' via ' + data.method + ' (' + data.rules_added + ' rule(s))</span>';
+                    addLog('Opened port(s) ' + data.ports + ' via ' + data.method, 'success');
+                }
+            } else {
+                result.innerHTML = '<span style="color:var(--danger)">Failed: ' + data.error + '</span>';
+                addLog('Firewall open failed: ' + data.error, 'error');
+            }
+        } catch (err) {
+            result.style.display = 'block';
+            result.innerHTML = '<span style="color:var(--danger)">Error: ' + err.message + '</span>';
+            addLog('Firewall request error: ' + err.message, 'error');
+        }
+        btn.disabled = false; btn.textContent = 'Open port(s) now';
+    }
+
+    async function scanSecurityRules() {
+        parseConfig();
+        const btn = document.getElementById('scanRulesBtn');
+        const result = document.getElementById('firewallResult');
+        const user = document.getElementById('cfgUser').value;
+        const key = document.getElementById('cfgKey').value;
+        const subnetId = document.getElementById('subnetSelect').value;
+        if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
+        if (!subnetId) {
+            addLog('Error: Select a subnet first', 'error');
+            result.style.display = 'block';
+            result.innerHTML = '<span style="color:var(--warning)">Select a subnet first</span>';
+            return;
+        }
+        btn.disabled = true; btn.textContent = 'Scanning...'; result.style.display = 'none';
+        try {
+            const res = await fetch('/api/scan-security-rules', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user: user, tenancy: document.getElementById('cfgTenancy').value,
+                    fingerprint: document.getElementById('cfgFingerprint').value,
+                    region: document.getElementById('cfgRegion').value,
+                    private_key: key, subnet_id: subnetId, timezone: userTimezone
+                })
+            });
+            const data = await res.json();
+            result.style.display = 'block';
+            if (data.success) {
+                if (data.rules.length === 0) {
+                    result.innerHTML = '<span style="color:var(--warning)">No rules found. Subnet is locked down.</span>';
+                } else {
+                    let html = '<div style="color:var(--text-secondary);margin-bottom:4px;">Found ' + data.rules.length + ' rule(s):</div>';
+                    data.rules.forEach(r => {
+                        const port = r.port_range ? 'port ' + r.port_range : 'all ports';
+                        html += '<div style="color:var(--text-muted);padding:2px 0;">- ' + r.type + ' | ' + r.direction + ' | ' + r.protocol + ' | ' + port + '</div>';
+                    });
+                    result.innerHTML = html;
+                    addLog('Scanned ' + data.rules.length + ' security rule(s)', 'success');
+                }
+            } else {
+                result.innerHTML = '<span style="color:var(--danger)">Failed: ' + data.error + '</span>';
+            }
+        } catch (err) {
+            result.style.display = 'block';
+            result.innerHTML = '<span style="color:var(--danger)">Error: ' + err.message + '</span>';
+            addLog('Security rule scan error: ' + err.message, 'error');
+        }
+        btn.disabled = false; btn.textContent = 'Scan existing rules';
+    }
+
+    async function testTelegram() {
+        const btn = document.getElementById('tgTestBtn');
+        const result = document.getElementById('tgResult');
+        const token = document.getElementById('tgToken').value.trim();
+        const chat = document.getElementById('tgChat').value.trim();
+        if (!token || !chat) {
+            result.innerHTML = '<span style="color:var(--warning)">Fill both fields first</span>';
+            return;
+        }
+        btn.disabled = true; btn.textContent = 'Testing...';
+        try {
+            const res = await fetch('/api/test-telegram', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ bot_token: token, chat_id: chat, timezone: userTimezone })
+            });
+            const data = await res.json();
+            if (data.success) {
+                result.innerHTML = '<span style="color:var(--positive)">Connected! Test message sent.</span>';
+                addLog('Telegram alerts configured', 'success');
+            } else {
+                result.innerHTML = '<span style="color:var(--danger)">Failed: ' + data.error + '</span>';
+            }
+        } catch (err) {
+            result.innerHTML = '<span style="color:var(--danger)">Error: ' + err.message + '</span>';
+        }
+        btn.disabled = false; btn.textContent = 'Test connection';
+    }
+
+    async function rebootInstance(instanceId, instanceName) {
+        parseConfig();
+        const user = document.getElementById('cfgUser').value;
+        const key = document.getElementById('cfgKey').value;
+        if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
+        if (!confirm('Reboot instance "' + instanceName + '"?')) {
+            addLog('Reboot cancelled', 'warn'); return;
+        }
+        addLog('Rebooting instance "' + instanceName + '"...', 'warn');
+        try {
+            const res = await fetch('/api/reboot-instance', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user: user, tenancy: document.getElementById('cfgTenancy').value,
+                    fingerprint: document.getElementById('cfgFingerprint').value,
+                    region: document.getElementById('cfgRegion').value,
+                    private_key: key, instance_id: instanceId, timezone: userTimezone
+                })
+            });
+            const data = await res.json();
+            if (data.success) {
+                addLog('Rebooted: ' + data.message, 'success');
+                setTimeout(checkQuota, 3000);
+            } else {
+                addLog('Reboot failed: ' + data.error, 'error');
+            }
+        } catch (err) {
+            addLog('Reboot error: ' + err.message, 'error');
+        }
+    }
+
+    async function deleteInstance(instanceId, instanceName) {
+        parseConfig();
+        const user = document.getElementById('cfgUser').value;
+        const key = document.getElementById('cfgKey').value;
+        if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
+        const confirmMsg = 'DANGER: Delete instance "' + instanceName + '"?' + String.fromCharCode(10) + String.fromCharCode(10) + 'This action CANNOT be undone. The instance and all attached boot volumes will be permanently lost.' + String.fromCharCode(10) + String.fromCharCode(10) + 'Are you sure?';
+        if (!confirm(confirmMsg)) {
+            addLog('Delete cancelled', 'warn'); return;
+        }
+        addLog('Deleting instance "' + instanceName + '"...', 'warn');
+        try {
+            const res = await fetch('/api/delete-instance', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user: user, tenancy: document.getElementById('cfgTenancy').value,
+                    fingerprint: document.getElementById('cfgFingerprint').value,
+                    region: document.getElementById('cfgRegion').value,
+                    private_key: key, instance_id: instanceId, timezone: userTimezone
+                })
+            });
+            const data = await res.json();
+            if (data.success) {
+                addLog('Deleted: ' + data.message, 'success');
+                setTimeout(checkQuota, 2000);
+            } else {
+                addLog('Delete failed: ' + data.error, 'error');
+            }
+        } catch (err) {
+            addLog('Delete error: ' + err.message, 'error');
+        }
+    }
+
+    async function deleteAllInstances() {
+        parseConfig();
+        const user = document.getElementById('cfgUser').value;
+        const key = document.getElementById('cfgKey').value;
+        if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
+        const confirmMsg = 'DANGER: Delete ALL instances in this tenancy?' + String.fromCharCode(10) + String.fromCharCode(10) + 'This will terminate EVERY running and stopped instance.' + String.fromCharCode(10) + String.fromCharCode(10) + 'This action CANNOT be undone.' + String.fromCharCode(10) + String.fromCharCode(10) + 'Type DELETE to confirm:';
+        const input = prompt(confirmMsg);
+        if (input !== 'DELETE') {
+            addLog('Bulk delete cancelled', 'warn'); return;
+        }
+        addLog('Initiating deletion of ALL instances...', 'error');
+        try {
+            const res = await fetch('/api/delete-all-instances', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user: user, tenancy: document.getElementById('cfgTenancy').value,
+                    fingerprint: document.getElementById('cfgFingerprint').value,
+                    region: document.getElementById('cfgRegion').value,
+                    private_key: key, timezone: userTimezone
+                })
+            });
+            const data = await res.json();
+            if (data.success) {
+                addLog('Deleted ' + data.deleted + ' instance(s)', 'success');
+                if (data.failed && data.failed.length > 0) {
+                    data.failed.forEach(f => addLog('Failed: ' + f.name + ' - ' + f.error, 'error'));
+                }
+                setTimeout(checkQuota, 3000);
+            } else {
+                addLog('Bulk delete failed: ' + data.error, 'error');
+            }
+        } catch (err) {
+            addLog('Bulk delete error: ' + err.message, 'error');
+        }
+    }
+
+    async function startLoop() {
+        const image = document.getElementById('imageSelect').value;
+        const ssh = document.getElementById('sshKey').value.trim();
+        const user = document.getElementById('cfgUser').value;
+        const key = document.getElementById('cfgKey').value;
+        if (!user || !key) { addLog('Error: Credentials required', 'error'); return; }
+        if (!image) { addLog('Error: Select an OS image first', 'error'); return; }
+        if (!ssh) { addLog('Error: SSH public key required', 'error'); return; }
+        const payload = {
+            user: user, tenancy: document.getElementById('cfgTenancy').value,
+            fingerprint: document.getElementById('cfgFingerprint').value,
+            region: document.getElementById('cfgRegion').value,
+            private_key: key, shape: document.getElementById('shapeSelect').value,
+            image_id: image, subnet_id: document.getElementById('subnetSelect').value,
+            ad_preference: document.getElementById('adSelect').value,
+            display_name: document.getElementById('vmName').value,
+            ocpus: document.getElementById('ocpus').value,
+            memory: document.getElementById('memory').value,
+            boot_volume_gb: document.getElementById('bootVol').value,
+            ssh_key: ssh,
+            telegram_bot_token: document.getElementById('tgToken').value.trim(),
+            telegram_chat_id: document.getElementById('tgChat').value.trim(),
+            telegram_live_log: document.getElementById('tgLiveLog').checked,
+            retry_delay: parseInt(document.getElementById('retryDelay').value) || 60,
+            randomize_delay: delayMode === 'random',
+            random_min: 25, random_max: 60,
+            timezone: userTimezone
+        };
+        try {
+            const res = await fetch('/api/auto-launch-loop', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const data = await res.json();
+            if (data.success) {
+                updateStatus(true);
+                addLog('Provisioning loop started', 'success');
+                startPolling();
+            } else {
+                addLog('Failed: ' + data.error, 'error');
+            }
+        } catch (err) {
+            addLog('Request error: ' + err.message, 'error');
+        }
+    }
+
+    async function stopLoop() {
+        try {
+            const res = await fetch('/api/stop-loop', { method: 'POST' });
+            const data = await res.json();
+            addLog(data.message, 'warn');
+            updateStatus(false);
+            stopPolling();
+        } catch (err) {
+            addLog('Stop error: ' + err.message, 'error');
+        }
+    }
+
+    async function fetchLogs() {
+        try {
+            const res = await fetch('/api/logs?offset=' + logOffset);
+            const data = await res.json();
+            if (data.logs && data.logs.length > 0) {
+                const term = document.getElementById('terminalBody');
+                data.logs.forEach(line => {
+                    const div = document.createElement('div');
+                    div.className = 'log-line';
+                    div.textContent = line;
+                    term.appendChild(div);
+                });
+                logOffset = data.next_offset;
+                term.scrollTop = term.scrollHeight;
+            }
+        } catch (e) {}
+    }
+
+    async function checkStatus() {
+        try {
+            const res = await fetch('/api/status');
+            const data = await res.json();
+            if (data.success) {
+                updateStatus(data.running);
+                if (data.running && !pollInterval) startPolling();
+                if (!data.running && pollInterval) stopPolling();
+            }
+        } catch (e) {}
+    }
+
+    function startPolling() {
+        if (pollInterval) return;
+        pollInterval = setInterval(fetchLogs, 2000);
+        statusInterval = setInterval(checkStatus, 5000);
+    }
+
+    function stopPolling() {
+        if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+        if (statusInterval) { clearInterval(statusInterval); statusInterval = null; }
+    }
+
+    function onTgLiveLogChange() {
+        document.getElementById('tgLiveWarning').style.display = document.getElementById('tgLiveLog').checked ? 'block' : 'none';
+    }
+
+    function onAllOSChange() {
+        document.getElementById('imageSelect').innerHTML = '<option value="">-- Scan images --</option>';
+    }
+
+    function clearAll() {
+        if (isRunning) { addLog('Stop the provisioning loop before clearing', 'warn'); return; }
+        document.getElementById('rawConfig').value = '';
+        document.getElementById('cfgUser').value = '';
+        document.getElementById('cfgTenancy').value = '';
+        document.getElementById('cfgFingerprint').value = '';
+        document.getElementById('cfgRegion').value = '';
+        document.getElementById('cfgKey').value = '';
+        document.getElementById('keyZone').classList.remove('success');
+        document.getElementById('keyZoneContent').innerHTML =
+            '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="color:var(--text-muted);margin-bottom:6px;">' +
+            '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>' +
+            '<div style="font-size:12px;color:var(--text-muted);">Click to upload .pem, .txt, or .key</div>';
+        document.getElementById('keyFile').value = '';
+        document.getElementById('imageSelect').innerHTML = '<option value="">-- Scan images first --</option>';
+        document.getElementById('subnetSelect').innerHTML = '<option value="">-- Auto-select first available --</option>';
+        document.getElementById('subnetInfo').style.display = 'none';
+        document.getElementById('vnicSelect').innerHTML = '<option value="">-- Scan VNICs first --</option>';
+        document.getElementById('vnicInfo').style.display = 'none';
+        document.getElementById('vmName').value = 'Arm';
+        document.getElementById('ocpus').value = '2';
+        document.getElementById('memory').value = '12';
+        document.getElementById('bootVol').value = '50';
+        document.getElementById('sshKey').value = '';
+        document.getElementById('sshZone').classList.remove('success');
+        document.getElementById('sshZoneContent').innerHTML =
+            '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="color:var(--text-muted);margin-bottom:6px;">' +
+            '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>' +
+            '<div style="font-size:12px;color:var(--text-muted);">Click to upload .pub or .txt</div>';
+        document.getElementById('sshFile').value = '';
+        document.getElementById('tgToken').value = '';
+        document.getElementById('tgChat').value = '';
+        document.getElementById('tgLiveLog').checked = false;
+        document.getElementById('tgLiveWarning').style.display = 'none';
+        document.getElementById('tgResult').innerHTML = '';
+        document.getElementById('quotaPanel').style.display = 'none';
+        document.getElementById('quotaPanel').innerHTML = '';
+        document.getElementById('shapeInfo').style.display = 'none';
+        document.getElementById('shapeInfo').innerHTML = '';
+        clearLogs();
+        addLog('All fields cleared', 'success');
+    }
+
+    window.addEventListener('load', () => {
+        fetchLogs();
+        checkStatus();
+        setInterval(checkStatus, 5000);
+    });
+    </script>
+</body>
+</html>
