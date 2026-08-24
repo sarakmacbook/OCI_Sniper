@@ -1,4 +1,4 @@
-# 🎯 OCI Sniper v5
+# 🎯 OCI Sniper v5.0.1
 
 Always-Free instance grabber & manager for Oracle Cloud Infrastructure (OCI).
 
@@ -116,6 +116,14 @@ All endpoints JSON. POST bodies take `user`, `tenancy`, `fingerprint`, `region`,
 | Auth fails right after deploy | `APP_PASSWORD` not picked up — check platform env vars, redeploy. |
 | Service sleeps anyway | Ensure `KEEP_ALIVE=true` and (non-Render) `KEEP_ALIVE_URL` points at the public URL. Check logs for `Keep-alive ping OK`. |
 | Image dropdown empty | Your region may lack Ubuntu images for that shape — enable *all OS* mode or pick another shape. |
+
+## Changelog v5.0 → v5.0.1
+
+**Fixed**
+- Railway/Heroku health check failing at boot: `python:3.12-slim` ships without timezone data, so
+  `ZoneInfo("Asia/Phnom_Penh")` raised `ZoneInfoNotFoundError` during import and killed gunicorn before `/health` could answer.
+- `app.py`: module-level tz lookups are now guarded (fall back to UTC); `tzdata` wheel added to requirements;
+  Dockerfile installs the `tzdata` apt package; nixpacks setup adds `tzdata`.
 
 ## Changelog v4 → v5
 

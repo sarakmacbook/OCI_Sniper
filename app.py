@@ -15,9 +15,12 @@ import oci
 from zoneinfo import ZoneInfo, available_timezones
 
 def get_user_tz(tz_name=None):
-    if tz_name and tz_name in available_timezones():
-        return ZoneInfo(tz_name)
-    return ZoneInfo("UTC")
+    try:
+        if tz_name and tz_name in available_timezones():
+            return ZoneInfo(tz_name)
+        return ZoneInfo("UTC")
+    except Exception:
+        return datetime.timezone.utc
 
 def get_user_time(tz_name=None):
     tz = get_user_tz(tz_name)
@@ -28,12 +31,16 @@ def format_user_time(dt=None, tz_name=None):
         dt = get_user_time(tz_name)
     return dt.strftime('%Y-%m-%d %H:%M:%S')
 
-# Legacy alias
-PHNOM_PENH_TZ = ZoneInfo("Asia/Phnom_Penh")
+# Legacy alias — guarded so import never fails on hosts without tzdata
+# (python:3.12-slim ships no /usr/share/zoneinfo and no tzdata wheel).
+try:
+    PHNOM_PENH_TZ = ZoneInfo("Asia/Phnom_Penh")
+except Exception:
+    PHNOM_PENH_TZ = datetime.timezone.utc
 get_phnom_penh_time = lambda: get_user_time("Asia/Phnom_Penh")
 format_phnom_penh_time = lambda dt=None: format_user_time(dt, "Asia/Phnom_Penh")
 
-APP_VERSION = "5.0"
+APP_VERSION = "5.0.1"
 
 app = Flask(__name__)
 
