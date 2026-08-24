@@ -1,6 +1,14 @@
 # 🎯 OCI Sniper v5
 
+
+
+
+
+
 Always-Free instance grabber & manager for Oracle Cloud Infrastructure (OCI).
+
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/template)
+
 
 A self-hosted Flask web panel that hunts down OCI Always Free capacity (A1.Flex ARM / E2.1.Micro) with an automated retry loop, then lets you manage everything from one dashboard: instances, networking, firewall ports, quota usage — with Telegram alerts when an instance lands.
 
