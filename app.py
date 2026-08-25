@@ -232,17 +232,16 @@ def build_config(data):
 def require_auth(f):
     @functools.wraps(f)
     def decorated(*args, **kwargs):
+        # If no APP_PASSWORD is set, allow all requests (no auth required)
         if not ADMIN_PASSWORD:
-            # Fail closed on state-changing endpoints when no password is configured.
-            if request.method == 'POST':
-                return jsonify({'success': False,
-                                'error': 'Server has no APP_PASSWORD set. Refusing unauthenticated action.'}), 503
             return f(*args, **kwargs)
+        # Rate limit check
         ok, retry_after = rate_limit_check()
         if not ok:
             resp = Response('Too many requests', 429)
             resp.headers['Retry-After'] = str(retry_after)
             return resp
+        # Require Basic Auth
         auth = request.authorization
         if not auth or not hmac.compare_digest(auth.password.encode(), ADMIN_PASSWORD.encode()):
             return Response(
@@ -269,9 +268,10 @@ def api_version():
 @app.route('/')
 def home():
     try:
-        return render_template('index.html')
+        with open('index.html', 'r', encoding='utf-8') as f:
+            return f.read()
     except Exception as e:
-        return f"Flask Template Error: {str(e)}", 500
+        return f"Error loading index.html: {str(e)}", 500
 
 
 @app.route('/api/list-images', methods=['POST'])
