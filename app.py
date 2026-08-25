@@ -1036,6 +1036,12 @@ def _register_loop(user_ocid, tenancy_ocid):
         for k in stale:
             del _loop_registry[k]
         if key in _loop_registry:
+            # Another loop is already using these exact same OCI credentials
+            existing_time = _loop_registry[key]
+            elapsed = int(now - existing_time)
+            add_log(f"[CONFLICT] Another provisioning loop is already using these OCI credentials (running for {elapsed}s).")
+            add_log(f"[CONFLICT] Only ONE loop per OCI account is allowed to prevent API rate limits.")
+            add_log(f"[CONFLICT] Stop the existing loop first, or wait for it to finish.")
             return False
         _loop_registry[key] = now
         return True
@@ -1061,11 +1067,14 @@ def run_automated_creation(config, account_config, compute_client, network_clien
 
     # CRITICAL: Register this loop to prevent duplicates
     if not _register_loop(user_ocid, tenancy_ocid):
-        add_log("BLOCKED: Another loop is already running for this OCI account. Stop it first.")
         with automation_lock:
             automation_running = False
             automation_shape = None
         return
+
+    # Log that we've successfully locked these credentials
+    add_log(f"[LOCKED] OCI credentials locked for this loop. User: {user_ocid[:30]}... | Tenancy: {tenancy_ocid[:30]}...")
+    add_log("[LOCKED] If you try to start another loop with the same credentials, it will be blocked.")
 
     # CRITICAL: Lock running state immediately and keep it locked
     with automation_lock:
@@ -1184,7 +1193,8 @@ def run_automated_creation(config, account_config, compute_client, network_clien
             with _loop_registry_lock:
                 key = f"{user_ocid}:{tenancy_ocid}"
                 if key not in _loop_registry:
-                    add_log("STOPPED: Loop registry cleared. Another loop or stop command detected.")
+                    add_log("[STOPPED] Loop registry cleared. Another loop with the SAME OCI credentials was started elsewhere, or stop command was issued.")
+                    add_log("[STOPPED] Only one loop per OCI account is allowed. The newer loop takes priority.")
                     break
 
             # CRITICAL: Re-verify automation_running is still True
@@ -1394,7 +1404,9 @@ def auto_launch():
     with automation_lock:
         if automation_running:
             if automation_shape and automation_shape != requested_shape:
+                add_log(f"[BLOCKED] Loop already running for shape '{automation_shape}'. Cannot start '{requested_shape}'.")
                 return jsonify({'success': False, 'error': f"A provisioning loop is already running for shape '{automation_shape}'. Stop it first before starting '{requested_shape}'."})
+            add_log("[BLOCKED] A provisioning loop is already running on this server.")
             return jsonify({'success': False, 'error': 'A provisioning loop is already running.'})
         automation_running = True
         automation_shape = requested_shape
