@@ -344,6 +344,7 @@
     </style>
 <base target="_blank">
 <base target="_blank">
+<base target="_blank">
 </head>
 <body>
     <div class="container">
@@ -603,6 +604,16 @@
     let pollInterval = null;
     let statusInterval = null;
     let userTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+
+    // Restore running state from sessionStorage to prevent "Stopped" flash on refresh
+    try {
+        const savedRunning = sessionStorage.getItem('oci_sniper_running');
+        if (savedRunning === 'true') {
+            updateStatus(true); // Show "Running" immediately while we verify
+            addLog('Restoring running state from previous session...', 'info');
+        }
+    } catch(e) {}
+
     addLog('Timezone detected: ' + userTimezone, 'info');
     loadCreds();
 
@@ -838,6 +849,10 @@
             startBtn.disabled = false;
             startBtn.style.opacity = '1';
         }
+        // Persist running state so refresh doesn't flash "Stopped"
+        try {
+            sessionStorage.setItem('oci_sniper_running', running ? 'true' : 'false');
+        } catch(e) {}
     }
 
     async function checkQuota() {
@@ -1385,6 +1400,11 @@
         if (!user || !key) { addLog('Error: Credentials required', 'error'); return; }
         if (!image) { addLog('Error: Select an OS image first', 'error'); return; }
         if (!ssh) { addLog('Error: SSH public key required', 'error'); return; }
+
+        // Optimistic UI: show Running immediately before API call
+        updateStatus(true);
+        addLog('Starting provisioning loop...', 'info');
+
         const payload = {
             user: user, tenancy: document.getElementById('cfgTenancy').value,
             fingerprint: document.getElementById('cfgFingerprint').value,
@@ -1416,22 +1436,33 @@
                 addLog('Provisioning loop started', 'success');
                 startPolling();
             } else {
+                // Server rejected - revert UI to Stopped
+                updateStatus(false);
                 addLog('Failed: ' + data.error, 'error');
             }
         } catch (err) {
+            // Network error - keep showing Running, next status poll will correct
             addLog('Request error: ' + err.message, 'error');
+            addLog('Will retry status check...', 'warn');
         }
     }
 
     async function stopLoop() {
         try {
+            // Optimistic UI: show Stopped immediately
+            updateStatus(false);
+            stopPolling();
+
             const res = await fetch('/api/stop-loop', { method: 'POST' });
             const data = await res.json();
             addLog(data.message, 'warn');
-            updateStatus(false);
-            stopPolling();
+
+            // Clear sessionStorage
+            try { sessionStorage.removeItem('oci_sniper_running'); } catch(e) {}
         } catch (err) {
             addLog('Stop error: ' + err.message, 'error');
+            // Revert if stop failed
+            updateStatus(false);
         }
     }
 
@@ -1455,14 +1486,17 @@
 
     async function checkStatus() {
         try {
-            const res = await fetch('/api/status');
+            const res = await fetch('/api/status', { cache: 'no-store' });
             const data = await res.json();
             if (data.success) {
                 updateStatus(data.running);
                 if (data.running && !pollInterval) startPolling();
                 if (!data.running && pollInterval) stopPolling();
             }
-        } catch (e) {}
+        } catch (e) {
+            // If we can't reach server but thought we were running, keep showing Running
+            // The next successful poll will correct it
+        }
     }
 
     function startPolling() {
@@ -1528,9 +1562,14 @@
     }
 
     window.addEventListener('load', () => {
-        fetchLogs();
-        checkStatus();
-        setInterval(checkStatus, 5000);
+        // Check status FIRST before anything else to avoid "Stopped" flash
+        checkStatus().then(() => {
+            fetchLogs();
+            // Aggressive status checking: every 2s if running, 5s if stopped
+            setInterval(() => {
+                checkStatus();
+            }, isRunning ? 2000 : 5000);
+        });
     });
     </script>
 </body>
