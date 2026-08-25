@@ -232,7 +232,7 @@ def build_config(data):
 def require_auth(f):
     @functools.wraps(f)
     def decorated(*args, **kwargs):
-        # If no APP_PASSWORD is set, allow all requests (no auth required)
+        # If no APP_PASSWORD is set, allow all requests without authentication
         if not ADMIN_PASSWORD:
             return f(*args, **kwargs)
         # Rate limit check
@@ -241,7 +241,7 @@ def require_auth(f):
             resp = Response('Too many requests', 429)
             resp.headers['Retry-After'] = str(retry_after)
             return resp
-        # Require Basic Auth
+        # Require Basic Auth when password is configured
         auth = request.authorization
         if not auth or not hmac.compare_digest(auth.password.encode(), ADMIN_PASSWORD.encode()):
             return Response(
@@ -1022,14 +1022,49 @@ def get_oci_username(config, identity_client):
         return None
 
 
+# ---- Loop registry to prevent duplicate loops for same user ----
+_loop_registry = {}
+_loop_registry_lock = threading.Lock()
+
+def _register_loop(user_ocid, tenancy_ocid):
+    """Register a loop start. Returns True if allowed, False if duplicate detected."""
+    key = f"{user_ocid}:{tenancy_ocid}"
+    with _loop_registry_lock:
+        now = time.time()
+        # Clean old entries (> 5 min)
+        stale = [k for k, v in _loop_registry.items() if now - v > 300]
+        for k in stale:
+            del _loop_registry[k]
+        if key in _loop_registry:
+            return False
+        _loop_registry[key] = now
+        return True
+
+def _unregister_loop(user_ocid, tenancy_ocid):
+    """Unregister a loop end."""
+    key = f"{user_ocid}:{tenancy_ocid}"
+    with _loop_registry_lock:
+        _loop_registry.pop(key, None)
+
+
 def run_automated_creation(config, account_config, compute_client, network_client, identity_client,
                            retry_delay=60, randomize_delay=False, random_min=25, random_max=60,
                            telegram_bot_token=None, telegram_chat_id=None, tz_name=None):
-    global automation_running
+    global automation_running, automation_shape
     set_user_tz(tz_name)
     oci_username = None
     target_region = config.get('region', 'unknown')
     target_name = account_config.get('display_name', 'AlwaysFree-Bot')
+    user_ocid = config.get('user', '')
+    tenancy_ocid = config.get('tenancy', '')
+
+    # CRITICAL: Register this loop to prevent duplicates
+    if not _register_loop(user_ocid, tenancy_ocid):
+        add_log("STOPPED: Another provisioning loop is already running for this OCI account. Only one loop per account is allowed.")
+        with automation_lock:
+            automation_running = False
+            automation_shape = None
+        return
     try:
         oci_username = get_oci_username(config, identity_client)
         if oci_username:
@@ -1124,6 +1159,13 @@ def run_automated_creation(config, account_config, compute_client, network_clien
             _random.shuffle(ad_list)
             add_log(f"AD order randomized for faster discovery: {', '.join(ad_list)}")
         while True:
+            # CRITICAL: Verify we still own this loop (no duplicate started)
+            with _loop_registry_lock:
+                key = f"{user_ocid}:{tenancy_ocid}"
+                if key not in _loop_registry:
+                    add_log("STOPPED: Loop registry cleared by another process. Stopping.")
+                    break
+
             attempts += 1
             if MAX_ATTEMPTS and attempts > MAX_ATTEMPTS:
                 add_log(f"Attempt limit reached ({MAX_ATTEMPTS}). Giving up.")
@@ -1249,9 +1291,12 @@ def run_automated_creation(config, account_config, compute_client, network_clien
             )
             send_telegram_message(telegram_bot_token, telegram_chat_id, tg_msg, get_current_tz())
     finally:
+        # CRITICAL: Always unregister and reset state in finally block
+        _unregister_loop(user_ocid, tenancy_ocid)
         with automation_lock:
             automation_running = False
             automation_shape = None
+        add_log("Provisioning loop state reset. Ready for new loop.")
 
 
 @app.route('/api/free-tier-status', methods=['POST'])
@@ -1281,7 +1326,7 @@ def get_status():
 @app.route('/api/auto-launch-loop', methods=['POST'])
 @require_auth
 def auto_launch():
-    global automation_running, tg_live_enabled, tg_live_bot_token, tg_live_chat_id
+    global automation_running, automation_shape, tg_live_enabled, tg_live_bot_token, tg_live_chat_id, tg_live_last_sent
     data = request.json or {}
     set_user_tz(data.get('timezone'))
     config = build_config(data)
@@ -1338,11 +1383,17 @@ def auto_launch():
 @app.route('/api/stop-loop', methods=['POST'])
 @require_auth
 def stop_loop():
-    global tg_live_enabled
+    global tg_live_enabled, automation_running, automation_shape
     stop_event.set()
     with tg_live_lock:
         tg_live_enabled = False
-    return jsonify({'success': True, 'message': 'Stop signal sent.'})
+    # Clear all loop registrations to force-stop any running loops
+    with _loop_registry_lock:
+        _loop_registry.clear()
+    with automation_lock:
+        automation_running = False
+        automation_shape = None
+    return jsonify({'success': True, 'message': 'Stop signal sent. All loops cleared.'})
 
 
 @app.route('/api/logs', methods=['GET'])
