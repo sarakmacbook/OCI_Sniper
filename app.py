@@ -1350,6 +1350,7 @@ def get_status():
     # Cross-check: if registry is empty but running is True, fix it
     with _loop_registry_lock:
         registry_empty = len(_loop_registry) == 0
+        active_loops = list(_loop_registry.keys())
 
     if running and registry_empty:
         # Stale state detected - fix it
@@ -1357,9 +1358,15 @@ def get_status():
             automation_running = False
             automation_shape = None
         add_log("Fixed stale running state (no active loops in registry)")
-        return jsonify({'success': True, 'running': False, 'shape': None})
+        return jsonify({'success': True, 'running': False, 'shape': None, 'active_loops': 0})
 
-    return jsonify({'success': True, 'running': running, 'shape': shape})
+    return jsonify({
+        'success': True,
+        'running': running,
+        'shape': shape,
+        'active_loops': len(active_loops),
+        'timestamp': time.time()
+    })
 
 
 @app.route('/api/auto-launch-loop', methods=['POST'])
