@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OCI Sniper v5</title>
+    <title>OCI Provisioner Portal v5</title>
     <style>
         :root {
             --bg: #0f0f12;
@@ -350,8 +350,8 @@
     <div class="container">
         <div class="header">
             <div>
-                <h1>🎯 OCI Sniper</h1>
-                <p>Always Free capacity hunter · v5</p>
+                <h1>OCI Provisioner Portal</h1>
+                <p>Always free tier automation v2</p>
             </div>
             <div style="display:flex;align-items:center;gap:8px;">
                 <button onclick="clearAll()" style="padding:5px 12px;border:1px solid var(--border);border-radius:20px;background:var(--surface-raised);color:var(--text-muted);font-size:11px;font-weight:500;cursor:pointer;">Clear all</button>
@@ -568,7 +568,51 @@
             </div>
         </div>
 
-        <!-- Action Bar -->
+                <!-- Boot Volume Management Panel -->
+        <div class="panel">
+            <button class="panel-header" onclick="togglePanel('bv')">
+                <span class="icon-group">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12h20"/><path d="M2 12l5-5"/><path d="M2 12l5 5"/><path d="M22 12l-5-5"/><path d="M22 12l-5 5"/><rect x="8" y="8" width="8" height="8" rx="1"/></svg>
+                    4. Boot Volume Management
+                </span>
+                <svg id="bvChevron" class="chevron collapsed" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+            </button>
+            <div id="bvBody" class="panel-body collapsed">
+                <div class="btn-row">
+                    <button class="btn" id="scanBvBtn" onclick="scanBootVolumes()">Scan boot volumes</button>
+                    <button class="btn" onclick="clearBootVolumes()">Clear list</button>
+                </div>
+                <div id="bvPanel" style="display:none;"></div>
+                <div id="bvAttachPanel" style="display:none; margin-top:12px; padding:12px; background:var(--surface-raised); border-radius:var(--radius-md); border:1px solid var(--border);">
+                    <div style="font-size:13px; font-weight:500; margin-bottom:8px; color:var(--text-secondary);">Attach / Replace Boot Volume</div>
+                    <div class="grid-2">
+                        <div class="form-group">
+                            <label class="form-label">Target Instance</label>
+                            <select id="bvTargetInstance" class="form-select">
+                                <option value="">-- Select instance --</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Operation</label>
+                            <select id="bvOperation" class="form-select" onchange="onBvOpChange()">
+                                <option value="attach">Attach to instance</option>
+                                <option value="replace">Replace instance boot volume</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="form-group" id="bvSourceVolumeGroup">
+                        <label class="form-label">Source Boot Volume</label>
+                        <select id="bvSourceVolume" class="form-select">
+                            <option value="">-- Select detached volume --</option>
+                        </select>
+                    </div>
+                    <button class="btn btn-primary" id="bvActionBtn" onclick="executeBvAction()" style="width:100%; margin-top:8px;">Attach to instance</button>
+                    <div id="bvActionResult" style="margin-top:8px; font-size:12px; display:none;"></div>
+                </div>
+            </div>
+        </div>
+
+<!-- Action Bar -->
         <div class="action-bar">
             <button id="startBtn" class="btn btn-primary" onclick="startLoop()">Start provisioning loop</button>
             <button id="stopBtn" class="btn btn-danger" onclick="stopLoop()">Stop</button>
@@ -604,16 +648,6 @@
     let pollInterval = null;
     let statusInterval = null;
     let userTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
-
-    // Restore running state from sessionStorage to prevent "Stopped" flash on refresh
-    try {
-        const savedRunning = sessionStorage.getItem('oci_sniper_running');
-        if (savedRunning === 'true') {
-            updateStatus(true); // Show "Running" immediately while we verify
-            addLog('Restoring running state from previous session...', 'info');
-        }
-    } catch(e) {}
-
     addLog('Timezone detected: ' + userTimezone, 'info');
     loadCreds();
 
@@ -849,10 +883,6 @@
             startBtn.disabled = false;
             startBtn.style.opacity = '1';
         }
-        // Persist running state so refresh doesn't flash "Stopped"
-        try {
-            sessionStorage.setItem('oci_sniper_running', running ? 'true' : 'false');
-        } catch(e) {}
     }
 
     async function checkQuota() {
@@ -1400,11 +1430,6 @@
         if (!user || !key) { addLog('Error: Credentials required', 'error'); return; }
         if (!image) { addLog('Error: Select an OS image first', 'error'); return; }
         if (!ssh) { addLog('Error: SSH public key required', 'error'); return; }
-
-        // Optimistic UI: show Running immediately before API call
-        updateStatus(true);
-        addLog('Starting provisioning loop...', 'info');
-
         const payload = {
             user: user, tenancy: document.getElementById('cfgTenancy').value,
             fingerprint: document.getElementById('cfgFingerprint').value,
@@ -1436,33 +1461,22 @@
                 addLog('Provisioning loop started', 'success');
                 startPolling();
             } else {
-                // Server rejected - revert UI to Stopped
-                updateStatus(false);
                 addLog('Failed: ' + data.error, 'error');
             }
         } catch (err) {
-            // Network error - keep showing Running, next status poll will correct
             addLog('Request error: ' + err.message, 'error');
-            addLog('Will retry status check...', 'warn');
         }
     }
 
     async function stopLoop() {
         try {
-            // Optimistic UI: show Stopped immediately
-            updateStatus(false);
-            stopPolling();
-
             const res = await fetch('/api/stop-loop', { method: 'POST' });
             const data = await res.json();
             addLog(data.message, 'warn');
-
-            // Clear sessionStorage
-            try { sessionStorage.removeItem('oci_sniper_running'); } catch(e) {}
+            updateStatus(false);
+            stopPolling();
         } catch (err) {
             addLog('Stop error: ' + err.message, 'error');
-            // Revert if stop failed
-            updateStatus(false);
         }
     }
 
@@ -1486,17 +1500,14 @@
 
     async function checkStatus() {
         try {
-            const res = await fetch('/api/status', { cache: 'no-store' });
+            const res = await fetch('/api/status');
             const data = await res.json();
             if (data.success) {
                 updateStatus(data.running);
                 if (data.running && !pollInterval) startPolling();
                 if (!data.running && pollInterval) stopPolling();
             }
-        } catch (e) {
-            // If we can't reach server but thought we were running, keep showing Running
-            // The next successful poll will correct it
-        }
+        } catch (e) {}
     }
 
     function startPolling() {
@@ -1557,20 +1568,269 @@
         document.getElementById('quotaPanel').innerHTML = '';
         document.getElementById('shapeInfo').style.display = 'none';
         document.getElementById('shapeInfo').innerHTML = '';
+        document.getElementById('bvPanel').style.display = 'none';
+        document.getElementById('bvPanel').innerHTML = '';
+        document.getElementById('bvAttachPanel').style.display = 'none';
+        document.getElementById('bvTargetInstance').innerHTML = '<option value="">-- Select instance --</option>';
+        document.getElementById('bvSourceVolume').innerHTML = '<option value="">-- Select detached volume --</option>';
+        document.getElementById('bvActionResult').style.display = 'none';
+        document.getElementById('bvActionResult').innerHTML = '';
+        bootVolumes = [];
         clearLogs();
         addLog('All fields cleared', 'success');
     }
 
     window.addEventListener('load', () => {
-        // Check status FIRST before anything else to avoid "Stopped" flash
-        checkStatus().then(() => {
-            fetchLogs();
-            // Aggressive status checking: every 2s if running, 5s if stopped
-            setInterval(() => {
-                checkStatus();
-            }, isRunning ? 2000 : 5000);
-        });
+        fetchLogs();
+        checkStatus();
+        setInterval(checkStatus, 5000);
     });
-    </script>
+    
+    // ---- Boot Volume Management ----
+    let bootVolumes = [];
+    let bvInstances = [];
+
+    async function scanBootVolumes() {
+        parseConfig();
+        const btn = document.getElementById('scanBvBtn');
+        const panel = document.getElementById('bvPanel');
+        const user = document.getElementById('cfgUser').value;
+        const key = document.getElementById('cfgKey').value;
+        if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
+        btn.disabled = true; btn.textContent = 'Scanning...';
+        panel.style.display = 'block';
+        panel.innerHTML = '<div style="font-size:12px;color:var(--text-muted);">Fetching boot volumes...</div>';
+        try {
+            const res = await fetch('/api/list-boot-volumes', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user: user, tenancy: document.getElementById('cfgTenancy').value,
+                    fingerprint: document.getElementById('cfgFingerprint').value,
+                    region: document.getElementById('cfgRegion').value,
+                    private_key: key, timezone: userTimezone
+                })
+            });
+            const data = await res.json();
+            if (data.success) {
+                bootVolumes = data.volumes;
+                renderBootVolumes();
+                addLog('Found ' + data.volumes.length + ' boot volume(s)', 'success');
+                populateBvAttachPanel();
+            } else {
+                panel.innerHTML = '<div style="color:var(--danger);font-size:12px;">Error: ' + data.error + '</div>';
+                addLog('Boot volume scan failed: ' + data.error, 'error');
+            }
+        } catch (err) {
+            panel.innerHTML = '<div style="color:var(--danger);font-size:12px;">Request error: ' + err.message + '</div>';
+            addLog('Boot volume scan error: ' + err.message, 'error');
+        }
+        btn.disabled = false; btn.textContent = 'Scan boot volumes';
+    }
+
+    function renderBootVolumes() {
+        const panel = document.getElementById('bvPanel');
+        if (!bootVolumes.length) {
+            panel.innerHTML = '<div style="font-size:12px;color:var(--text-muted);">No boot volumes found.</div>';
+            return;
+        }
+        let html = '<div style="margin-top:8px;">';
+        bootVolumes.forEach(bv => {
+            const attached = bv.attached_instance;
+            const attachInfo = attached
+                ? '<span style="color:var(--positive);">Attached to: ' + attached.name + '</span>'
+                : '<span style="color:var(--warning);">Detached</span>';
+            const sizeInfo = bv.size_gb + ' GB';
+            html += '<div class="instance-row" style="align-items:flex-start; flex-wrap:wrap;">';
+            html += '<div class="instance-info" style="min-width:200px;">';
+            html += '<div class="instance-name">' + bv.name + '</div>';
+            html += '<div class="instance-meta">' + sizeInfo + ' | ' + bv.ad + ' | ' + attachInfo + '</div>';
+            html += '</div>';
+            html += '<div style="display:flex;gap:4px;flex-wrap:wrap;">';
+            if (!attached) {
+                html += '<button class="instance-delete" onclick="deleteBootVolume(' + "'" + bv.id + "'" + ',' + "'" + bv.name + "'" + ')" title="Delete this boot volume" style="border-color:rgba(239,68,68,0.3);">Delete</button>';
+            } else {
+                html += '<button class="instance-delete" onclick="detachBootVolume(' + "'" + bv.attachment_id + "'" + ',' + "'" + bv.name + "'" + ')" title="Detach from instance (instance will be stopped)" style="border-color:rgba(245,158,11,0.3);color:var(--warning);">Detach</button>';
+            }
+            html += '</div>';
+            html += '</div>';
+        });
+        html += '</div>';
+        panel.innerHTML = html;
+    }
+
+    async function deleteBootVolume(volumeId, volumeName) {
+        if (!confirm('Delete boot volume "' + volumeName + '"?\n\nThis action CANNOT be undone.')) {
+            addLog('Delete boot volume cancelled', 'warn'); return;
+        }
+        parseConfig();
+        const user = document.getElementById('cfgUser').value;
+        const key = document.getElementById('cfgKey').value;
+        addLog('Deleting boot volume "' + volumeName + '"...', 'warn');
+        try {
+            const res = await fetch('/api/delete-boot-volume', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user: user, tenancy: document.getElementById('cfgTenancy').value,
+                    fingerprint: document.getElementById('cfgFingerprint').value,
+                    region: document.getElementById('cfgRegion').value,
+                    private_key: key, volume_id: volumeId, timezone: userTimezone
+                })
+            });
+            const data = await res.json();
+            if (data.success) {
+                addLog('Deleted boot volume: ' + volumeName, 'success');
+                setTimeout(scanBootVolumes, 2000);
+            } else {
+                addLog('Delete boot volume failed: ' + data.error, 'error');
+            }
+        } catch (err) {
+            addLog('Delete boot volume error: ' + err.message, 'error');
+        }
+    }
+
+    async function detachBootVolume(attachmentId, volumeName) {
+        if (!confirm('Detach boot volume "' + volumeName + '" from its instance?\n\nThe instance will be STOPPED first, then the volume detached. You can re-attach or replace it later.')) {
+            addLog('Detach cancelled', 'warn'); return;
+        }
+        parseConfig();
+        const user = document.getElementById('cfgUser').value;
+        const key = document.getElementById('cfgKey').value;
+        addLog('Detaching boot volume "' + volumeName + '"...', 'warn');
+        try {
+            const res = await fetch('/api/detach-boot-volume', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user: user, tenancy: document.getElementById('cfgTenancy').value,
+                    fingerprint: document.getElementById('cfgFingerprint').value,
+                    region: document.getElementById('cfgRegion').value,
+                    private_key: key, attachment_id: attachmentId, timezone: userTimezone
+                })
+            });
+            const data = await res.json();
+            if (data.success) {
+                addLog('Detached boot volume: ' + volumeName + (data.instance_was_running ? ' (instance was stopped)' : ''), 'success');
+                setTimeout(scanBootVolumes, 3000);
+                setTimeout(checkQuota, 3000);
+            } else {
+                addLog('Detach failed: ' + data.error, 'error');
+            }
+        } catch (err) {
+            addLog('Detach error: ' + err.message, 'error');
+        }
+    }
+
+    async function populateBvAttachPanel() {
+        parseConfig();
+        const user = document.getElementById('cfgUser').value;
+        const key = document.getElementById('cfgKey').value;
+        if (!user || !key) return;
+        try {
+            const res = await fetch('/api/list-instances', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user: user, tenancy: document.getElementById('cfgTenancy').value,
+                    fingerprint: document.getElementById('cfgFingerprint').value,
+                    region: document.getElementById('cfgRegion').value,
+                    private_key: key, timezone: userTimezone
+                })
+            });
+            const data = await res.json();
+            const instSelect = document.getElementById('bvTargetInstance');
+            const volSelect = document.getElementById('bvSourceVolume');
+            instSelect.innerHTML = '<option value="">-- Select instance --</option>';
+            volSelect.innerHTML = '<option value="">-- Select detached volume --</option>';
+            if (data.success && data.instances) {
+                bvInstances = data.instances.filter(i => i.state !== 'TERMINATED');
+                bvInstances.forEach(inst => {
+                    const opt = document.createElement('option');
+                    opt.value = inst.id;
+                    opt.textContent = inst.name + ' (' + inst.shape + ')';
+                    instSelect.appendChild(opt);
+                });
+            }
+            const detached = bootVolumes.filter(v => !v.attached_instance);
+            detached.forEach(v => {
+                const opt = document.createElement('option');
+                opt.value = v.id;
+                opt.textContent = v.name + ' (' + v.size_gb + ' GB, ' + v.ad + ')';
+                volSelect.appendChild(opt);
+            });
+            if (bvInstances.length > 0 && detached.length > 0) {
+                document.getElementById('bvAttachPanel').style.display = 'block';
+            }
+        } catch (err) {
+            console.error('Failed to populate attach panel:', err);
+        }
+    }
+
+    function onBvOpChange() {
+        const op = document.getElementById('bvOperation').value;
+        const btn = document.getElementById('bvActionBtn');
+        btn.textContent = op === 'attach' ? 'Attach to instance' : 'Replace boot volume';
+    }
+
+    async function executeBvAction() {
+        const instanceId = document.getElementById('bvTargetInstance').value;
+        const volumeId = document.getElementById('bvSourceVolume').value;
+        const op = document.getElementById('bvOperation').value;
+        const result = document.getElementById('bvActionResult');
+        const btn = document.getElementById('bvActionBtn');
+        if (!instanceId) { result.style.display = 'block'; result.innerHTML = '<span style="color:var(--warning)">Select an instance</span>'; return; }
+        if (!volumeId) { result.style.display = 'block'; result.innerHTML = '<span style="color:var(--warning)">Select a detached boot volume</span>'; return; }
+        parseConfig();
+        const user = document.getElementById('cfgUser').value;
+        const key = document.getElementById('cfgKey').value;
+        const confirmMsg = op === 'replace'
+            ? 'Replace boot volume on this instance?\n\nThe instance will be STOPPED, the current boot volume detached, and the selected volume attached. It will then be started again.'
+            : 'Attach this boot volume to the selected instance?\n\nThe instance will be STOPPED before attach and left STOPPED.';
+        if (!confirm(confirmMsg)) { addLog(op + ' cancelled', 'warn'); return; }
+        btn.disabled = true; btn.textContent = 'Processing...'; result.style.display = 'none';
+        try {
+            const endpoint = op === 'replace' ? '/api/replace-boot-volume' : '/api/attach-boot-volume';
+            const payload = {
+                user: user, tenancy: document.getElementById('cfgTenancy').value,
+                fingerprint: document.getElementById('cfgFingerprint').value,
+                region: document.getElementById('cfgRegion').value,
+                private_key: key, instance_id: instanceId,
+                timezone: userTimezone
+            };
+            if (op === 'replace') {
+                payload.new_volume_id = volumeId;
+            } else {
+                payload.volume_id = volumeId;
+            }
+            const res = await fetch(endpoint, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const data = await res.json();
+            result.style.display = 'block';
+            if (data.success) {
+                result.innerHTML = '<span style="color:var(--positive)">' + data.message + '</span>';
+                addLog(data.message, 'success');
+                setTimeout(scanBootVolumes, 3000);
+                setTimeout(checkQuota, 3000);
+            } else {
+                result.innerHTML = '<span style="color:var(--danger)">Failed: ' + data.error + '</span>';
+                addLog(op + ' failed: ' + data.error, 'error');
+            }
+        } catch (err) {
+            result.style.display = 'block';
+            result.innerHTML = '<span style="color:var(--danger)">Error: ' + err.message + '</span>';
+            addLog(op + ' error: ' + err.message, 'error');
+        }
+        btn.disabled = false;
+        btn.textContent = op === 'attach' ? 'Attach to instance' : 'Replace boot volume';
+    }
+
+    function clearBootVolumes() {
+        document.getElementById('bvPanel').style.display = 'none';
+        document.getElementById('bvPanel').innerHTML = '';
+        document.getElementById('bvAttachPanel').style.display = 'none';
+        bootVolumes = [];
+        addLog('Boot volume list cleared', 'info');
+    }
+
+</script>
 </body>
 </html>
