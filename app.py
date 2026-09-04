@@ -44,12 +44,7 @@ def add_security_headers(response):
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-XSS-Protection'] = '1; mode=block'
     response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
-    response.headers['Referrer-Policy'] = 'no-referrer'
     return response
-
-@app.errorhandler(429)
-def too_many_requests(e):
-    return jsonify({'success': False, 'error': 'Rate limit exceeded. Slow down.'}), 429
 
 # ---- Config ----
 ADMIN_PASSWORD = os.environ.get('APP_PASSWORD')
@@ -57,13 +52,16 @@ if not ADMIN_PASSWORD:
     print("WARNING: APP_PASSWORD not set. Running WITHOUT authentication. Set APP_PASSWORD to enable Basic Auth.")
 
 MAX_ATTEMPTS = int(os.environ.get('MAX_ATTEMPTS', 0))  # 0 = unlimited attempts
+
 # ---- Keep-alive self-ping (stops free-tier platforms sleeping, e.g. Render) ----
 KEEP_ALIVE_ENABLED = os.environ.get('KEEP_ALIVE', 'true').lower() in ('1', 'true', 'yes')
 KEEP_ALIVE_INTERVAL = max(60, int(os.environ.get('KEEP_ALIVE_INTERVAL', 600)))  # seconds, >=1min
+# Auto-detect Render's public URL; override with KEEP_ALIVE_URL for any other host.
 KEEP_ALIVE_URL = (os.environ.get('KEEP_ALIVE_URL') or os.environ.get('RENDER_EXTERNAL_URL') or '').rstrip('/')
 _keep_alive_started = False
 
 def _keep_alive_loop(url, interval):
+    # Sleep first: the process was obviously just started (already awake).
     time.sleep(interval)
     while True:
         try:
@@ -77,6 +75,7 @@ def _keep_alive_loop(url, interval):
         time.sleep(interval)
 
 def start_keep_alive():
+    """Start the self-ping daemon thread once per process. Returns True if started."""
     global _keep_alive_started
     if _keep_alive_started or not KEEP_ALIVE_ENABLED or not KEEP_ALIVE_URL:
         return False
@@ -89,9 +88,9 @@ def start_keep_alive():
     ).start()
     return True
 
-# ---- Rate limiting ----
-RATE_LIMIT_WINDOW = int(os.environ.get('RATE_LIMIT_WINDOW', 60))
-RATE_LIMIT_MAX = int(os.environ.get('RATE_LIMIT_MAX', 30))
+# ---- Rate limiting (per-IP, failed auth + API abuse guard) ----
+RATE_LIMIT_WINDOW = int(os.environ.get('RATE_LIMIT_WINDOW', 60))   # seconds
+RATE_LIMIT_MAX = int(os.environ.get('RATE_LIMIT_MAX', 30))         # max requests per window per IP
 _rate_bucket = {}
 _rate_lock = threading.Lock()
 
@@ -102,6 +101,7 @@ def _client_ip():
     return request.remote_addr or 'unknown'
 
 def rate_limit_check():
+    """Sliding-window rate limit. Returns (ok, retry_after_seconds)."""
     ip = _client_ip()
     now = time.time()
     with _rate_lock:
@@ -111,6 +111,7 @@ def rate_limit_check():
             return False, int(RATE_LIMIT_WINDOW - (now - bucket[0])) + 1
         bucket.append(now)
         _rate_bucket[ip] = bucket
+        # opportunistic cleanup of stale IPs
         if len(_rate_bucket) > 10000:
             cutoff = now - RATE_LIMIT_WINDOW
             for k in list(_rate_bucket.keys()):
@@ -118,6 +119,19 @@ def rate_limit_check():
                 if not _rate_bucket[k]:
                     del _rate_bucket[k]
     return True, 0
+
+@app.after_request
+def add_security_headers(response):
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    return response
+
+@app.errorhandler(429)
+def too_many_requests(e):
+    return jsonify({'success': False, 'error': 'Rate limit exceeded. Slow down.'}), 429
 
 # ---- Shared state ----
 global_logs = []
@@ -128,6 +142,7 @@ automation_running = False
 automation_shape = None
 stop_event = threading.Event()
 
+# Per-request timezone
 _user_tz = threading.local()
 
 def set_user_tz(tz_name):
@@ -143,6 +158,7 @@ tg_live_bot_token = None
 tg_live_chat_id = None
 tg_live_last_sent = 0
 tg_live_min_interval = 3
+
 
 def add_log(message):
     tz = get_current_tz()
@@ -169,19 +185,27 @@ def _send_live_log_to_telegram(line):
         if len(clean_msg) > 3900:
             clean_msg = clean_msg[:3900] + "..."
         url = f"https://api.telegram.org/bot{tg_live_bot_token}/sendMessage"
-        payload = {"chat_id": tg_live_chat_id, "text": f"<code>{clean_msg}</code>", "parse_mode": "HTML"}
+        payload = {
+            "chat_id": tg_live_chat_id,
+            "text": f"<code>{clean_msg}</code>",
+            "parse_mode": "HTML"
+        }
         requests.post(url, json=payload, timeout=5)
     except Exception:
         pass
 
+
 def _redact(text, keep=6):
+    """Redact long tokens in strings before they land in logs or API errors."""
     s = str(text)
     if len(s) <= keep * 2:
         return s
     return s[:keep] + "…" + s[-keep:] + f" (len={len(s)})"
 
 def safe_error_str(e):
+    """Exception -> short string with potential private material redacted."""
     msg = str(e)
+    # OCI PEM keys
     if 'PRIVATE KEY' in msg or 'BEGIN' in msg:
         return "error contained key material (redacted)"
     if len(msg) > 300:
@@ -197,12 +221,15 @@ def build_config(data):
         "key_content": data.get('private_key')
     }
 
+
 def require_auth(f):
     @functools.wraps(f)
     def decorated(*args, **kwargs):
         if not ADMIN_PASSWORD:
+            # Fail closed on state-changing endpoints when no password is configured.
             if request.method == 'POST':
-                return jsonify({'success': False, 'error': 'Server has no APP_PASSWORD set. Refusing unauthenticated action.'}), 503
+                return jsonify({'success': False,
+                                'error': 'Server has no APP_PASSWORD set. Refusing unauthenticated action.'}), 503
             return f(*args, **kwargs)
         ok, retry_after = rate_limit_check()
         if not ok:
@@ -211,18 +238,26 @@ def require_auth(f):
             return resp
         auth = request.authorization
         if not auth or not hmac.compare_digest(auth.password.encode(), ADMIN_PASSWORD.encode()):
-            return Response('Authentication required', 401, {'WWW-Authenticate': 'Basic realm="OCI Provisioner"'})
+            return Response(
+                'Authentication required',
+                401,
+                {'WWW-Authenticate': 'Basic realm="OCI Provisioner"'}
+            )
         return f(*args, **kwargs)
     return decorated
 
+
 @app.route('/health')
 def health():
+    # First health hit is also the keep-alive trigger (platform healthchecks hit this on boot).
     start_keep_alive()
     return jsonify({'status': 'ok', 'version': APP_VERSION, 'keep_alive': KEEP_ALIVE_ENABLED}), 200
+
 
 @app.route('/api/version')
 def api_version():
     return jsonify({'version': APP_VERSION})
+
 
 @app.route('/')
 def home():
@@ -230,6 +265,7 @@ def home():
         return render_template('index.html')
     except Exception as e:
         return f"Flask Template Error: {str(e)}", 500
+
 
 @app.route('/api/list-images', methods=['POST'])
 @require_auth
@@ -239,6 +275,7 @@ def list_available_images():
     config = build_config(data)
     shape = data.get('shape')
     all_os_mode = data.get('all_os_mode', False)
+
     try:
         oci.config.validate_config(config)
         compute = oci.core.ComputeClient(config)
@@ -247,7 +284,11 @@ def list_available_images():
             kwargs['shape'] = shape
         images = compute.list_images(**kwargs).data
         min_dt = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc).astimezone(PHNOM_PENH_TZ)
-        images = sorted(images, key=lambda i: i.time_created.astimezone(PHNOM_PENH_TZ) if i.time_created else min_dt, reverse=True)
+        images = sorted(
+            images,
+            key=lambda i: i.time_created.astimezone(PHNOM_PENH_TZ) if i.time_created else min_dt,
+            reverse=True
+        )
         valid = []
         for img in images:
             if getattr(img, 'lifecycle_state', '') != 'AVAILABLE':
@@ -280,6 +321,7 @@ def list_available_images():
         return jsonify({'success': True, 'images': valid[:50]})
     except Exception as e:
         return jsonify({'success': False, 'error': safe_error_str(e)})
+
 
 @app.route('/api/list-subnets', methods=['POST'])
 @require_auth
@@ -315,6 +357,7 @@ def list_available_subnets():
         return jsonify({'success': True, 'subnets': all_subnets})
     except Exception as e:
         return jsonify({'success': False, 'error': safe_error_str(e)})
+
 
 @app.route('/api/list-shapes', methods=['POST'])
 @require_auth
@@ -359,6 +402,7 @@ def list_available_shapes():
         return jsonify({'success': True, 'shapes': all_shapes, 'ad_count': len(ads)})
     except Exception as e:
         return jsonify({'success': False, 'error': safe_error_str(e)})
+
 
 @app.route('/api/create-subnet', methods=['POST'])
 @require_auth
@@ -467,6 +511,7 @@ def create_subnet():
     except Exception as e:
         return jsonify({'success': False, 'error': safe_error_str(e)})
 
+
 @app.route('/api/test-launch', methods=['POST'])
 @require_auth
 def test_launch():
@@ -547,6 +592,7 @@ def test_launch():
     except Exception as e:
         return jsonify({'success': False, 'error': safe_error_str(e)})
 
+
 @app.route('/api/list-vnics', methods=['POST'])
 @require_auth
 def list_vnics():
@@ -587,6 +633,7 @@ def list_vnics():
     except Exception as e:
         return jsonify({'success': False, 'error': safe_error_str(e)})
 
+
 @app.route('/api/open-firewall', methods=['POST'])
 @require_auth
 def open_firewall():
@@ -599,6 +646,7 @@ def open_firewall():
     direction = data.get('direction', 'ingress')
     if not subnet_id:
         return jsonify({'success': False, 'error': 'subnet_id required'})
+    # Validate inputs before touching the security list
     import ipaddress as _ipaddress
     try:
         _ipaddress.ip_network(cidr, strict=False)
@@ -720,6 +768,7 @@ def open_firewall():
     except Exception as e:
         return jsonify({'success': False, 'error': safe_error_str(e)})
 
+
 @app.route('/api/scan-security-rules', methods=['POST'])
 @require_auth
 def scan_security_rules():
@@ -777,6 +826,7 @@ def scan_security_rules():
     except Exception as e:
         return jsonify({'success': False, 'error': safe_error_str(e)})
 
+
 def check_free_tier_limits(config, account_config, compute_client, block_client, identity_client):
     tenancy = config['tenancy']
     requested_shape = account_config.get('shape')
@@ -814,21 +864,74 @@ def check_free_tier_limits(config, account_config, compute_client, block_client,
         return True, ""
     return True, ""
 
-@app.route('/api/free-tier-status', methods=['POST'])
-@require_auth
-def free_tier_status():
-    data = request.json or {}
-    set_user_tz(data.get('timezone'))
-    config = build_config(data)
+
+def get_instance_public_ip(config, compute_client, network_client, instance_id):
     try:
-        oci.config.validate_config(config)
-        compute_client = oci.core.ComputeClient(config)
-        block_client = oci.core.BlockstorageClient(config)
-        identity_client = oci.identity.IdentityClient(config)
-        usage = get_free_tier_usage(config, compute_client, block_client, identity_client)
-        return jsonify({'success': True, 'usage': usage})
+        for _ in range(30):
+            inst = compute_client.get_instance(instance_id=instance_id).data
+            if inst.lifecycle_state == 'RUNNING':
+                break
+            if inst.lifecycle_state in ('TERMINATED', 'TERMINATING'):
+                return None, 'Instance terminated'
+            time.sleep(2)
+        attachments = compute_client.list_vnic_attachments(compartment_id=config['tenancy'], instance_id=instance_id).data
+        for att in attachments:
+            if getattr(att, 'lifecycle_state', '') == 'ATTACHED':
+                vnic = network_client.get_vnic(vnic_id=att.vnic_id).data
+                if vnic.public_ip:
+                    return vnic.public_ip, None
+        return None, 'No public IP assigned'
     except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
+        return None, str(e)
+
+
+def list_all_instances(config, compute_client, identity_client, network_client=None):
+    tenancy = config['tenancy']
+    instances = compute_client.list_instances(compartment_id=tenancy).data
+    result = []
+    # Create network client if not provided
+    if network_client is None:
+        network_client = oci.core.VirtualNetworkClient(config)
+    for inst in instances:
+        if inst.lifecycle_state in ('TERMINATED', 'TERMINATING'):
+            continue
+        shape = inst.shape
+        ocpus = None
+        memory = None
+        public_ip = None
+        if hasattr(inst, 'shape_config') and inst.shape_config:
+            ocpus = inst.shape_config.ocpus
+            memory = inst.shape_config.memory_in_gbs
+        # Try to get public IP from VNIC attachments
+        try:
+            attachments = compute_client.list_vnic_attachments(
+                compartment_id=tenancy, instance_id=inst.id
+            ).data
+            for att in attachments:
+                if getattr(att, 'lifecycle_state', '') == 'ATTACHED':
+                    vnic = network_client.get_vnic(vnic_id=att.vnic_id).data
+                    if vnic.public_ip:
+                        public_ip = vnic.public_ip
+                        break
+        except Exception:
+            pass
+        result.append({
+            'id': inst.id, 'name': inst.display_name, 'shape': shape,
+            'state': inst.lifecycle_state, 'ocpus': ocpus, 'memory': memory,
+            'public_ip': public_ip,
+            'time_created': inst.time_created.isoformat() if inst.time_created else None,
+            'availability_domain': inst.availability_domain
+        })
+    return result
+
+
+def terminate_instance(compute_client, instance_id):
+    try:
+        compute_client.terminate_instance(instance_id=instance_id)
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
 
 def get_free_tier_usage(config, compute_client, block_client, identity_client):
     tenancy = config['tenancy']
@@ -864,268 +967,22 @@ def get_free_tier_usage(config, compute_client, block_client, identity_client):
         'all_instances': all_instances
     }
 
-@app.route('/api/status', methods=['GET'])
-@require_auth
-def get_status():
-    with automation_lock:
-        return jsonify({'success': True, 'running': automation_running, 'shape': automation_shape})
 
-@app.route('/api/auto-launch-loop', methods=['POST'])
-@require_auth
-def auto_launch():
-    global automation_running, tg_live_enabled, tg_live_bot_token, tg_live_chat_id
-    data = request.json or {}
-    set_user_tz(data.get('timezone'))
-    config = build_config(data)
-    try:
-        oci.config.validate_config(config)
-    except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
-    requested_shape = data.get('shape', '')
-    bot_token = data.get('telegram_bot_token', '').strip()
-    chat_id = data.get('telegram_chat_id', '').strip()
-    enable_live = data.get('telegram_live_log', False)
-    with tg_live_lock:
-        tg_live_enabled = bool(enable_live and bot_token and chat_id)
-        tg_live_bot_token = bot_token if enable_live else None
-        tg_live_chat_id = chat_id if enable_live else None
-        tg_live_last_sent = 0
-    if enable_live and (not bot_token or not chat_id):
-        return jsonify({'success': False, 'error': 'Telegram live log enabled but bot token or chat ID is missing'})
-    with automation_lock:
-        if automation_running:
-            if automation_shape and automation_shape != requested_shape:
-                return jsonify({'success': False, 'error': f"A provisioning loop is already running for shape '{automation_shape}'. Stop it first before starting '{requested_shape}'."})
-            return jsonify({'success': False, 'error': 'A provisioning loop is already running.'})
-        automation_running = True
-        automation_shape = requested_shape
-        stop_event.clear()
-    try:
-        compute_client = oci.core.ComputeClient(config)
-        network_client = oci.core.VirtualNetworkClient(config)
-        identity_client = oci.identity.IdentityClient(config)
-        retry_delay = int(data.get('retry_delay', 60))
-        if retry_delay < 10:
-            retry_delay = 10
-        randomize_delay = data.get('randomize_delay', False)
-        random_min = int(data.get('random_min', 25))
-        random_max = int(data.get('random_max', 60))
-        thread = threading.Thread(
-            target=run_automated_creation,
-            args=(config, data, compute_client, network_client, identity_client,
-                  retry_delay, randomize_delay, random_min, random_max,
-                  data.get('telegram_bot_token'), data.get('telegram_chat_id'),
-                  get_current_tz()),
-            daemon=True
-        )
-        thread.start()
-        return jsonify({'success': True, 'message': 'Provisioning loop started.' + (' Live Telegram logging enabled.' if tg_live_enabled else '')})
-    except Exception as e:
-        with automation_lock:
-            automation_running = False
-            automation_shape = None
-        return jsonify({'success': False, 'error': safe_error_str(e)})
-
-@app.route('/api/stop-loop', methods=['POST'])
-@require_auth
-def stop_loop():
-    global tg_live_enabled
-    stop_event.set()
-    with tg_live_lock:
-        tg_live_enabled = False
-    return jsonify({'success': True, 'message': 'Stop signal sent.'})
-
-@app.route('/api/logs', methods=['GET'])
-@require_auth
-def fetch_live_logs():
-    try:
-        offset = max(0, int(request.args.get('offset', 0)))
-    except (TypeError, ValueError):
-        offset = 0
-    with logs_lock:
-        batch = global_logs[offset:]
-        total = len(global_logs)
-    return jsonify({'logs': batch, 'next_offset': total})
-
-@app.route('/api/test-telegram', methods=['POST'])
-@require_auth
-def test_telegram():
-    data = request.json or {}
-    set_user_tz(data.get('timezone'))
-    bot_token = data.get('bot_token', '').strip()
-    chat_id = data.get('chat_id', '').strip()
+def send_telegram_message(bot_token, chat_id, message, tz_name=None):
     if not bot_token or not chat_id:
-        return jsonify({'success': False, 'error': 'Bot token and chat ID are required'})
-    user_time = format_user_time(tz_name=get_current_tz())
-    ok, err = send_telegram_message(
-        bot_token, chat_id,
-        f"&#9989; <b>OCI Instance loop Connected</b>\n\nYour Telegram alerts are now active.\n<b>Time:</b> {user_time}\n\nYou will receive notifications when provisioning succeeds or fails.",
-        get_current_tz()
-    )
-    if ok:
-        return jsonify({'success': True, 'message': 'Test message sent successfully'})
-    return jsonify({'success': False, 'error': err})
-
-@app.route('/api/send-telegram', methods=['POST'])
-@require_auth
-def send_telegram():
-    data = request.json or {}
-    set_user_tz(data.get('timezone'))
-    ok, err = send_telegram_message(
-        data.get('bot_token'), data.get('chat_id'), data.get('message', ''), get_current_tz()
-    )
-    return jsonify({'success': ok, 'error': err})
-
-@app.route('/api/list-instances', methods=['POST'])
-@require_auth
-def api_list_instances():
-    data = request.json or {}
-    set_user_tz(data.get('timezone'))
-    config = build_config(data)
+        return False, "Missing bot token or chat ID"
     try:
-        oci.config.validate_config(config)
-        compute_client = oci.core.ComputeClient(config)
-        identity_client = oci.identity.IdentityClient(config)
-        instances = list_all_instances(config, compute_client, identity_client)
-        return jsonify({'success': True, 'instances': instances})
-    except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
-
-@app.route('/api/delete-instance', methods=['POST'])
-@require_auth
-def api_delete_instance():
-    data = request.json or {}
-    set_user_tz(data.get('timezone'))
-    config = build_config(data)
-    instance_id = data.get('instance_id')
-    if not instance_id:
-        return jsonify({'success': False, 'error': 'instance_id required'})
-    try:
-        oci.config.validate_config(config)
-        compute_client = oci.core.ComputeClient(config)
-        try:
-            inst = compute_client.get_instance(instance_id=instance_id).data
-            name = inst.display_name
-        except:
-            name = instance_id[:20]
-        ok, err = terminate_instance(compute_client, instance_id)
-        if ok:
-            add_log(f"Instance '{name}' ({instance_id[:20]}...) termination initiated.")
-            return jsonify({'success': True, 'message': f"Instance '{name}' termination initiated"})
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+        response = requests.post(url, json=payload, timeout=10)
+        data = response.json()
+        if data.get("ok"):
+            return True, "Message sent"
         else:
-            return jsonify({'success': False, 'error': err})
-    except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
-
-@app.route('/api/reboot-instance', methods=['POST'])
-@require_auth
-def api_reboot_instance():
-    data = request.json or {}
-    set_user_tz(data.get('timezone'))
-    config = build_config(data)
-    instance_id = data.get('instance_id')
-    if not instance_id:
-        return jsonify({'success': False, 'error': 'instance_id required'})
-    try:
-        oci.config.validate_config(config)
-        compute_client = oci.core.ComputeClient(config)
-        try:
-            inst = compute_client.get_instance(instance_id=instance_id).data
-            name = inst.display_name
-        except:
-            name = instance_id[:20]
-        compute_client.instance_action(instance_id=instance_id, action='RESET')
-        add_log(f"Instance '{name}' ({instance_id[:20]}...) reboot initiated.")
-        return jsonify({'success': True, 'message': f"Instance '{name}' reboot initiated"})
-    except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
-
-@app.route('/api/delete-all-instances', methods=['POST'])
-@require_auth
-def api_delete_all_instances():
-    data = request.json or {}
-    set_user_tz(data.get('timezone'))
-    config = build_config(data)
-    try:
-        oci.config.validate_config(config)
-        compute_client = oci.core.ComputeClient(config)
-        identity_client = oci.identity.IdentityClient(config)
-        instances = list_all_instances(config, compute_client, identity_client)
-        if not instances:
-            return jsonify({'success': True, 'message': 'No instances to delete', 'deleted': 0})
-        deleted = 0
-        failed = []
-        for inst in instances:
-            ok, err = terminate_instance(compute_client, inst['id'])
-            if ok:
-                add_log(f"Terminating '{inst['name']}' ({inst['id'][:20]}...)")
-                deleted += 1
-            else:
-                failed.append({'name': inst['name'], 'error': err})
-        return jsonify({'success': True, 'message': f"Initiated termination for {deleted} instance(s)", 'deleted': deleted, 'failed': failed})
-    except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
-
-def get_instance_public_ip(config, compute_client, network_client, instance_id):
-    try:
-        for _ in range(30):
-            inst = compute_client.get_instance(instance_id=instance_id).data
-            if inst.lifecycle_state == 'RUNNING':
-                break
-            if inst.lifecycle_state in ('TERMINATED', 'TERMINATING'):
-                return None, 'Instance terminated'
-            time.sleep(2)
-        attachments = compute_client.list_vnic_attachments(compartment_id=config['tenancy'], instance_id=instance_id).data
-        for att in attachments:
-            if getattr(att, 'lifecycle_state', '') == 'ATTACHED':
-                vnic = network_client.get_vnic(vnic_id=att.vnic_id).data
-                if vnic.public_ip:
-                    return vnic.public_ip, None
-        return None, 'No public IP assigned'
-    except Exception as e:
-        return None, str(e)
-
-def list_all_instances(config, compute_client, identity_client, network_client=None):
-    tenancy = config['tenancy']
-    instances = compute_client.list_instances(compartment_id=tenancy).data
-    result = []
-    if network_client is None:
-        network_client = oci.core.VirtualNetworkClient(config)
-    for inst in instances:
-        if inst.lifecycle_state in ('TERMINATED', 'TERMINATING'):
-            continue
-        shape = inst.shape
-        ocpus = None
-        memory = None
-        public_ip = None
-        if hasattr(inst, 'shape_config') and inst.shape_config:
-            ocpus = inst.shape_config.ocpus
-            memory = inst.shape_config.memory_in_gbs
-        try:
-            attachments = compute_client.list_vnic_attachments(compartment_id=tenancy, instance_id=inst.id).data
-            for att in attachments:
-                if getattr(att, 'lifecycle_state', '') == 'ATTACHED':
-                    vnic = network_client.get_vnic(vnic_id=att.vnic_id).data
-                    if vnic.public_ip:
-                        public_ip = vnic.public_ip
-                        break
-        except Exception:
-            pass
-        result.append({
-            'id': inst.id, 'name': inst.display_name, 'shape': shape,
-            'state': inst.lifecycle_state, 'ocpus': ocpus, 'memory': memory,
-            'public_ip': public_ip,
-            'time_created': inst.time_created.isoformat() if inst.time_created else None,
-            'availability_domain': inst.availability_domain
-        })
-    return result
-
-def terminate_instance(compute_client, instance_id):
-    try:
-        compute_client.terminate_instance(instance_id=instance_id)
-        return True, None
+            return False, data.get("description", "Unknown Telegram error")
     except Exception as e:
         return False, str(e)
+
 
 def get_oci_username(config, identity_client):
     try:
@@ -1157,22 +1014,7 @@ def get_oci_username(config, identity_client):
         add_log(f"Error fetching user info: {str(e)}")
         return None
 
-def send_telegram_message(bot_token, chat_id, message, tz_name=None):
-    if not bot_token or not chat_id:
-        return False, "Missing bot token or chat ID"
-    try:
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
-        response = requests.post(url, json=payload, timeout=10)
-        data = response.json()
-        if data.get("ok"):
-            return True, "Message sent"
-        else:
-            return False, data.get("description", "Unknown Telegram error")
-    except Exception as e:
-        return False, str(e)
 
-# Simplified automated creation (original preserved in logic)
 def run_automated_creation(config, account_config, compute_client, network_client, identity_client,
                            retry_delay=60, randomize_delay=False, random_min=25, random_max=60,
                            telegram_bot_token=None, telegram_chat_id=None, tz_name=None):
@@ -1270,8 +1112,9 @@ def run_automated_creation(config, account_config, compute_client, network_clien
         attempts = 0
         success = False
         ad_index = 0
+        import random as _random
         if len(ad_list) > 1:
-            random.shuffle(ad_list)
+            _random.shuffle(ad_list)
             add_log(f"AD order randomized for faster discovery: {', '.join(ad_list)}")
         while True:
             attempts += 1
@@ -1299,16 +1142,16 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                 success = True
                 if telegram_bot_token and telegram_chat_id:
                     instance_name = account_config.get('display_name', 'AlwaysFree-Bot')
-                    shape_name = account_config.get('shape', 'Unknown')
-                    region_name = config.get('region', 'unknown')
+                    shape = account_config.get('shape', 'Unknown')
+                    region = config.get('region', 'unknown')
                     user_time = format_user_time(tz_name=get_current_tz())
                     user_line = f"<b>User:</b> {oci_username}\n" if oci_username else ""
                     ip_line = f"<b>Public IP:</b> {public_ip}\n" if public_ip else ""
                     tg_msg = (
                         f"&#9989; <b>OCI Provisioner Success!</b>\n\n"
                         f"<b>Instance:</b> {instance_name}\n"
-                        f"<b>Shape:</b> {shape_name}\n"
-                        f"<b>Region:</b> {region_name}\n"
+                        f"<b>Shape:</b> {shape}\n"
+                        f"<b>Region:</b> {region}\n"
                         f"{ip_line}"
                         f"{user_line}"
                         f"<b>Time:</b> {user_time}\n"
@@ -1403,214 +1246,246 @@ def run_automated_creation(config, account_config, compute_client, network_clien
             automation_running = False
             automation_shape = None
 
-# =====================================================================
-# NEW BOOT VOLUME MANAGEMENT FUNCTIONS (Full Integration)
-# =====================================================================
 
-# Helper: get boot volume attachments for an instance
-@app.route('/api/list-boot-volumes', methods=['POST'])
+@app.route('/api/free-tier-status', methods=['POST'])
 @require_auth
-def api_list_boot_volumes():
+def free_tier_status():
     data = request.json or {}
     set_user_tz(data.get('timezone'))
     config = build_config(data)
-    instance_id = data.get('instance_id', '').strip() or None
     try:
         oci.config.validate_config(config)
         compute_client = oci.core.ComputeClient(config)
         block_client = oci.core.BlockstorageClient(config)
-        tenancy = config['tenancy']
-        volumes = []
-        # List boot volume attachments
-        attachments = compute_client.list_boot_volume_attachments(compartment_id=tenancy).data
-        for att in attachments:
-            # Filter by instance if requested
-            if instance_id and att.instance_id != instance_id:
-                continue
-            try:
-                vol = block_client.get_boot_volume(boot_volume_id=att.boot_volume_id).data
-                volumes.append({
-                    'id': vol.id,
-                    'display_name': vol.display_name,
-                    'size_in_gbs': vol.size_in_gbs,
-                    'lifecycle_state': vol.lifecycle_state,
-                    'instance_id': att.instance_id,
-                    'instance_name': data.get('instance_name_lookup', {}).get(att.instance_id, att.instance_id[:20] + '...'),
-                    'attachment_state': getattr(att, 'lifecycle_state', 'UNKNOWN'),
-                    'time_created': vol.time_created.isoformat() if vol.time_created else None
-                })
-            except Exception:
-                pass
-        # Also list unattached boot volumes
-        unattached = block_client.list_boot_volumes(compartment_id=tenancy).data
-        for vol in unattached:
-            if vol.lifecycle_state == 'TERMINATED':
-                continue
-            # Check if this volume is already in attachments
-            if any(v['id'] == vol.id for v in volumes):
-                continue
-            volumes.append({
-                'id': vol.id,
-                'display_name': vol.display_name,
-                'size_in_gbs': vol.size_in_gbs,
-                'lifecycle_state': vol.lifecycle_state,
-                'instance_id': None,
-                'instance_name': 'Not attached',
-                'attachment_state': 'DETACHED',
-                'time_created': vol.time_created.isoformat() if vol.time_created else None
-            })
-        return jsonify({'success': True, 'volumes': volumes, 'filtered_by_instance': instance_id})
+        identity_client = oci.identity.IdentityClient(config)
+        usage = get_free_tier_usage(config, compute_client, block_client, identity_client)
+        return jsonify({'success': True, 'usage': usage})
     except Exception as e:
         return jsonify({'success': False, 'error': safe_error_str(e)})
 
-# Detach boot volume
-@app.route('/api/detach-boot-volume', methods=['POST'])
+
+@app.route('/api/status', methods=['GET'])
 @require_auth
-def api_detach_boot_volume():
+def get_status():
+    with automation_lock:
+        return jsonify({'success': True, 'running': automation_running, 'shape': automation_shape})
+
+
+@app.route('/api/auto-launch-loop', methods=['POST'])
+@require_auth
+def auto_launch():
+    global automation_running, tg_live_enabled, tg_live_bot_token, tg_live_chat_id
     data = request.json or {}
     set_user_tz(data.get('timezone'))
     config = build_config(data)
-    instance_id = data.get('instance_id', '').strip() or None
-    boot_volume_id = data.get('boot_volume_id', '').strip() or None
-    if not instance_id or not boot_volume_id:
-        return jsonify({'success': False, 'error': 'instance_id and boot_volume_id are required'})
+    try:
+        oci.config.validate_config(config)
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+    requested_shape = data.get('shape', '')
+    bot_token = data.get('telegram_bot_token', '').strip()
+    chat_id = data.get('telegram_chat_id', '').strip()
+    enable_live = data.get('telegram_live_log', False)
+    with tg_live_lock:
+        tg_live_enabled = bool(enable_live and bot_token and chat_id)
+        tg_live_bot_token = bot_token if enable_live else None
+        tg_live_chat_id = chat_id if enable_live else None
+        tg_live_last_sent = 0
+    if enable_live and (not bot_token or not chat_id):
+        return jsonify({'success': False, 'error': 'Telegram live log enabled but bot token or chat ID is missing'})
+    with automation_lock:
+        if automation_running:
+            if automation_shape and automation_shape != requested_shape:
+                return jsonify({'success': False, 'error': f"A provisioning loop is already running for shape '{automation_shape}'. Stop it first before starting '{requested_shape}'."})
+            return jsonify({'success': False, 'error': 'A provisioning loop is already running.'})
+        automation_running = True
+        automation_shape = requested_shape
+        stop_event.clear()
+    try:
+        compute_client = oci.core.ComputeClient(config)
+        network_client = oci.core.VirtualNetworkClient(config)
+        identity_client = oci.identity.IdentityClient(config)
+        retry_delay = int(data.get('retry_delay', 60))
+        if retry_delay < 10:
+            retry_delay = 10
+        randomize_delay = data.get('randomize_delay', False)
+        random_min = int(data.get('random_min', 25))
+        random_max = int(data.get('random_max', 60))
+        thread = threading.Thread(
+            target=run_automated_creation,
+            args=(config, data, compute_client, network_client, identity_client,
+                  retry_delay, randomize_delay, random_min, random_max,
+                  data.get('telegram_bot_token'), data.get('telegram_chat_id'),
+                  get_current_tz()),
+            daemon=True
+        )
+        thread.start()
+        return jsonify({'success': True, 'message': 'Provisioning loop started.' + (' Live Telegram logging enabled.' if tg_live_enabled else '')})
+    except Exception as e:
+        with automation_lock:
+            automation_running = False
+            automation_shape = None
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+
+
+@app.route('/api/stop-loop', methods=['POST'])
+@require_auth
+def stop_loop():
+    global tg_live_enabled
+    stop_event.set()
+    with tg_live_lock:
+        tg_live_enabled = False
+    return jsonify({'success': True, 'message': 'Stop signal sent.'})
+
+
+@app.route('/api/logs', methods=['GET'])
+@require_auth
+def fetch_live_logs():
+    try:
+        offset = max(0, int(request.args.get('offset', 0)))
+    except (TypeError, ValueError):
+        offset = 0
+    with logs_lock:
+        batch = global_logs[offset:]
+        total = len(global_logs)
+    return jsonify({'logs': batch, 'next_offset': total})
+
+
+@app.route('/api/test-telegram', methods=['POST'])
+@require_auth
+def test_telegram():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    bot_token = data.get('bot_token', '').strip()
+    chat_id = data.get('chat_id', '').strip()
+    if not bot_token or not chat_id:
+        return jsonify({'success': False, 'error': 'Bot token and chat ID are required'})
+    user_time = format_user_time(tz_name=get_current_tz())
+    ok, err = send_telegram_message(
+        bot_token, chat_id,
+        f"&#9989; <b>OCI Instance loop Connected</b>\n\n"
+        f"Your Telegram alerts are now active.\n"
+        f"<b>Time:</b> {user_time}\n\n"
+        f"You will receive notifications when provisioning succeeds or fails.",
+        get_current_tz()
+    )
+    if ok:
+        return jsonify({'success': True, 'message': 'Test message sent successfully'})
+    return jsonify({'success': False, 'error': err})
+
+
+@app.route('/api/send-telegram', methods=['POST'])
+@require_auth
+def send_telegram():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    ok, err = send_telegram_message(
+        data.get('bot_token'), data.get('chat_id'), data.get('message', ''), get_current_tz()
+    )
+    return jsonify({'success': ok, 'error': err})
+
+
+@app.route('/api/list-instances', methods=['POST'])
+@require_auth
+def api_list_instances():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
     try:
         oci.config.validate_config(config)
         compute_client = oci.core.ComputeClient(config)
-        compute_client.detach_boot_volume(
-            instance_id=instance_id,
-            boot_volume_id=boot_volume_id
-        )
-        add_log(f"Boot volume {boot_volume_id[:20]}... detached from instance {instance_id[:20]}...")
-        return jsonify({
-            'success': True,
-            'message': f"Boot volume {boot_volume_id[:20]}... detached from instance {instance_id[:20]}...",
-            'instance_id': instance_id,
-            'boot_volume_id': boot_volume_id
-        })
+        identity_client = oci.identity.IdentityClient(config)
+        instances = list_all_instances(config, compute_client, identity_client)
+        return jsonify({'success': True, 'instances': instances})
     except Exception as e:
         return jsonify({'success': False, 'error': safe_error_str(e)})
 
-# Re-attach boot volume
-@app.route('/api/attach-boot-volume', methods=['POST'])
-@require_auth
-def api_attach_boot_volume():
-    data = request.json or {}
-    set_user_tz(data.get('timezone'))
-    config = build_config(data)
-    instance_id = data.get('instance_id', '').strip() or None
-    boot_volume_id = data.get('boot_volume_id', '').strip() or None
-    if not instance_id or not boot_volume_id:
-        return jsonify({'success': False, 'error': 'instance_id and boot_volume_id are required'})
-    try:
-        oci.config.validate_config(config)
-        compute_client = oci.core.ComputeClient(config)
-        attach_details = oci.core.models.AttachBootVolumeDetails(
-            instance_id=instance_id,
-            boot_volume_id=boot_volume_id,
-            display_name=f"attach-{boot_volume_id[-8:]}"
-        )
-        compute_client.attach_boot_volume(attach_boot_volume_details=attach_details)
-        add_log(f"Boot volume {boot_volume_id[:20]}... attached to instance {instance_id[:20]}...")
-        return jsonify({
-            'success': True,
-            'message': f"Boot volume {boot_volume_id[:20]}... attached to instance {instance_id[:20]}...",
-            'instance_id': instance_id,
-            'boot_volume_id': boot_volume_id
-        })
-    except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
 
-# Delete boot volume
-@app.route('/api/delete-boot-volume', methods=['POST'])
+@app.route('/api/delete-instance', methods=['POST'])
 @require_auth
-def api_delete_boot_volume():
+def api_delete_instance():
     data = request.json or {}
     set_user_tz(data.get('timezone'))
     config = build_config(data)
-    boot_volume_id = data.get('boot_volume_id', '').strip() or None
-    if not boot_volume_id:
-        return jsonify({'success': False, 'error': 'boot_volume_id is required'})
-    try:
-        oci.config.validate_config(config)
-        block_client = oci.core.BlockstorageClient(config)
-        # Ensure it's detached first (optional guard)
-        block_client.delete_boot_volume(boot_volume_id=boot_volume_id)
-        add_log(f"Boot volume {boot_volume_id[:20]}... deleted.")
-        return jsonify({
-            'success': True,
-            'message': f"Boot volume {boot_volume_id[:20]}... deleted successfully.",
-            'boot_volume_id': boot_volume_id
-        })
-    except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
-
-# Replace boot volume (detach old + delete old + attach new? Or replace on instance)
-# Implementation: if new_volume specified -> attach new, then detach old; else just replace by detaching current and attaching a backup/new
-@app.route('/api/replace-boot-volume', methods=['POST'])
-@require_auth
-def api_replace_boot_volume():
-    data = request.json or {}
-    set_user_tz(data.get('timezone'))
-    config = build_config(data)
-    instance_id = data.get('instance_id', '').strip() or None
-    new_volume_id = data.get('new_boot_volume_id', '').strip() or None
-    old_volume_id = data.get('old_boot_volume_id', '').strip() or None
+    instance_id = data.get('instance_id')
     if not instance_id:
-        return jsonify({'success': False, 'error': 'instance_id is required'})
-    # If no old specified, try to find current boot volume attachment
+        return jsonify({'success': False, 'error': 'instance_id required'})
     try:
         oci.config.validate_config(config)
         compute_client = oci.core.ComputeClient(config)
-        block_client = oci.core.BlockstorageClient(config)
-        if not old_volume_id:
-            attachments = compute_client.list_boot_volume_attachments(compartment_id=config['tenancy'], instance_id=instance_id).data
-            if attachments:
-                old_volume_id = attachments[0].boot_volume_id
-        # If new_volume_id provided: attach new first (if not already attached), then detach old
-        if new_volume_id:
-            # Check if new volume is already attached to this instance
-            already_attached = False
-            for att in compute_client.list_boot_volume_attachments(compartment_id=config['tenancy'], instance_id=instance_id).data:
-                if att.boot_volume_id == new_volume_id:
-                    already_attached = True
-                    break
-            if not already_attached:
-                attach_details = oci.core.models.AttachBootVolumeDetails(
-                    instance_id=instance_id,
-                    boot_volume_id=new_volume_id,
-                    display_name=f"replace-{new_volume_id[-8:]}"
-                )
-                compute_client.attach_boot_volume(attach_boot_volume_details=attach_details)
-                add_log(f"New boot volume {new_volume_id[:20]}... attached to instance {instance_id[:20]}...")
-        # Detach old
-        if old_volume_id:
-            # Check attachment exists
-            attachments = compute_client.list_boot_volume_attachments(compartment_id=config['tenancy'], instance_id=instance_id).data
-            if any(att.boot_volume_id == old_volume_id for att in attachments):
-                compute_client.detach_boot_volume(instance_id=instance_id, boot_volume_id=old_volume_id)
-                add_log(f"Old boot volume {old_volume_id[:20]}... detached from instance {instance_id[:20]}...")
-            else:
-                add_log(f"Old boot volume {old_volume_id[:20]}... not attached (already detached).")
-        return jsonify({
-            'success': True,
-            'message': f"Boot volume replacement completed for instance {instance_id[:20]}...",
-            'instance_id': instance_id,
-            'old_volume_id': old_volume_id,
-            'new_volume_id': new_volume_id
-        })
+        try:
+            inst = compute_client.get_instance(instance_id=instance_id).data
+            name = inst.display_name
+        except:
+            name = instance_id[:20]
+        ok, err = terminate_instance(compute_client, instance_id)
+        if ok:
+            add_log(f"Instance '{name}' ({instance_id[:20]}...) termination initiated.")
+            return jsonify({'success': True, 'message': f"Instance '{name}' termination initiated"})
+        else:
+            return jsonify({'success': False, 'error': err})
     except Exception as e:
         return jsonify({'success': False, 'error': safe_error_str(e)})
 
-# =====================================================================
-# END NEW FUNCTIONS
-# =====================================================================
+
+
+
+@app.route('/api/reboot-instance', methods=['POST'])
+@require_auth
+def api_reboot_instance():
+    """Reboot a single instance by ID."""
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    instance_id = data.get('instance_id')
+
+    if not instance_id:
+        return jsonify({'success': False, 'error': 'instance_id required'})
+
+    try:
+        oci.config.validate_config(config)
+        compute_client = oci.core.ComputeClient(config)
+
+        # Get instance name before rebooting for logging
+        try:
+            inst = compute_client.get_instance(instance_id=instance_id).data
+            name = inst.display_name
+        except:
+            name = instance_id[:20]
+
+        compute_client.instance_action(instance_id=instance_id, action='RESET')
+        add_log(f"Instance '{name}' ({instance_id[:20]}...) reboot initiated.")
+        return jsonify({'success': True, 'message': f"Instance '{name}' reboot initiated"})
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+
+@app.route('/api/delete-all-instances', methods=['POST'])
+@require_auth
+def api_delete_all_instances():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    try:
+        oci.config.validate_config(config)
+        compute_client = oci.core.ComputeClient(config)
+        identity_client = oci.identity.IdentityClient(config)
+        instances = list_all_instances(config, compute_client, identity_client)
+        if not instances:
+            return jsonify({'success': True, 'message': 'No instances to delete', 'deleted': 0})
+        deleted = 0
+        failed = []
+        for inst in instances:
+            ok, err = terminate_instance(compute_client, inst['id'])
+            if ok:
+                add_log(f"Terminating '{inst['name']}' ({inst['id'][:20]}...)")
+                deleted += 1
+            else:
+                failed.append({'name': inst['name'], 'error': err})
+        return jsonify({'success': True, 'message': f"Initiated termination for {deleted} instance(s)", 'deleted': deleted, 'failed': failed})
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+
 
 if __name__ == '__main__':
-    _port_raw = os.environ.get("PORT", "5000")
-    try:
-        port = int(_port_raw)
-    except ValueError:
-        print(f"WARNING: PORT value '{_port_raw}' is not a valid integer. Falling back to 5000.")
-        port = 5000
+    port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
