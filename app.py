@@ -5,8 +5,6 @@ import random
 import threading
 import datetime
 import functools
-import hmac
-import secrets
 import requests
 from flask import Flask, render_template, request, jsonify, Response
 import oci
@@ -33,97 +31,23 @@ PHNOM_PENH_TZ = ZoneInfo("Asia/Phnom_Penh")
 get_phnom_penh_time = lambda: get_user_time("Asia/Phnom_Penh")
 format_phnom_penh_time = lambda dt=None: format_user_time(dt, "Asia/Phnom_Penh")
 
-APP_VERSION = "5.0"
-
 app = Flask(__name__)
 
 # ---- Security Headers ----
-# ---- Config ----
-ADMIN_PASSWORD = os.environ.get('APP_PASSWORD')
-if not ADMIN_PASSWORD:
-    print("WARNING: APP_PASSWORD not set. Running WITHOUT authentication. Set APP_PASSWORD to enable Basic Auth.")
-
-MAX_ATTEMPTS = int(os.environ.get('MAX_ATTEMPTS', 0))  # 0 = unlimited attempts
-
-# ---- Keep-alive self-ping (stops free-tier platforms sleeping, e.g. Render) ----
-KEEP_ALIVE_ENABLED = os.environ.get('KEEP_ALIVE', 'true').lower() in ('1', 'true', 'yes')
-KEEP_ALIVE_INTERVAL = max(60, int(os.environ.get('KEEP_ALIVE_INTERVAL', 600)))  # seconds, >=1min
-# Auto-detect Render's public URL; override with KEEP_ALIVE_URL for any other host.
-KEEP_ALIVE_URL = (os.environ.get('KEEP_ALIVE_URL') or os.environ.get('RENDER_EXTERNAL_URL') or '').rstrip('/')
-_keep_alive_started = False
-
-def _keep_alive_loop(url, interval):
-    # Sleep first: the process was obviously just started (already awake).
-    time.sleep(interval)
-    while True:
-        try:
-            r = requests.get(url + '/health', timeout=10)
-            if r.status_code == 200:
-                add_log(f"Keep-alive ping OK ({url}/health, {interval}s)")
-            else:
-                add_log(f"Keep-alive ping got HTTP {r.status_code}")
-        except Exception as e:
-            add_log(f"Keep-alive ping FAILED: {safe_error_str(e)}")
-        time.sleep(interval)
-
-def start_keep_alive():
-    """Start the self-ping daemon thread once per process. Returns True if started."""
-    global _keep_alive_started
-    if _keep_alive_started or not KEEP_ALIVE_ENABLED or not KEEP_ALIVE_URL:
-        return False
-    _keep_alive_started = True
-    threading.Thread(
-        target=_keep_alive_loop,
-        args=(KEEP_ALIVE_URL, KEEP_ALIVE_INTERVAL),
-        name='keep-alive',
-        daemon=True
-    ).start()
-    return True
-
-# ---- Rate limiting (per-IP, failed auth + API abuse guard) ----
-RATE_LIMIT_WINDOW = int(os.environ.get('RATE_LIMIT_WINDOW', 60))   # seconds
-RATE_LIMIT_MAX = int(os.environ.get('RATE_LIMIT_MAX', 30))         # max requests per window per IP
-_rate_bucket = {}
-_rate_lock = threading.Lock()
-
-def _client_ip():
-    fwd = request.headers.get('X-Forwarded-For', '')
-    if fwd:
-        return fwd.split(',')[0].strip()
-    return request.remote_addr or 'unknown'
-
-def rate_limit_check():
-    """Sliding-window rate limit. Returns (ok, retry_after_seconds)."""
-    ip = _client_ip()
-    now = time.time()
-    with _rate_lock:
-        bucket = [t for t in _rate_bucket.get(ip, []) if now - t < RATE_LIMIT_WINDOW]
-        if len(bucket) >= RATE_LIMIT_MAX:
-            _rate_bucket[ip] = bucket
-            return False, int(RATE_LIMIT_WINDOW - (now - bucket[0])) + 1
-        bucket.append(now)
-        _rate_bucket[ip] = bucket
-        # opportunistic cleanup of stale IPs
-        if len(_rate_bucket) > 10000:
-            cutoff = now - RATE_LIMIT_WINDOW
-            for k in list(_rate_bucket.keys()):
-                _rate_bucket[k] = [t for t in _rate_bucket[k] if t > cutoff]
-                if not _rate_bucket[k]:
-                    del _rate_bucket[k]
-    return True, 0
-
 @app.after_request
 def add_security_headers(response):
     response.headers['X-Frame-Options'] = 'DENY'
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-XSS-Protection'] = '1; mode=block'
     response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
-    response.headers['Referrer-Policy'] = 'no-referrer'
     return response
 
-@app.errorhandler(429)
-def too_many_requests(e):
-    return jsonify({'success': False, 'error': 'Rate limit exceeded. Slow down.'}), 429
+# ---- Config ----
+ADMIN_PASSWORD = os.environ.get('APP_PASSWORD')
+if not ADMIN_PASSWORD:
+    print("WARNING: APP_PASSWORD not set. Running WITHOUT authentication. Set APP_PASSWORD to enable Basic Auth.")
+
+MAX_ATTEMPTS = int(os.environ.get('MAX_ATTEMPTS', 100))
 
 # ---- Shared state ----
 global_logs = []
@@ -173,9 +97,9 @@ def _send_live_log_to_telegram(line):
             return
         tg_live_last_sent = now
     try:
-        clean_msg = line.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-        if len(clean_msg) > 3900:
-            clean_msg = clean_msg[:3900] + "..."
+        clean_msg = line
+        if len(clean_msg) > 4000:
+            clean_msg = clean_msg[:4000] + "..."
         url = f"https://api.telegram.org/bot{tg_live_bot_token}/sendMessage"
         payload = {
             "chat_id": tg_live_chat_id,
@@ -186,23 +110,6 @@ def _send_live_log_to_telegram(line):
     except Exception:
         pass
 
-
-def _redact(text, keep=6):
-    """Redact long tokens in strings before they land in logs or API errors."""
-    s = str(text)
-    if len(s) <= keep * 2:
-        return s
-    return s[:keep] + "…" + s[-keep:] + f" (len={len(s)})"
-
-def safe_error_str(e):
-    """Exception -> short string with potential private material redacted."""
-    msg = str(e)
-    # OCI PEM keys
-    if 'PRIVATE KEY' in msg or 'BEGIN' in msg:
-        return "error contained key material (redacted)"
-    if len(msg) > 300:
-        msg = msg[:300] + "…"
-    return msg
 
 def build_config(data):
     return {
@@ -218,18 +125,9 @@ def require_auth(f):
     @functools.wraps(f)
     def decorated(*args, **kwargs):
         if not ADMIN_PASSWORD:
-            # Fail closed on state-changing endpoints when no password is configured.
-            if request.method == 'POST':
-                return jsonify({'success': False,
-                                'error': 'Server has no APP_PASSWORD set. Refusing unauthenticated action.'}), 503
             return f(*args, **kwargs)
-        ok, retry_after = rate_limit_check()
-        if not ok:
-            resp = Response('Too many requests', 429)
-            resp.headers['Retry-After'] = str(retry_after)
-            return resp
         auth = request.authorization
-        if not auth or not hmac.compare_digest(auth.password.encode(), ADMIN_PASSWORD.encode()):
+        if not auth or auth.password != ADMIN_PASSWORD:
             return Response(
                 'Authentication required',
                 401,
@@ -241,14 +139,7 @@ def require_auth(f):
 
 @app.route('/health')
 def health():
-    # First health hit is also the keep-alive trigger (platform healthchecks hit this on boot).
-    start_keep_alive()
-    return jsonify({'status': 'ok', 'version': APP_VERSION, 'keep_alive': KEEP_ALIVE_ENABLED}), 200
-
-
-@app.route('/api/version')
-def api_version():
-    return jsonify({'version': APP_VERSION})
+    return jsonify({'status': 'ok'}), 200
 
 
 @app.route('/')
@@ -312,7 +203,7 @@ def list_available_images():
             })
         return jsonify({'success': True, 'images': valid[:50]})
     except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
+        return jsonify({'success': False, 'error': str(e)})
 
 
 @app.route('/api/list-subnets', methods=['POST'])
@@ -348,7 +239,7 @@ def list_available_subnets():
                 })
         return jsonify({'success': True, 'subnets': all_subnets})
     except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
+        return jsonify({'success': False, 'error': str(e)})
 
 
 @app.route('/api/list-shapes', methods=['POST'])
@@ -393,7 +284,7 @@ def list_available_shapes():
         all_shapes.sort(key=lambda s: (s['name'] not in free_tier, s['name']))
         return jsonify({'success': True, 'shapes': all_shapes, 'ad_count': len(ads)})
     except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
+        return jsonify({'success': False, 'error': str(e)})
 
 
 @app.route('/api/create-subnet', methods=['POST'])
@@ -501,7 +392,7 @@ def create_subnet():
             }
         })
     except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
+        return jsonify({'success': False, 'error': str(e)})
 
 
 @app.route('/api/test-launch', methods=['POST'])
@@ -582,7 +473,7 @@ def test_launch():
             }
         })
     except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
+        return jsonify({'success': False, 'error': str(e)})
 
 
 @app.route('/api/list-vnics', methods=['POST'])
@@ -623,7 +514,7 @@ def list_vnics():
         vcn_list = [{'id': v.id, 'name': v.display_name or 'Unnamed'} for v in vcns.values()]
         return jsonify({'success': True, 'vnics': vnics, 'vcns': vcn_list, 'filtered_by_subnet': target_subnet_id})
     except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
+        return jsonify({'success': False, 'error': str(e)})
 
 
 @app.route('/api/open-firewall', methods=['POST'])
@@ -634,23 +525,10 @@ def open_firewall():
     config = build_config(data)
     subnet_id = data.get('subnet_id')
     ports = data.get('ports', 'all')
-    cidr = data.get('cidr', '0.0.0.0/0').strip()
+    cidr = data.get('cidr', '0.0.0.0/0')
     direction = data.get('direction', 'ingress')
     if not subnet_id:
         return jsonify({'success': False, 'error': 'subnet_id required'})
-    # Validate inputs before touching the security list
-    import ipaddress as _ipaddress
-    try:
-        _ipaddress.ip_network(cidr, strict=False)
-    except ValueError:
-        return jsonify({'success': False, 'error': f'Invalid CIDR: {cidr!r}'})
-    if direction not in ('ingress', 'egress', 'both'):
-        return jsonify({'success': False, 'error': f'Invalid direction: {direction!r}'})
-    if ports not in ('all', '*'):
-        for p in str(ports).split(','):
-            p = p.strip()
-            if not p.isdigit() or not (1 <= int(p) <= 65535):
-                return jsonify({'success': False, 'error': f'Invalid port: {p!r} (use 1-65535 or "all")'})
     try:
         oci.config.validate_config(config)
         network_client = oci.core.VirtualNetworkClient(config)
@@ -758,7 +636,7 @@ def open_firewall():
             'ports': ports, 'cidr': cidr, 'direction': direction
         })
     except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
+        return jsonify({'success': False, 'error': str(e)})
 
 
 @app.route('/api/scan-security-rules', methods=['POST'])
@@ -816,7 +694,7 @@ def scan_security_rules():
                 })
         return jsonify({'success': True, 'rules': rules, 'nsg_count': len(nsg_ids), 'sec_list_count': len(sec_list_ids)})
     except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
+        return jsonify({'success': False, 'error': str(e)})
 
 
 def check_free_tier_limits(config, account_config, compute_client, block_client, identity_client):
@@ -1069,9 +947,6 @@ def run_automated_creation(config, account_config, compute_client, network_clien
         if boot_gb < 50:
             add_log("Boot volume raised to minimum 50 GB.")
             boot_gb = 50
-        if boot_gb > 200:
-            add_log("Boot volume capped at 200 GB (free tier total limit).")
-            boot_gb = 200
         add_log(f"Setup Verified -> Subnet: {subnet_id[:20]}... | Image: {image_id[:20]}... | Zone: {ad_list[0] if ad_list else 'N/A'}")
         add_log(f"Debug -> Shape: {account_config['shape']} | Boot: {boot_gb}GB | OCPUs: {account_config.get('ocpus', 'N/A')} | RAM: {account_config.get('memory', 'N/A')}GB")
         add_log(f"Debug -> Subnet details: assign_public_ip=True")
@@ -1080,8 +955,8 @@ def run_automated_creation(config, account_config, compute_client, network_clien
         add_log(f"Debug -> Shape='{shape}', is_flex={is_flex}")
         shape_config = None
         if is_flex:
-            ocpus = max(1, min(int(account_config.get('ocpus', 2)), 4))
-            memory = max(6, min(int(account_config.get('memory', 12)), 24))
+            ocpus = int(account_config.get('ocpus', 2))
+            memory = int(account_config.get('memory', 12))
             shape_config = oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=ocpus, memory_in_gbs=memory)
             add_log(f"Debug -> Flex shape config: ocpus={ocpus}, memory={memory}")
         else:
@@ -1110,9 +985,6 @@ def run_automated_creation(config, account_config, compute_client, network_clien
             add_log(f"AD order randomized for faster discovery: {', '.join(ad_list)}")
         while True:
             attempts += 1
-            if MAX_ATTEMPTS and attempts > MAX_ATTEMPTS:
-                add_log(f"Attempt limit reached ({MAX_ATTEMPTS}). Giving up.")
-                break
             if stop_event.is_set():
                 add_log("Provisioning loop stopped by user.")
                 break
@@ -1253,7 +1125,7 @@ def free_tier_status():
         usage = get_free_tier_usage(config, compute_client, block_client, identity_client)
         return jsonify({'success': True, 'usage': usage})
     except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
+        return jsonify({'success': False, 'error': str(e)})
 
 
 @app.route('/api/status', methods=['GET'])
@@ -1273,7 +1145,7 @@ def auto_launch():
     try:
         oci.config.validate_config(config)
     except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
+        return jsonify({'success': False, 'error': f"Invalid OCI config: {e}"})
     requested_shape = data.get('shape', '')
     bot_token = data.get('telegram_bot_token', '').strip()
     chat_id = data.get('telegram_chat_id', '').strip()
@@ -1317,7 +1189,7 @@ def auto_launch():
         with automation_lock:
             automation_running = False
             automation_shape = None
-        return jsonify({'success': False, 'error': safe_error_str(e)})
+        return jsonify({'success': False, 'error': str(e)})
 
 
 @app.route('/api/stop-loop', methods=['POST'])
@@ -1333,10 +1205,7 @@ def stop_loop():
 @app.route('/api/logs', methods=['GET'])
 @require_auth
 def fetch_live_logs():
-    try:
-        offset = max(0, int(request.args.get('offset', 0)))
-    except (TypeError, ValueError):
-        offset = 0
+    offset = int(request.args.get('offset', 0))
     with logs_lock:
         batch = global_logs[offset:]
         total = len(global_logs)
@@ -1390,7 +1259,7 @@ def api_list_instances():
         instances = list_all_instances(config, compute_client, identity_client)
         return jsonify({'success': True, 'instances': instances})
     except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
+        return jsonify({'success': False, 'error': str(e)})
 
 
 @app.route('/api/delete-instance', methods=['POST'])
@@ -1417,7 +1286,7 @@ def api_delete_instance():
         else:
             return jsonify({'success': False, 'error': err})
     except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
+        return jsonify({'success': False, 'error': str(e)})
 
 
 
@@ -1449,7 +1318,7 @@ def api_reboot_instance():
         add_log(f"Instance '{name}' ({instance_id[:20]}...) reboot initiated.")
         return jsonify({'success': True, 'message': f"Instance '{name}' reboot initiated"})
     except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
+        return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/api/delete-all-instances', methods=['POST'])
 @require_auth
@@ -1475,12 +1344,9 @@ def api_delete_all_instances():
                 failed.append({'name': inst['name'], 'error': err})
         return jsonify({'success': True, 'message': f"Initiated termination for {deleted} instance(s)", 'deleted': deleted, 'failed': failed})
     except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
+        return jsonify({'success': False, 'error': str(e)})
 
 
-
-
-# ---- Boot Volume Management ----
 
 @app.route('/api/list-boot-volumes', methods=['POST'])
 @require_auth
@@ -1490,53 +1356,53 @@ def list_boot_volumes():
     config = build_config(data)
     try:
         oci.config.validate_config(config)
-        block_client = oci.core.BlockstorageClient(config)
         compute_client = oci.core.ComputeClient(config)
+        block_client = oci.core.BlockstorageClient(config)
         identity_client = oci.identity.IdentityClient(config)
         tenancy = config['tenancy']
         ads = identity_client.list_availability_domains(compartment_id=tenancy).data
 
+        instances = compute_client.list_instances(compartment_id=tenancy).data
+        instance_map = {i.id: i for i in instances if i.lifecycle_state not in ('TERMINATED', 'TERMINATING')}
+
+        attachments = []
+        for ad in ads:
+            try:
+                att_list = compute_client.list_boot_volume_attachments(
+                    compartment_id=tenancy, availability_domain=ad.name
+                ).data
+                attachments.extend(att_list)
+            except Exception:
+                pass
+        attachment_map = {a.boot_volume_id: a for a in attachments if a.lifecycle_state == 'ATTACHED'}
+
         all_volumes = []
         for ad in ads:
-            volumes = block_client.list_boot_volumes(compartment_id=tenancy, availability_domain=ad.name).data
-            for vol in volumes:
-                if getattr(vol, 'lifecycle_state', '') == 'TERMINATED':
-                    continue
-                # Find attachment info
-                attachment = None
-                attached_instance = None
-                try:
-                    attachments = compute_client.list_boot_volume_attachments(
-                        compartment_id=tenancy, boot_volume_id=vol.id
-                    ).data
-                    for att in attachments:
-                        if getattr(att, 'lifecycle_state', '') == 'ATTACHED':
-                            attachment = att
-                            try:
-                                inst = compute_client.get_instance(instance_id=att.instance_id).data
-                                attached_instance = inst.display_name
-                            except:
-                                attached_instance = att.instance_id[:20]
-                            break
-                except Exception:
-                    pass
-
-                all_volumes.append({
-                    'id': vol.id,
-                    'name': vol.display_name or 'Unnamed',
-                    'size_gb': vol.size_in_gbs,
-                    'ad': ad.name,
-                    'state': vol.lifecycle_state,
-                    'attachment_id': attachment.id if attachment else None,
-                    'instance_id': attachment.instance_id if attachment else None,
-                    'instance_name': attached_instance,
-                    'time_created': vol.time_created.isoformat() if vol.time_created else None,
-                    'image_id': getattr(vol, 'image_id', None),
-                    'is_system': getattr(vol, 'is_system', False)
-                })
+            try:
+                volumes = block_client.list_boot_volumes(
+                    compartment_id=tenancy, availability_domain=ad.name
+                ).data
+                for vol in volumes:
+                    if getattr(vol, 'lifecycle_state', '') == 'TERMINATED':
+                        continue
+                    att = attachment_map.get(vol.id)
+                    inst = instance_map.get(att.instance_id) if att else None
+                    all_volumes.append({
+                        'id': vol.id,
+                        'name': vol.display_name or 'Unnamed',
+                        'size_gb': getattr(vol, 'size_in_gbs', 'N/A'),
+                        'ad': ad.name,
+                        'state': getattr(vol, 'lifecycle_state', 'UNKNOWN'),
+                        'instance_name': inst.display_name if inst else None,
+                        'instance_id': inst.id if inst else None,
+                        'instance_state': inst.lifecycle_state if inst else None,
+                        'attachment_id': att.id if att else None
+                    })
+            except Exception:
+                pass
         return jsonify({'success': True, 'volumes': all_volumes})
     except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
+        return jsonify({'success': False, 'error': str(e)})
 
 
 @app.route('/api/detach-boot-volume', methods=['POST'])
@@ -1546,49 +1412,31 @@ def detach_boot_volume():
     set_user_tz(data.get('timezone'))
     config = build_config(data)
     attachment_id = data.get('attachment_id')
-    volume_name = data.get('volume_name', 'Unknown')
+    instance_id = data.get('instance_id')
     if not attachment_id:
         return jsonify({'success': False, 'error': 'attachment_id required'})
     try:
         oci.config.validate_config(config)
         compute_client = oci.core.ComputeClient(config)
+
+        if instance_id:
+            inst = compute_client.get_instance(instance_id=instance_id).data
+            if inst.lifecycle_state == 'RUNNING':
+                add_log(f"Stopping instance '{inst.display_name}' to detach boot volume...")
+                compute_client.instance_action(instance_id=instance_id, action='STOP')
+                for _ in range(30):
+                    inst = compute_client.get_instance(instance_id=instance_id).data
+                    if inst.lifecycle_state == 'STOPPED':
+                        break
+                    time.sleep(2)
+                if inst.lifecycle_state != 'STOPPED':
+                    return jsonify({'success': False, 'error': 'Instance did not stop in time'})
+
         compute_client.detach_boot_volume(boot_volume_attachment_id=attachment_id)
-        add_log(f"Boot volume '{volume_name}' detached (attachment: {attachment_id[:20]}...)")
-        return jsonify({'success': True, 'message': f"Boot volume '{volume_name}' detached"})
+        add_log(f"Boot volume detached (attachment {attachment_id[:20]}...)")
+        return jsonify({'success': True, 'message': 'Boot volume detached'})
     except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
-
-
-@app.route('/api/attach-boot-volume', methods=['POST'])
-@require_auth
-def attach_boot_volume():
-    data = request.json or {}
-    set_user_tz(data.get('timezone'))
-    config = build_config(data)
-    volume_id = data.get('volume_id')
-    instance_id = data.get('instance_id')
-    volume_name = data.get('volume_name', 'Unknown')
-    instance_name = data.get('instance_name', 'Unknown')
-    if not volume_id or not instance_id:
-        return jsonify({'success': False, 'error': 'volume_id and instance_id required'})
-    try:
-        oci.config.validate_config(config)
-        compute_client = oci.core.ComputeClient(config)
-        attachment = compute_client.attach_boot_volume(
-            attach_boot_volume_details=oci.core.models.AttachBootVolumeDetails(
-                boot_volume_id=volume_id,
-                instance_id=instance_id,
-                display_name=f"{volume_name}-attach"
-            )
-        ).data
-        add_log(f"Boot volume '{volume_name}' attached to '{instance_name}' ({attachment.id[:20]}...)")
-        return jsonify({
-            'success': True,
-            'message': f"Boot volume '{volume_name}' attached to '{instance_name}'",
-            'attachment_id': attachment.id
-        })
-    except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
+        return jsonify({'success': False, 'error': str(e)})
 
 
 @app.route('/api/delete-boot-volume', methods=['POST'])
@@ -1598,130 +1446,81 @@ def delete_boot_volume():
     set_user_tz(data.get('timezone'))
     config = build_config(data)
     volume_id = data.get('volume_id')
-    volume_name = data.get('volume_name', 'Unknown')
     if not volume_id:
         return jsonify({'success': False, 'error': 'volume_id required'})
     try:
         oci.config.validate_config(config)
         block_client = oci.core.BlockstorageClient(config)
         block_client.delete_boot_volume(boot_volume_id=volume_id)
-        add_log(f"Boot volume '{volume_name}' ({volume_id[:20]}...) deletion initiated.")
-        return jsonify({'success': True, 'message': f"Boot volume '{volume_name}' deletion initiated"})
+        add_log(f"Boot volume deletion initiated: {volume_id[:20]}...")
+        return jsonify({'success': True, 'message': 'Boot volume deletion initiated'})
     except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
+        return jsonify({'success': False, 'error': str(e)})
 
 
-@app.route('/api/replace-boot-volume', methods=['POST'])
+@app.route('/api/launch-from-boot-volume', methods=['POST'])
 @require_auth
-def replace_boot_volume():
-    """
-    Replace a boot volume: detach old volume from instance, attach new volume to same instance.
-    The instance should be stopped first for safety.
-    """
+def launch_from_boot_volume():
     data = request.json or {}
     set_user_tz(data.get('timezone'))
     config = build_config(data)
-    old_volume_id = data.get('old_volume_id')
-    new_volume_id = data.get('new_volume_id')
-    instance_id = data.get('instance_id')
-    old_name = data.get('old_name', 'old')
-    new_name = data.get('new_name', 'new')
-    instance_name = data.get('instance_name', 'Unknown')
+    boot_volume_id = data.get('boot_volume_id')
+    subnet_id = data.get('subnet_id')
+    shape = data.get('shape', 'VM.Standard.A1.Flex')
+    ssh_key = data.get('ssh_key', '').strip()
+    display_name = data.get('display_name', 'Instance-from-volume')
 
-    if not old_volume_id or not new_volume_id or not instance_id:
-        return jsonify({'success': False, 'error': 'old_volume_id, new_volume_id, and instance_id required'})
+    if not boot_volume_id:
+        return jsonify({'success': False, 'error': 'boot_volume_id required'})
+    if not subnet_id:
+        return jsonify({'success': False, 'error': 'subnet_id required'})
 
     try:
         oci.config.validate_config(config)
         compute_client = oci.core.ComputeClient(config)
+        network_client = oci.core.VirtualNetworkClient(config)
         block_client = oci.core.BlockstorageClient(config)
+        tenancy = config['tenancy']
 
-        # Step 1: Find and detach old attachment
-        add_log(f"Replacing boot volume on '{instance_name}': detaching '{old_name}'...")
-        attachments = compute_client.list_boot_volume_attachments(
-            compartment_id=config['tenancy'], instance_id=instance_id
-        ).data
-        old_attachment = None
-        for att in attachments:
-            if att.boot_volume_id == old_volume_id and getattr(att, 'lifecycle_state', '') == 'ATTACHED':
-                old_attachment = att
-                break
+        vol = block_client.get_boot_volume(boot_volume_id=boot_volume_id).data
+        ad = vol.availability_domain
 
-        if old_attachment:
-            compute_client.detach_boot_volume(boot_volume_attachment_id=old_attachment.id)
-            add_log(f"Old volume '{old_name}' detached.")
-            # Wait for detachment
-            for _ in range(30):
-                atts = compute_client.list_boot_volume_attachments(
-                    compartment_id=config['tenancy'], instance_id=instance_id
-                ).data
-                still_attached = any(a.boot_volume_id == old_volume_id and 
-                                     getattr(a, 'lifecycle_state', '') == 'ATTACHED' for a in atts)
-                if not still_attached:
-                    break
-                time.sleep(2)
-        else:
-            add_log(f"Old volume '{old_name}' was not attached — skipping detach.")
-
-        # Step 2: Attach new volume
-        add_log(f"Attaching new volume '{new_name}' to '{instance_name}'...")
-        new_attachment = compute_client.attach_boot_volume(
-            attach_boot_volume_details=oci.core.models.AttachBootVolumeDetails(
-                boot_volume_id=new_volume_id,
-                instance_id=instance_id,
-                display_name=f"{new_name}-attach"
+        is_flex = '.Flex' in shape
+        shape_config = None
+        if is_flex:
+            ocpus = int(data.get('ocpus', 2))
+            memory = int(data.get('memory', 12))
+            shape_config = oci.core.models.LaunchInstanceShapeConfigDetails(
+                ocpus=ocpus, memory_in_gbs=memory
             )
-        ).data
-        add_log(f"New volume '{new_name}' attached ({new_attachment.id[:20]}...).")
 
-        return jsonify({
-            'success': True,
-            'message': f"Boot volume replaced on '{instance_name}': '{old_name}' -> '{new_name}'",
-            'new_attachment_id': new_attachment.id
-        })
-    except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
-
-
-@app.route('/api/resize-boot-volume', methods=['POST'])
-@require_auth
-def resize_boot_volume():
-    """Resize a boot volume (must be detached or instance stopped)."""
-    data = request.json or {}
-    set_user_tz(data.get('timezone'))
-    config = build_config(data)
-    volume_id = data.get('volume_id')
-    volume_name = data.get('volume_name', 'Unknown')
-    new_size = int(data.get('new_size_gb', 0))
-
-    if not volume_id or new_size < 50:
-        return jsonify({'success': False, 'error': 'volume_id required and new_size must be >= 50 GB'})
-
-    try:
-        oci.config.validate_config(config)
-        block_client = oci.core.BlockstorageClient(config)
-
-        # Get current size
-        vol = block_client.get_boot_volume(boot_volume_id=volume_id).data
-        current_size = vol.size_in_gbs
-        if new_size <= current_size:
-            return jsonify({'success': False, 'error': f'New size ({new_size} GB) must be larger than current ({current_size} GB)'})
-
-        block_client.update_boot_volume(
-            boot_volume_id=volume_id,
-            update_boot_volume_details=oci.core.models.UpdateBootVolumeDetails(
-                size_in_gbs=new_size
-            )
+        instance_details = oci.core.models.LaunchInstanceDetails(
+            compartment_id=tenancy,
+            availability_domain=ad,
+            shape=shape,
+            shape_config=shape_config,
+            source_details=oci.core.models.InstanceSourceViaBootVolumeDetails(
+                boot_volume_id=boot_volume_id
+            ),
+            create_vnic_details=oci.core.models.CreateVnicDetails(
+                subnet_id=subnet_id, assign_public_ip=True
+            ),
+            metadata={"ssh_authorized_keys": ssh_key} if ssh_key else {},
+            display_name=display_name
         )
-        add_log(f"Boot volume '{volume_name}' resized: {current_size} GB -> {new_size} GB")
+
+        response = compute_client.launch_instance(instance_details)
+        instance_id = response.data.id
+        add_log(f"Instance launched from boot volume: {instance_id[:20]}...")
         return jsonify({
             'success': True,
-            'message': f"Boot volume '{volume_name}' resized from {current_size} GB to {new_size} GB"
+            'instance_id': instance_id,
+            'message': 'Instance launched from existing boot volume'
         })
     except Exception as e:
-        return jsonify({'success': False, 'error': safe_error_str(e)})
+        return jsonify({'success': False, 'error': str(e)})
 
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+    app.run(host='0.0.0.0', port=port)
