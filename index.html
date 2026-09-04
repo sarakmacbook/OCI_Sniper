@@ -1568,6 +1568,12 @@
         document.getElementById('quotaPanel').innerHTML = '';
         document.getElementById('shapeInfo').style.display = 'none';
         document.getElementById('shapeInfo').innerHTML = '';
+        document.getElementById('bvPanel').style.display = 'none';
+        document.getElementById('bvList').innerHTML = '';
+        document.getElementById('bvActionResult').style.display = 'none';
+        document.getElementById('bvActionResult').innerHTML = '';
+        document.getElementById('bvInfo').style.display = 'none';
+        selectedBvId = null; selectedBvName = null; selectedBvInstanceId = null;
         clearLogs();
         addLog('All fields cleared', 'success');
     }
@@ -1602,19 +1608,20 @@
                 panel.style.display = 'block';
                 let html = '';
                 data.volumes.forEach(vol => {
+                    const safeName = (vol.name || 'Unnamed').replace(/'/g, "\'");
                     const attached = vol.instance_name ? '<span style="color:var(--positive)">Attached to ' + vol.instance_name + '</span>' : '<span style="color:var(--text-muted)">Detached</span>';
                     const isSelected = selectedBvId === vol.id ? 'border-color:var(--accent);background:rgba(99,102,241,0.08);' : '';
-                    html += '<div class="instance-row" style="cursor:pointer;' + isSelected + '" onclick="selectBv(' + "'" + vol.id + "','" + vol.name + "','" + (vol.instance_id || '') + "')" + '">';
+                    html += '<div class="instance-row" style="cursor:pointer;' + isSelected + '" onclick="selectBv(' + "'" + vol.id + "','" + safeName + "','" + (vol.instance_id || '') + "')" + '">';
                     html += '<div class="instance-info">';
                     html += '<div class="instance-name">' + vol.name + ' <span style="color:var(--text-muted);font-weight:400;">(' + vol.size_gb + ' GB)</span></div>';
                     html += '<div class="instance-meta">' + vol.ad + ' | ' + attached + ' | ' + vol.state + '</div>';
                     html += '</div>';
                     if (vol.instance_name) {
-                        html += '<button class="instance-delete" onclick="event.stopPropagation();detachBootVolume(' + "'" + vol.attachment_id + "','" + vol.name + "')" + '" title="Detach" style="border-color:rgba(245,158,11,0.3);color:var(--warning);margin-right:4px;">&#128229;</button>';
+                        html += '<button class="instance-delete" onclick="event.stopPropagation();detachBootVolume(' + "'" + vol.attachment_id + "','" + safeName + "')" + '" title="Detach" style="border-color:rgba(245,158,11,0.3);color:var(--warning);margin-right:4px;">&#128229;</button>';
                     } else {
-                        html += '<button class="instance-delete" onclick="event.stopPropagation();attachBootVolume(' + "'" + vol.id + "','" + vol.name + "')" + '" title="Attach to selected instance" style="border-color:rgba(34,197,94,0.3);color:var(--positive);margin-right:4px;">&#128230;</button>';
+                        html += '<button class="instance-delete" onclick="event.stopPropagation();attachBootVolume(' + "'" + vol.id + "','" + safeName + "')" + '" title="Attach to selected instance" style="border-color:rgba(34,197,94,0.3);color:var(--positive);margin-right:4px;">&#128230;</button>';
                     }
-                    html += '<button class="instance-delete" onclick="event.stopPropagation();deleteBootVolume(' + "'" + vol.id + "','" + vol.name + "')" + '" title="Delete volume">&#128465;</button>';
+                    html += '<button class="instance-delete" onclick="event.stopPropagation();deleteBootVolume(' + "'" + vol.id + "','" + safeName + "')" + '" title="Delete volume">&#128465;</button>';
                     html += '</div>';
                 });
                 list.innerHTML = html;
@@ -1636,7 +1643,16 @@
         selectedBvId = id;
         selectedBvName = name;
         selectedBvInstanceId = instanceId;
-        scanBootVolumes(); // re-render to show selection
+        // Update visual highlight without re-fetching
+        document.querySelectorAll('#bvList .instance-row').forEach(row => {
+            row.style.borderColor = '';
+            row.style.background = '';
+        });
+        const clicked = event.currentTarget;
+        if (clicked) {
+            clicked.style.borderColor = 'var(--accent)';
+            clicked.style.background = 'rgba(99,102,241,0.08)';
+        }
         addLog('Selected boot volume: ' + name, 'info');
     }
 
