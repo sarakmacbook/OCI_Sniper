@@ -38,14 +38,6 @@ APP_VERSION = "5.0"
 app = Flask(__name__)
 
 # ---- Security Headers ----
-@app.after_request
-def add_security_headers(response):
-    response.headers['X-Frame-Options'] = 'DENY'
-    response.headers['X-Content-Type-Options'] = 'nosniff'
-    response.headers['X-XSS-Protection'] = '1; mode=block'
-    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
-    return response
-
 # ---- Config ----
 ADMIN_PASSWORD = os.environ.get('APP_PASSWORD')
 if not ADMIN_PASSWORD:
