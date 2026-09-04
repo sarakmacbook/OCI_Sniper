@@ -1486,6 +1486,250 @@ def api_delete_all_instances():
         return jsonify({'success': False, 'error': safe_error_str(e)})
 
 
+
+
+# ---- Boot Volume Management ----
+
+@app.route('/api/list-boot-volumes', methods=['POST'])
+@require_auth
+def list_boot_volumes():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    try:
+        oci.config.validate_config(config)
+        block_client = oci.core.BlockstorageClient(config)
+        compute_client = oci.core.ComputeClient(config)
+        identity_client = oci.identity.IdentityClient(config)
+        tenancy = config['tenancy']
+        ads = identity_client.list_availability_domains(compartment_id=tenancy).data
+
+        all_volumes = []
+        for ad in ads:
+            volumes = block_client.list_boot_volumes(compartment_id=tenancy, availability_domain=ad.name).data
+            for vol in volumes:
+                if getattr(vol, 'lifecycle_state', '') == 'TERMINATED':
+                    continue
+                # Find attachment info
+                attachment = None
+                attached_instance = None
+                try:
+                    attachments = compute_client.list_boot_volume_attachments(
+                        compartment_id=tenancy, boot_volume_id=vol.id
+                    ).data
+                    for att in attachments:
+                        if getattr(att, 'lifecycle_state', '') == 'ATTACHED':
+                            attachment = att
+                            try:
+                                inst = compute_client.get_instance(instance_id=att.instance_id).data
+                                attached_instance = inst.display_name
+                            except:
+                                attached_instance = att.instance_id[:20]
+                            break
+                except Exception:
+                    pass
+
+                all_volumes.append({
+                    'id': vol.id,
+                    'name': vol.display_name or 'Unnamed',
+                    'size_gb': vol.size_in_gbs,
+                    'ad': ad.name,
+                    'state': vol.lifecycle_state,
+                    'attachment_id': attachment.id if attachment else None,
+                    'instance_id': attachment.instance_id if attachment else None,
+                    'instance_name': attached_instance,
+                    'time_created': vol.time_created.isoformat() if vol.time_created else None,
+                    'image_id': getattr(vol, 'image_id', None),
+                    'is_system': getattr(vol, 'is_system', False)
+                })
+        return jsonify({'success': True, 'volumes': all_volumes})
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+
+
+@app.route('/api/detach-boot-volume', methods=['POST'])
+@require_auth
+def detach_boot_volume():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    attachment_id = data.get('attachment_id')
+    volume_name = data.get('volume_name', 'Unknown')
+    if not attachment_id:
+        return jsonify({'success': False, 'error': 'attachment_id required'})
+    try:
+        oci.config.validate_config(config)
+        compute_client = oci.core.ComputeClient(config)
+        compute_client.detach_boot_volume(boot_volume_attachment_id=attachment_id)
+        add_log(f"Boot volume '{volume_name}' detached (attachment: {attachment_id[:20]}...)")
+        return jsonify({'success': True, 'message': f"Boot volume '{volume_name}' detached"})
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+
+
+@app.route('/api/attach-boot-volume', methods=['POST'])
+@require_auth
+def attach_boot_volume():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    volume_id = data.get('volume_id')
+    instance_id = data.get('instance_id')
+    volume_name = data.get('volume_name', 'Unknown')
+    instance_name = data.get('instance_name', 'Unknown')
+    if not volume_id or not instance_id:
+        return jsonify({'success': False, 'error': 'volume_id and instance_id required'})
+    try:
+        oci.config.validate_config(config)
+        compute_client = oci.core.ComputeClient(config)
+        attachment = compute_client.attach_boot_volume(
+            attach_boot_volume_details=oci.core.models.AttachBootVolumeDetails(
+                boot_volume_id=volume_id,
+                instance_id=instance_id,
+                display_name=f"{volume_name}-attach"
+            )
+        ).data
+        add_log(f"Boot volume '{volume_name}' attached to '{instance_name}' ({attachment.id[:20]}...)")
+        return jsonify({
+            'success': True,
+            'message': f"Boot volume '{volume_name}' attached to '{instance_name}'",
+            'attachment_id': attachment.id
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+
+
+@app.route('/api/delete-boot-volume', methods=['POST'])
+@require_auth
+def delete_boot_volume():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    volume_id = data.get('volume_id')
+    volume_name = data.get('volume_name', 'Unknown')
+    if not volume_id:
+        return jsonify({'success': False, 'error': 'volume_id required'})
+    try:
+        oci.config.validate_config(config)
+        block_client = oci.core.BlockstorageClient(config)
+        block_client.delete_boot_volume(boot_volume_id=volume_id)
+        add_log(f"Boot volume '{volume_name}' ({volume_id[:20]}...) deletion initiated.")
+        return jsonify({'success': True, 'message': f"Boot volume '{volume_name}' deletion initiated"})
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+
+
+@app.route('/api/replace-boot-volume', methods=['POST'])
+@require_auth
+def replace_boot_volume():
+    """
+    Replace a boot volume: detach old volume from instance, attach new volume to same instance.
+    The instance should be stopped first for safety.
+    """
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    old_volume_id = data.get('old_volume_id')
+    new_volume_id = data.get('new_volume_id')
+    instance_id = data.get('instance_id')
+    old_name = data.get('old_name', 'old')
+    new_name = data.get('new_name', 'new')
+    instance_name = data.get('instance_name', 'Unknown')
+
+    if not old_volume_id or not new_volume_id or not instance_id:
+        return jsonify({'success': False, 'error': 'old_volume_id, new_volume_id, and instance_id required'})
+
+    try:
+        oci.config.validate_config(config)
+        compute_client = oci.core.ComputeClient(config)
+        block_client = oci.core.BlockstorageClient(config)
+
+        # Step 1: Find and detach old attachment
+        add_log(f"Replacing boot volume on '{instance_name}': detaching '{old_name}'...")
+        attachments = compute_client.list_boot_volume_attachments(
+            compartment_id=config['tenancy'], instance_id=instance_id
+        ).data
+        old_attachment = None
+        for att in attachments:
+            if att.boot_volume_id == old_volume_id and getattr(att, 'lifecycle_state', '') == 'ATTACHED':
+                old_attachment = att
+                break
+
+        if old_attachment:
+            compute_client.detach_boot_volume(boot_volume_attachment_id=old_attachment.id)
+            add_log(f"Old volume '{old_name}' detached.")
+            # Wait for detachment
+            for _ in range(30):
+                atts = compute_client.list_boot_volume_attachments(
+                    compartment_id=config['tenancy'], instance_id=instance_id
+                ).data
+                still_attached = any(a.boot_volume_id == old_volume_id and 
+                                     getattr(a, 'lifecycle_state', '') == 'ATTACHED' for a in atts)
+                if not still_attached:
+                    break
+                time.sleep(2)
+        else:
+            add_log(f"Old volume '{old_name}' was not attached — skipping detach.")
+
+        # Step 2: Attach new volume
+        add_log(f"Attaching new volume '{new_name}' to '{instance_name}'...")
+        new_attachment = compute_client.attach_boot_volume(
+            attach_boot_volume_details=oci.core.models.AttachBootVolumeDetails(
+                boot_volume_id=new_volume_id,
+                instance_id=instance_id,
+                display_name=f"{new_name}-attach"
+            )
+        ).data
+        add_log(f"New volume '{new_name}' attached ({new_attachment.id[:20]}...).")
+
+        return jsonify({
+            'success': True,
+            'message': f"Boot volume replaced on '{instance_name}': '{old_name}' -> '{new_name}'",
+            'new_attachment_id': new_attachment.id
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+
+
+@app.route('/api/resize-boot-volume', methods=['POST'])
+@require_auth
+def resize_boot_volume():
+    """Resize a boot volume (must be detached or instance stopped)."""
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    volume_id = data.get('volume_id')
+    volume_name = data.get('volume_name', 'Unknown')
+    new_size = int(data.get('new_size_gb', 0))
+
+    if not volume_id or new_size < 50:
+        return jsonify({'success': False, 'error': 'volume_id required and new_size must be >= 50 GB'})
+
+    try:
+        oci.config.validate_config(config)
+        block_client = oci.core.BlockstorageClient(config)
+
+        # Get current size
+        vol = block_client.get_boot_volume(boot_volume_id=volume_id).data
+        current_size = vol.size_in_gbs
+        if new_size <= current_size:
+            return jsonify({'success': False, 'error': f'New size ({new_size} GB) must be larger than current ({current_size} GB)'})
+
+        block_client.update_boot_volume(
+            boot_volume_id=volume_id,
+            update_boot_volume_details=oci.core.models.UpdateBootVolumeDetails(
+                size_in_gbs=new_size
+            )
+        )
+        add_log(f"Boot volume '{volume_name}' resized: {current_size} GB -> {new_size} GB")
+        return jsonify({
+            'success': True,
+            'message': f"Boot volume '{volume_name}' resized from {current_size} GB to {new_size} GB"
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+
+
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
