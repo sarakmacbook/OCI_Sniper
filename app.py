@@ -1,1757 +1,1616 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OCI Provisioner Portal v5</title>
-    <style>
-        :root {
-            --bg: #0f0f12;
-            --surface: #1a1a1f;
-            --surface-raised: #222228;
-            --border: #2a2a32;
-            --text: #e8e8ec;
-            --text-secondary: #a0a0a8;
-            --text-muted: #6a6a72;
-            --accent: #6366f1;
-            --accent-dim: #4f46e5;
-            --positive: #22c55e;
-            --danger: #ef4444;
-            --warning: #f59e0b;
-            --radius-sm: 6px;
-            --radius-md: 10px;
-            --radius-lg: 12px;
-            --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-            --font-mono: "SF Mono", Monaco, "Cascadia Code", "Roboto Mono", Consolas, monospace;
-        }
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: var(--font-sans);
-            background: var(--bg);
-            color: var(--text);
-            line-height: 1.5;
-            padding: 20px;
-            min-height: 100vh;
-        }
-        .container { max-width: 680px; margin: 0 auto; }
-        .header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            margin-bottom: 20px;
-        }
-        .header h1 { font-size: 22px; font-weight: 600; letter-spacing: -0.3px; }
-        .header p { font-size: 13px; color: var(--text-muted); margin-top: 2px; }
-        .status-badge {
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            padding: 6px 14px;
-            border-radius: 20px;
-            font-size: 12px;
-            font-weight: 500;
-            border: 1px solid;
-            transition: all 0.2s ease;
-        }
-        .status-badge.stopped {
-            background: rgba(239, 68, 68, 0.08);
-            border-color: rgba(239, 68, 68, 0.2);
-            color: var(--danger);
-        }
-        .status-badge.running {
-            background: rgba(34, 197, 94, 0.08);
-            border-color: rgba(34, 197, 94, 0.2);
-            color: var(--positive);
-        }
-        .status-dot {
-            width: 7px; height: 7px; border-radius: 50%;
-            display: inline-block;
-        }
-        .status-dot.running {
-            background: var(--positive);
-            box-shadow: 0 0 8px rgba(34, 197, 94, 0.5);
-            animation: pulse 2s infinite;
-        }
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.4; }
-        }
-        .panel {
-            background: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: var(--radius-lg);
-            margin-bottom: 14px;
-            overflow: hidden;
-        }
-        .panel-header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 14px 16px;
-            cursor: pointer;
-            background: none;
-            border: none;
-            width: 100%;
-            color: var(--text);
-            font-size: 15px;
-            font-weight: 500;
-            text-align: left;
-            transition: background 0.15s;
-        }
-        .panel-header:hover { background: rgba(255,255,255,0.02); }
-        .panel-header .icon-group { display: flex; align-items: center; gap: 10px; }
-        .panel-header svg { color: var(--text-muted); }
-        .chevron { transition: transform 0.2s ease; color: var(--text-muted); }
-        .chevron.collapsed { transform: rotate(-90deg); }
-        .panel-body { padding: 0 16px 16px; }
-        .panel-body.collapsed { display: none; }
-        .form-group { margin-bottom: 14px; }
-        .form-label {
-            display: block;
-            font-size: 12px;
-            color: var(--text-muted);
-            margin-bottom: 6px;
-            font-weight: 500;
-            text-transform: uppercase;
-            letter-spacing: 0.3px;
-        }
-        .form-input, .form-select, .form-textarea {
-            width: 100%;
-            padding: 10px 12px;
-            border: 1px solid var(--border);
-            border-radius: var(--radius-md);
-            background: var(--surface-raised);
-            color: var(--text);
-            font-size: 13px;
-            font-family: var(--font-sans);
-            transition: border-color 0.15s, box-shadow 0.15s;
-        }
-        .form-input:focus, .form-select:focus, .form-textarea:focus {
-            outline: none;
-            border-color: var(--accent);
-            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
-        }
-        .form-textarea {
-            min-height: 60px;
-            resize: vertical;
-            font-family: var(--font-mono);
-            font-size: 12px;
-        }
-        .form-textarea.ssh-area {
-            min-height: 50px;
-            margin-top: 8px;
-        }
-        .upload-zone {
-            padding: 16px;
-            border: 1.5px dashed var(--border);
-            border-radius: var(--radius-md);
-            text-align: center;
-            cursor: pointer;
-            transition: all 0.2s ease;
-            position: relative;
-        }
-        .upload-zone:hover {
-            border-color: var(--accent-dim);
-            background: rgba(99, 102, 241, 0.03);
-        }
-        .upload-zone.success {
-            border-color: var(--positive);
-            background: rgba(34, 197, 94, 0.05);
-        }
-        .upload-zone input[type="file"] {
-            position: absolute;
-            top: 0; left: 0;
-            width: 100%; height: 100%;
-            opacity: 0;
-            cursor: pointer;
-        }
-        .btn-row { display: flex; gap: 8px; margin-bottom: 12px; }
-        .btn {
-            flex: 1;
-            padding: 10px 14px;
-            border: 1px solid var(--border);
-            border-radius: var(--radius-md);
-            background: var(--surface-raised);
-            color: var(--text);
-            font-size: 13px;
-            font-weight: 500;
-            cursor: pointer;
-            transition: all 0.15s;
-            text-align: center;
-        }
-        .btn:hover { background: rgba(255,255,255,0.05); }
-        .btn:active { transform: translateY(1px); }
-        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-        .btn-primary {
-            background: var(--accent);
-            border-color: var(--accent);
-            color: #fff;
-        }
-        .btn-primary:hover { background: var(--accent-dim); }
-        .btn-danger { color: var(--danger); border-color: rgba(239,68,68,0.3); }
-        .btn-danger:hover { background: rgba(239,68,68,0.08); }
-        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-        .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
-        .toggle-group {
-            display: flex;
-            gap: 4px;
-            padding: 4px;
-            border: 1px solid var(--border);
-            border-radius: var(--radius-md);
-            background: var(--surface-raised);
-        }
-        .toggle-btn {
-            flex: 1;
-            padding: 7px 8px;
-            border: none;
-            border-radius: var(--radius-sm);
-            background: transparent;
-            color: var(--text-muted);
-            font-size: 12px;
-            font-weight: 500;
-            cursor: pointer;
-            transition: all 0.15s;
-        }
-        .toggle-btn.active {
-            background: var(--accent);
-            color: #fff;
-        }
-        .checkbox-row {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            margin-bottom: 12px;
-        }
-        .checkbox-row input[type="checkbox"] {
-            width: 16px; height: 16px;
-            accent-color: var(--accent);
-            cursor: pointer;
-        }
-        .checkbox-row label {
-            font-size: 13px;
-            color: var(--text-secondary);
-            cursor: pointer;
-        }
-        .warning-text {
-            font-size: 11px;
-            color: var(--warning);
-            margin-top: 4px;
-            display: none;
-        }
-        .action-bar {
-            display: flex;
-            gap: 10px;
-            margin-bottom: 16px;
-        }
-        .action-bar .btn { padding: 14px 20px; font-size: 15px; }
-        .action-bar .btn-primary { flex: 2; }
-        .action-bar .btn-danger { flex: 1; }
-        .terminal {
-            background: #0a0a0c;
-            border: 1px solid var(--border);
-            border-radius: var(--radius-lg);
-            overflow: hidden;
-        }
-        .terminal-header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 10px 14px;
-            background: var(--surface-raised);
-            border-bottom: 1px solid var(--border);
-        }
-        .terminal-title {
-            font-size: 12px;
-            font-weight: 500;
-            color: var(--text-muted);
-            display: flex;
-            align-items: center;
-            gap: 6px;
-        }
-        .terminal-body {
-            padding: 12px 14px;
-            min-height: 220px;
-            max-height: 320px;
-            overflow-y: auto;
-            font-family: var(--font-mono);
-            font-size: 12px;
-            line-height: 1.7;
-            color: var(--text-secondary);
-        }
-        .log-line { margin-bottom: 3px; }
-        .log-time { color: var(--text-muted); }
-        .log-info { color: var(--text-secondary); }
-        .log-success { color: var(--positive); }
-        .log-error { color: var(--danger); }
-        .log-warn { color: var(--warning); }
-        .quota-panel {
-            padding: 14px;
-            border-radius: var(--radius-md);
-            background: var(--surface-raised);
-            margin-bottom: 12px;
-            display: none;
-        }
-        .quota-item { margin-bottom: 12px; }
-        .quota-item:last-child { margin-bottom: 0; }
-        .quota-header {
-            display: flex;
-            justify-content: space-between;
-            font-size: 12px;
-            margin-bottom: 5px;
-        }
-        .quota-bar {
-            height: 5px;
-            background: var(--border);
-            border-radius: 3px;
-            overflow: hidden;
-        }
-        .quota-fill {
-            height: 100%;
-            border-radius: 3px;
-            transition: width 0.4s ease;
-        }
-        .tg-result { margin-top: 8px; font-size: 12px; }
-        .hidden { display: none; }
-        .instance-row {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 6px 8px;
-            background: var(--bg);
-            border-radius: 6px;
-            margin-bottom: 6px;
-            font-size: 12px;
-        }
-        .instance-info { overflow: hidden; flex: 1; }
-        .instance-name { color: var(--text); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .instance-meta { color: var(--text-muted); font-size: 11px; }
-        .instance-delete {
-            padding: 3px 8px;
-            border: 1px solid rgba(239,68,68,0.3);
-            border-radius: 4px;
-            background: transparent;
-            color: var(--danger);
-            font-size: 11px;
-            cursor: pointer;
-            flex-shrink: 0;
-            margin-left: 8px;
-        }
-        .instance-delete:hover { background: rgba(239,68,68,0.1); }
-        @media (max-width: 560px) {
-            .grid-2, .grid-3 { grid-template-columns: 1fr; }
-            .action-bar { flex-direction: column; }
-        }
-    </style>
-<base target="_blank">
-<base target="_blank">
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <div>
-                <h1>OCI Provisioner Portal</h1>
-                <p>Always free tier automation v2</p>
-            </div>
-            <div style="display:flex;align-items:center;gap:8px;">
-                <button onclick="clearAll()" style="padding:5px 12px;border:1px solid var(--border);border-radius:20px;background:var(--surface-raised);color:var(--text-muted);font-size:11px;font-weight:500;cursor:pointer;">Clear all</button>
-                <div id="statusBadge" class="status-badge stopped">
-                    <span id="statusDot" class="status-dot"></span>
-                    <span id="statusText">Stopped</span>
-                </div>
-            </div>
-        </div>
+import os
+import re
+import time
+import random
+import threading
+import datetime
+import functools
+import hmac
+import secrets
+import requests
+from flask import Flask, render_template, request, jsonify, Response
+import oci
 
-        <!-- Credentials Panel -->
-        <div class="panel">
-            <button class="panel-header" onclick="togglePanel('conn')">
-                <span class="icon-group">
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-                    1. Credentials & config
-                </span>
-                <svg id="connChevron" class="chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
-            </button>
-            <div id="connBody" class="panel-body">
-                <div class="form-group">
-                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
-                        <label class="form-label" style="margin-bottom:0;">Raw config block</label>
-                        <input type="file" id="configFile" style="display:none;" onchange="handleConfigFile()">
-                        <span onclick="document.getElementById('configFile').click()" style="cursor:pointer;font-size:11px;color:var(--accent);font-weight:500;display:flex;align-items:center;gap:4px;padding:3px 8px;border-radius:4px;border:1px solid color-mix(in srgb,var(--accent) 25%,transparent);">
-                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                                Upload .txt
-                            </span>
-                    </div>
-                    <textarea id="rawConfig" class="form-textarea" oninput="parseConfig()" placeholder="Paste OCI config here or upload a .txt file..."></textarea>
-                </div>
-                <div class="form-group">
-                    <label class="form-label">Private key (.pem)</label>
-                    <input type="file" id="keyFile" style="display:none;" onchange="handleKeyFile()">
-                    <div class="upload-zone" id="keyZone" onclick="document.getElementById('keyFile').click()">
-                        <div id="keyZoneContent">
-                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="color:var(--text-muted);margin-bottom:6px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                            <div style="font-size:12px;color:var(--text-muted);">Click to upload .pem, .txt, or .key</div>
-                        </div>
-                    </div>
-                </div>
-                <div class="btn-row">
-                    <button class="btn" id="quotaBtn" onclick="checkQuota()">Check free tier</button>
-                    <button class="btn" id="scanBtn" onclick="scanImages()">Scan OS images</button>
-                </div>
-                <div id="quotaPanel" class="quota-panel"></div>
-                <div class="checkbox-row">
-                    <input type="checkbox" id="allOS" onchange="onAllOSChange()">
-                    <label for="allOS">All OS mode (not just Ubuntu)</label>
-                </div>
-                <div class="form-group">
-                    <label class="form-label">Target OS image</label>
-                    <select id="imageSelect" class="form-select">
-                        <option value="">-- Scan images first --</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
-                        <label class="form-label" style="margin-bottom:0;">Target subnet</label>
-                        <button class="btn" id="scanSubnetBtn2" onclick="scanSubnets()" style="padding:3px 10px;font-size:11px;flex:none;">Scan subnets</button>
-                    </div>
-                    <select id="subnetSelect" class="form-select">
-                        <option value="">-- Auto-select first available --</option>
-                    </select>
-                    <div id="subnetInfo" style="margin-top:6px;font-size:11px;color:var(--text-muted);display:none;"></div>
-                </div>
-                <div class="form-group">
-                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
-                        <label class="form-label" style="margin-bottom:0;">Target VNIC</label>
-                        <button class="btn" id="scanVnicBtn" onclick="scanVnics()" style="padding:3px 10px;font-size:11px;flex:none;">Scan VNICs</button>
-                    </div>
-                    <select id="vnicSelect" class="form-select">
-                        <option value="">-- Scan VNICs first --</option>
-                    </select>
-                    <div id="vnicInfo" style="margin-top:6px;font-size:11px;color:var(--text-muted);display:none;"></div>
-                </div>
-                <div class="form-group">
-                    <label class="form-label">Availability domain preference</label>
-                    <select id="adSelect" class="form-select">
-                        <option value="">-- Random (fastest) --</option>
-                    </select>
-                    <div id="adInfo" style="margin-top:6px;font-size:11px;color:var(--text-muted);display:none;"></div>
-                </div>
-            </div>
-        </div>
+# ---- Timezone Configuration (User device timezone) ----
+from zoneinfo import ZoneInfo, available_timezones
 
-        <!-- Instance Config Panel -->
-        <div class="panel">
-            <button class="panel-header" onclick="togglePanel('inst')">
-                <span class="icon-group">
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-                    2. Instance configuration
-                </span>
-                <svg id="instChevron" class="chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
-            </button>
-            <div id="instBody" class="panel-body">
-                <div class="grid-2">
-                    <div class="form-group">
-                        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
-                            <label class="form-label" style="margin-bottom:0;">Shape</label>
-                            <button class="btn" id="scanShapeBtn" onclick="scanShapes()" style="padding:3px 10px;font-size:11px;flex:none;">Scan shapes</button>
-                        </div>
-                        <select id="shapeSelect" class="form-select" onchange="onShapeChange()">
-                            <option value="VM.Standard.A1.Flex">Ampere A1 Flex (ARM)</option>
-                            <option value="VM.Standard.E2.1.Micro">AMD E2 Micro</option>
-                        </select>
-                        <div id="shapeInfo" style="margin-top:6px;font-size:11px;color:var(--text-muted);display:none;"></div>
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label">VM name</label>
-                        <input type="text" id="vmName" class="form-input" value="Arm">
-                    </div>
-                </div>
-                <div class="grid-3">
-                    <div class="form-group">
-                        <label class="form-label">OCPUs</label>
-                        <input type="number" id="ocpus" class="form-input" value="2" min="1" max="4">
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label">RAM (GB)</label>
-                        <input type="number" id="memory" class="form-input" value="12" min="1" max="24">
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label">Boot vol (GB)</label>
-                        <div style="display:flex;gap:4px;">
-                            <input type="number" id="bootVol" class="form-input" value="50" min="50" max="200" style="flex:1;">
-                            <button class="btn" onclick="setMaxBoot()" style="padding:0 10px;font-size:11px;white-space:nowrap;">Max</button>
-                        </div>
-                    </div>
-                </div>
-                <div class="form-group">
-                    <label class="form-label">SSH public key</label>
-                    <input type="file" id="sshFile" style="display:none;" onchange="handleSSHFile()">
-                    <div class="upload-zone" id="sshZone" onclick="document.getElementById('sshFile').click()">
-                        <div id="sshZoneContent">
-                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="color:var(--text-muted);margin-bottom:6px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                            <div style="font-size:12px;color:var(--text-muted);">Click to upload .pub or .txt</div>
-                        </div>
-                    </div>
-                    <textarea id="sshKey" class="form-textarea ssh-area" placeholder="ssh-rsa AAAAB3..."></textarea>
-                </div>
-                <div class="form-group" style="background:var(--surface-raised);padding:12px;border-radius:var(--radius-md);border:1px solid var(--border);">
-                    <label class="form-label" style="color:var(--text-secondary);">Firewall / Security Rules</label>
-                    <div style="display:flex;gap:8px;margin-bottom:10px;">
-                        <div style="flex:1;">
-                            <label style="font-size:11px;color:var(--text-muted);margin-bottom:4px;display:block;">Port(s) to open</label>
-                            <input type="text" id="firewallPorts" class="form-input" value="all" placeholder="e.g. 22,80,443 or all" style="font-size:12px;">
-                        </div>
-                        <div style="flex:1;">
-                            <label style="font-size:11px;color:var(--text-muted);margin-bottom:4px;display:block;">Source CIDR</label>
-                            <input type="text" id="firewallCidr" class="form-input" value="0.0.0.0/0" placeholder="e.g. 0.0.0.0/0" style="font-size:12px;">
-                        </div>
-                        <div style="flex:1;">
-                            <label style="font-size:11px;color:var(--text-muted);margin-bottom:4px;display:block;">Direction</label>
-                            <select id="firewallDirection" class="form-select" style="font-size:12px;">
-                                <option value="ingress">Ingress (inbound)</option>
-                                <option value="egress">Egress (outbound)</option>
-                                <option value="both">Both</option>
-                            </select>
-                        </div>
-                    </div>
-                    <div style="display:flex;gap:8px;">
-                        <button class="btn" id="scanRulesBtn" onclick="scanSecurityRules()" style="flex:1;padding:8px 12px;font-size:12px;">Scan existing rules</button>
-                        <button class="btn" id="openFirewallBtn" onclick="openFirewallNow()" style="flex:1;padding:8px 12px;font-size:12px;">Open port(s) now</button>
-                    </div>
-                    <div id="firewallResult" style="margin-top:8px;font-size:11px;display:none;"></div>
-                </div>
-                <div class="grid-2">
-                    <div class="form-group">
-                        <label class="form-label">Retry delay (s)</label>
-                        <input type="number" id="retryDelay" class="form-input" value="60" min="10" max="3600" onchange="validateDelay()">
-                        <div id="delayWarning" class="warning-text">Delays under 30s risk rate limiting</div>
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label">Mode</label>
-                        <div class="toggle-group">
-                            <button id="modeFixed" class="toggle-btn active" onclick="setDelayMode('fixed')">Fixed</button>
-                            <button id="modeRandom" class="toggle-btn" onclick="setDelayMode('random')">Random 25-60s</button>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
+def get_user_tz(tz_name=None):
+    if tz_name and tz_name in available_timezones():
+        return ZoneInfo(tz_name)
+    return ZoneInfo("UTC")
 
-        <!-- Alerts Panel -->
-        <div class="panel">
-            <button class="panel-header" onclick="togglePanel('alert')">
-                <span class="icon-group">
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
-                    3. Telegram alerts
-                </span>
-                <svg id="alertChevron" class="chevron collapsed" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
-            </button>
-            <div id="alertBody" class="panel-body collapsed">
-                <div class="grid-2">
-                    <div class="form-group">
-                        <label class="form-label">Bot token</label>
-                        <input type="password" id="tgToken" class="form-input" placeholder="123456:ABC...">
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label">Chat ID</label>
-                        <input type="text" id="tgChat" class="form-input" placeholder="@channel or ID">
-                    </div>
-                </div>
-                <div class="checkbox-row" style="margin-top:8px;">
-                    <input type="checkbox" id="tgLiveLog" onchange="onTgLiveLogChange()">
-                    <label for="tgLiveLog">Stream all live output logs to Telegram</label>
-                </div>
-                <div id="tgLiveWarning" style="display:none;font-size:11px;color:var(--warning);margin-bottom:10px;padding-left:24px;">
-                    Warning: High message volume. Telegram may rate-limit (throttled to 1 msg / 3s).
-                </div>
-                <button class="btn" id="tgTestBtn" onclick="testTelegram()" style="width:100%;">Test connection</button>
-                <div id="tgResult" class="tg-result"></div>
-            </div>
-        </div>
+def get_user_time(tz_name=None):
+    tz = get_user_tz(tz_name)
+    return datetime.datetime.now(tz)
 
-        <!-- Action Bar -->
-        <div class="action-bar">
-            <button id="startBtn" class="btn btn-primary" onclick="startLoop()">Start provisioning loop</button>
-            <button id="stopBtn" class="btn btn-danger" onclick="stopLoop()">Stop</button>
-        </div>
+def format_user_time(dt=None, tz_name=None):
+    if dt is None:
+        dt = get_user_time(tz_name)
+    return dt.strftime('%Y-%m-%d %H:%M:%S')
 
-        
-<!-- BOOT VOLUME MANAGEMENT PANEL -->
-<div class="panel" style="margin-top:14px;">
-    <button class="panel-header" onclick="togglePanel('bootvol')">
-        <span class="icon-group">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
-            Boot Volume Management
-        </span>
-        <svg id="bootvolChevron" class="chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
-    </button>
-    <div id="bootvolBody" class="panel-body collapsed">
-        <div style="font-size:11px;color:var(--text-muted);margin-bottom:10px;">Manage boot volumes: detach, attach, delete, or replace. Works with both OCID and display names.</div>
-        <div class="grid-2" style="margin-bottom:12px;">
-            <div class="form-group">
-                <label class="form-label">Instance ID / Name</label>
-                <input type="text" id="bootInstId" class="form-input" placeholder="Instance OCID or display name">
-            </div>
-            <div class="form-group">
-                <label class="form-label">Boot Volume ID / Name</label>
-                <input type="text" id="bootVolId" class="form-input" placeholder="Boot volume OCID or display name">
-            </div>
-        </div>
-        <div class="btn-row" style="margin-bottom:14px;">
-            <button class="btn btn-primary" onclick="listBootVolumes()">List volumes</button>
-            <button class="btn" onclick="detachBootVolume()">Detach</button>
-            <button class="btn" onclick="attachBootVolume()">Attach</button>
-            <button class="btn btn-danger" onclick="deleteBootVolume()">Delete</button>
-        </div>
-        <div class="grid-2" style="margin-bottom:12px;">
-            <div class="form-group">
-                <label class="form-label">New boot volume (for replace)</label>
-                <input type="text" id="bootNewVolId" class="form-input" placeholder="New volume OCID or name (optional)">
-            </div>
-        </div>
-        <button class="btn btn-primary" onclick="replaceBootVolume()" style="width:100%;">Replace boot volume</button>
-        <div id="bootVolResult" style="margin-top:10px;font-size:12px;color:var(--text-muted);display:none;"></div>
-    </div>
-</div>
+# Legacy alias
+PHNOM_PENH_TZ = ZoneInfo("Asia/Phnom_Penh")
+get_phnom_penh_time = lambda: get_user_time("Asia/Phnom_Penh")
+format_phnom_penh_time = lambda dt=None: format_user_time(dt, "Asia/Phnom_Penh")
 
-<!-- Terminal -->
-<!-- Terminal -->
-        <div class="terminal">
-            <div class="terminal-header">
-                <span class="terminal-title">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
-                    Live output
-                </span>
-                <button onclick="clearLogs()" style="font-size:11px;color:var(--text-muted);background:none;border:none;cursor:pointer;padding:2px 6px;border-radius:4px;">Clear</button>
-            </div>
-            <div id="terminalBody" class="terminal-body">
-                <div style="color:var(--text-muted);">Ready. Configure credentials and click start.</div>
-            </div>
-        </div>
-    </div>
+APP_VERSION = "5.0"
 
-    <input type="hidden" id="cfgUser">
-    <input type="hidden" id="cfgTenancy">
-    <input type="hidden" id="cfgFingerprint">
-    <input type="hidden" id="cfgRegion">
-    <label title="Keep OCI identifiers in this browser's localStorage. Private key is NEVER saved."><input type="checkbox" id="rememberCreds"> Remember account info</label>
-    <button type="button" onclick="wipeCreds()" style="display:none;" id="wipeCredsBtn"></button>
-    <textarea id="cfgKey" style="display:none;"></textarea>
+app = Flask(__name__)
 
-    <script>
-    let isRunning = false;
-    let delayMode = 'fixed';
-    let logOffset = 0;
-    let pollInterval = null;
-    let statusInterval = null;
-    let userTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
-    addLog('Timezone detected: ' + userTimezone, 'info');
-    loadCreds();
+# ---- Security Headers ----
+@app.after_request
+def add_security_headers(response):
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    return response
 
-    function togglePanel(name) {
-        const body = document.getElementById(name + 'Body');
-        const chev = document.getElementById(name + 'Chevron');
-        body.classList.toggle('collapsed');
-        chev.classList.toggle('collapsed');
+@app.errorhandler(429)
+def too_many_requests(e):
+    return jsonify({'success': False, 'error': 'Rate limit exceeded. Slow down.'}), 429
+
+# ---- Config ----
+ADMIN_PASSWORD = os.environ.get('APP_PASSWORD')
+if not ADMIN_PASSWORD:
+    print("WARNING: APP_PASSWORD not set. Running WITHOUT authentication. Set APP_PASSWORD to enable Basic Auth.")
+
+MAX_ATTEMPTS = int(os.environ.get('MAX_ATTEMPTS', 0))  # 0 = unlimited attempts
+# ---- Keep-alive self-ping (stops free-tier platforms sleeping, e.g. Render) ----
+KEEP_ALIVE_ENABLED = os.environ.get('KEEP_ALIVE', 'true').lower() in ('1', 'true', 'yes')
+KEEP_ALIVE_INTERVAL = max(60, int(os.environ.get('KEEP_ALIVE_INTERVAL', 600)))  # seconds, >=1min
+KEEP_ALIVE_URL = (os.environ.get('KEEP_ALIVE_URL') or os.environ.get('RENDER_EXTERNAL_URL') or '').rstrip('/')
+_keep_alive_started = False
+
+def _keep_alive_loop(url, interval):
+    time.sleep(interval)
+    while True:
+        try:
+            r = requests.get(url + '/health', timeout=10)
+            if r.status_code == 200:
+                add_log(f"Keep-alive ping OK ({url}/health, {interval}s)")
+            else:
+                add_log(f"Keep-alive ping got HTTP {r.status_code}")
+        except Exception as e:
+            add_log(f"Keep-alive ping FAILED: {safe_error_str(e)}")
+        time.sleep(interval)
+
+def start_keep_alive():
+    global _keep_alive_started
+    if _keep_alive_started or not KEEP_ALIVE_ENABLED or not KEEP_ALIVE_URL:
+        return False
+    _keep_alive_started = True
+    threading.Thread(
+        target=_keep_alive_loop,
+        args=(KEEP_ALIVE_URL, KEEP_ALIVE_INTERVAL),
+        name='keep-alive',
+        daemon=True
+    ).start()
+    return True
+
+# ---- Rate limiting ----
+RATE_LIMIT_WINDOW = int(os.environ.get('RATE_LIMIT_WINDOW', 60))
+RATE_LIMIT_MAX = int(os.environ.get('RATE_LIMIT_MAX', 30))
+_rate_bucket = {}
+_rate_lock = threading.Lock()
+
+def _client_ip():
+    fwd = request.headers.get('X-Forwarded-For', '')
+    if fwd:
+        return fwd.split(',')[0].strip()
+    return request.remote_addr or 'unknown'
+
+def rate_limit_check():
+    ip = _client_ip()
+    now = time.time()
+    with _rate_lock:
+        bucket = [t for t in _rate_bucket.get(ip, []) if now - t < RATE_LIMIT_WINDOW]
+        if len(bucket) >= RATE_LIMIT_MAX:
+            _rate_bucket[ip] = bucket
+            return False, int(RATE_LIMIT_WINDOW - (now - bucket[0])) + 1
+        bucket.append(now)
+        _rate_bucket[ip] = bucket
+        if len(_rate_bucket) > 10000:
+            cutoff = now - RATE_LIMIT_WINDOW
+            for k in list(_rate_bucket.keys()):
+                _rate_bucket[k] = [t for t in _rate_bucket[k] if t > cutoff]
+                if not _rate_bucket[k]:
+                    del _rate_bucket[k]
+    return True, 0
+
+# ---- Shared state ----
+global_logs = []
+logs_lock = threading.Lock()
+
+automation_lock = threading.Lock()
+automation_running = False
+automation_shape = None
+stop_event = threading.Event()
+
+_user_tz = threading.local()
+
+def set_user_tz(tz_name):
+    _user_tz.name = tz_name
+
+def get_current_tz():
+    return getattr(_user_tz, 'name', None)
+
+# ---- Telegram live log settings ----
+tg_live_lock = threading.Lock()
+tg_live_enabled = False
+tg_live_bot_token = None
+tg_live_chat_id = None
+tg_live_last_sent = 0
+tg_live_min_interval = 3
+
+def add_log(message):
+    tz = get_current_tz()
+    timestamp = format_user_time(tz_name=tz)
+    line = f"[{timestamp}] {message}"
+    print(line)
+    with logs_lock:
+        global_logs.append(line)
+        if len(global_logs) > 200:
+            global_logs.pop(0)
+    _send_live_log_to_telegram(line)
+
+def _send_live_log_to_telegram(line):
+    global tg_live_enabled, tg_live_bot_token, tg_live_chat_id, tg_live_last_sent
+    with tg_live_lock:
+        if not tg_live_enabled or not tg_live_bot_token or not tg_live_chat_id:
+            return
+        now = time.time()
+        if now - tg_live_last_sent < tg_live_min_interval:
+            return
+        tg_live_last_sent = now
+    try:
+        clean_msg = line.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        if len(clean_msg) > 3900:
+            clean_msg = clean_msg[:3900] + "..."
+        url = f"https://api.telegram.org/bot{tg_live_bot_token}/sendMessage"
+        payload = {"chat_id": tg_live_chat_id, "text": f"<code>{clean_msg}</code>", "parse_mode": "HTML"}
+        requests.post(url, json=payload, timeout=5)
+    except Exception:
+        pass
+
+def _redact(text, keep=6):
+    s = str(text)
+    if len(s) <= keep * 2:
+        return s
+    return s[:keep] + "…" + s[-keep:] + f" (len={len(s)})"
+
+def safe_error_str(e):
+    msg = str(e)
+    if 'PRIVATE KEY' in msg or 'BEGIN' in msg:
+        return "error contained key material (redacted)"
+    if len(msg) > 300:
+        msg = msg[:300] + "…"
+    return msg
+
+def build_config(data):
+    return {
+        "user": data.get('user'),
+        "fingerprint": data.get('fingerprint'),
+        "tenancy": data.get('tenancy'),
+        "region": data.get('region'),
+        "key_content": data.get('private_key')
     }
 
-    // ---- Credential persistence (localStorage, opt-in) ----
-    const CFG_FIELDS = ['cfgUser', 'cfgTenancy', 'cfgFingerprint', 'cfgRegion'];
-    function saveCreds() {
-        try {
-            if (!document.getElementById('rememberCreds') || !document.getElementById('rememberCreds').checked) return;
-            const blob = {};
-            CFG_FIELDS.forEach(id => { const el = document.getElementById(id); if (el) blob[id] = el.value; });
-            localStorage.setItem('oci_prov_cfg', JSON.stringify(blob));
-        } catch (e) {}
-    }
-    function loadCreds() {
-        try {
-            const raw = localStorage.getItem('oci_prov_cfg');
-            if (!raw) return;
-            const blob = JSON.parse(raw);
-            CFG_FIELDS.forEach(id => { const el = document.getElementById(id); if (el && blob[id]) el.value = blob[id]; });
-            const cb = document.getElementById('rememberCreds');
-            if (cb) cb.checked = true;
-            parseConfig && parseConfig();
-        } catch (e) {}
-    }
-    function wipeCreds() {
-        try { localStorage.removeItem('oci_prov_cfg'); } catch (e) {}
-        CFG_FIELDS.forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
-        const cb = document.getElementById('rememberCreds');
-        if (cb) cb.checked = false;
-        addLog('Saved credentials wiped', 'warn');
-    }
-    function parseConfig() {
-        const text = document.getElementById('rawConfig').value;
-        const user = text.match(/user\s*=\s*(ocid1\.user\.[^\s#\n,]+)/i);
-        const tenancy = text.match(/tenancy\s*=\s*(ocid1\.tenancy\.[^\s#\n,]+)/i);
-        const fp = text.match(/fingerprint\s*=\s*([a-fA-F0-9:]{32,47})/i);
-        const region = text.match(/region\s*=\s*([a-zA-Z0-9-]+)/i);
-        if (user) document.getElementById('cfgUser').value = user[1].trim();
-        if (tenancy) document.getElementById('cfgTenancy').value = tenancy[1].trim();
-        if (fp) document.getElementById('cfgFingerprint').value = fp[1].trim();
-        if (region) document.getElementById('cfgRegion').value = region[1].trim();
-        saveCreds();
-    }
+def require_auth(f):
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        if not ADMIN_PASSWORD:
+            if request.method == 'POST':
+                return jsonify({'success': False, 'error': 'Server has no APP_PASSWORD set. Refusing unauthenticated action.'}), 503
+            return f(*args, **kwargs)
+        ok, retry_after = rate_limit_check()
+        if not ok:
+            resp = Response('Too many requests', 429)
+            resp.headers['Retry-After'] = str(retry_after)
+            return resp
+        auth = request.authorization
+        if not auth or not hmac.compare_digest(auth.password.encode(), ADMIN_PASSWORD.encode()):
+            return Response('Authentication required', 401, {'WWW-Authenticate': 'Basic realm="OCI Provisioner"'})
+        return f(*args, **kwargs)
+    return decorated
 
-    function handleConfigFile() {
-        const file = document.getElementById('configFile').files[0];
-        if (!file) return;
-        const reader = new FileReader();
-        reader.onload = function(e) {
-            document.getElementById('rawConfig').value = e.target.result;
-            parseConfig();
-            addLog('Config loaded from: ' + file.name, 'success');
-        };
-        reader.onerror = function() {
-            addLog('Failed to read config file', 'error');
-        };
-        reader.readAsText(file);
-    }
+@app.route('/health')
+def health():
+    start_keep_alive()
+    return jsonify({'status': 'ok', 'version': APP_VERSION, 'keep_alive': KEEP_ALIVE_ENABLED}), 200
 
-    function handleKeyFile() {
-        console.log('handleKeyFile called');
-        const fileInput = document.getElementById('keyFile');
-        const file = fileInput.files[0];
-        if (!file) { console.log('No file selected'); return; }
-        console.log('File selected:', file.name, file.size);
-        const reader = new FileReader();
-        reader.onload = e => {
-            document.getElementById('cfgKey').value = e.target.result;
-            const zone = document.getElementById('keyZone');
-            const content = document.getElementById('keyZoneContent');
-            content.innerHTML = '<span style="color:var(--positive);font-size:12px;">&#9989; Key loaded: ' + file.name + '</span>';
-            zone.classList.add('success');
-            addLog('Private key loaded: ' + file.name, 'success');
-        };
-        reader.onerror = () => addLog('Failed to read key file', 'error');
-        reader.readAsText(file);
-        fileInput.value = '';
-    }
+@app.route('/api/version')
+def api_version():
+    return jsonify({'version': APP_VERSION})
 
-    document.getElementById('keyZone').addEventListener('dblclick', function(e) {
-        e.preventDefault();
-        document.getElementById('cfgKey').value = '';
-        this.classList.remove('success');
-        document.getElementById('keyZoneContent').innerHTML =
-            '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="color:var(--text-muted);margin-bottom:6px;">' +
-            '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>' +
-            '<div style="font-size:12px;color:var(--text-muted);">Click to upload .pem, .txt, or .key</div>';
-        document.getElementById('keyFile').value = '';
-        addLog('Private key cleared', 'warn');
-    });
+@app.route('/')
+def home():
+    try:
+        return render_template('index.html')
+    except Exception as e:
+        return f"Flask Template Error: {str(e)}", 500
 
-    function handleSSHFile() {
-        console.log('handleSSHFile called');
-        const fileInput = document.getElementById('sshFile');
-        const file = fileInput.files[0];
-        if (!file) { console.log('No file selected'); return; }
-        console.log('File selected:', file.name, file.size);
-        const reader = new FileReader();
-        reader.onload = e => {
-            document.getElementById('sshKey').value = e.target.result.trim();
-            const zone = document.getElementById('sshZone');
-            const content = document.getElementById('sshZoneContent');
-            content.innerHTML = '<span style="color:var(--positive);font-size:12px;">&#9989; Key loaded: ' + file.name + '</span>';
-            zone.classList.add('success');
-            addLog('SSH key loaded: ' + file.name, 'success');
-        };
-        reader.onerror = () => addLog('Failed to read SSH file', 'error');
-        reader.readAsText(file);
-        fileInput.value = '';
-    }
-
-    document.getElementById('sshZone').addEventListener('dblclick', function(e) {
-        e.preventDefault();
-        document.getElementById('sshKey').value = '';
-        this.classList.remove('success');
-        document.getElementById('sshZoneContent').innerHTML =
-            '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="color:var(--text-muted);margin-bottom:6px;">' +
-            '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>' +
-            '<div style="font-size:12px;color:var(--text-muted);">Click to upload .pub or .txt</div>';
-        document.getElementById('sshFile').value = '';
-        addLog('SSH key cleared', 'warn');
-    });
-
-    function onShapeChange() {
-        const shape = document.getElementById('shapeSelect').value;
-        const cpu = document.getElementById('ocpus');
-        const ram = document.getElementById('memory');
-        const vmName = document.getElementById('vmName');
-        if (shape === 'VM.Standard.E2.1.Micro') {
-            cpu.value = 1; cpu.disabled = true;
-            ram.value = 1; ram.disabled = true;
-            vmName.value = 'VM-AMD';
-        } else {
-            cpu.value = 2; cpu.disabled = false;
-            ram.value = 12; ram.disabled = false;
-            vmName.value = 'Arm';
-        }
-    }
-
-    async function setMaxBoot() {
-        parseConfig();
-        const btn = event.target;
-        const input = document.getElementById('bootVol');
-        const user = document.getElementById('cfgUser').value;
-        const key = document.getElementById('cfgKey').value;
-        if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
-        btn.textContent = '...'; btn.disabled = true;
-        try {
-            const res = await fetch('/api/free-tier-status', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    user: user, tenancy: document.getElementById('cfgTenancy').value,
-                    fingerprint: document.getElementById('cfgFingerprint').value,
-                    region: document.getElementById('cfgRegion').value,
-                    private_key: key, timezone: userTimezone
-                })
-            });
-            const data = await res.json();
-            if (data.success) {
-                const remaining = data.usage.storage.remaining_gb;
-                const maxBoot = Math.min(200, Math.max(50, remaining));
-                input.value = maxBoot;
-                btn.textContent = 'Max (' + maxBoot + ' GB)';
-                addLog('Max boot volume set to ' + maxBoot + ' GB', 'success');
-                setTimeout(() => { btn.textContent = 'Max'; }, 3000);
-            } else {
-                addLog('Could not detect storage: ' + data.error, 'error');
-                btn.textContent = 'Max';
-            }
-        } catch (err) {
-            addLog('Request error: ' + err.message, 'error');
-            btn.textContent = 'Max';
-        }
-        btn.disabled = false;
-    }
-
-    function validateDelay() {
-        const val = parseInt(document.getElementById('retryDelay').value);
-        document.getElementById('delayWarning').style.display = val < 30 ? 'block' : 'none';
-    }
-
-    function setDelayMode(mode) {
-        delayMode = mode;
-        document.getElementById('modeFixed').classList.toggle('active', mode === 'fixed');
-        document.getElementById('modeRandom').classList.toggle('active', mode === 'random');
-        const input = document.getElementById('retryDelay');
-        input.disabled = mode === 'random';
-        input.style.opacity = mode === 'random' ? '0.4' : '1';
-    }
-
-    function addLog(msg, type) {
-        const now = new Date().toLocaleTimeString();
-        const term = document.getElementById('terminalBody');
-        const line = document.createElement('div');
-        line.className = 'log-line';
-        let cls = 'log-info';
-        if (type === 'success') cls = 'log-success';
-        if (type === 'error') cls = 'log-error';
-        if (type === 'warn') cls = 'log-warn';
-        line.innerHTML = '<span class="log-time">[' + now + ']</span> <span class="' + cls + '">' + msg + '</span>';
-        term.appendChild(line);
-        term.scrollTop = term.scrollHeight;
-    }
-
-    function clearLogs() {
-        document.getElementById('terminalBody').innerHTML = '';
-        logOffset = 0;
-    }
-
-    function updateStatus(running) {
-        isRunning = running;
-        const badge = document.getElementById('statusBadge');
-        const dot = document.getElementById('statusDot');
-        const text = document.getElementById('statusText');
-        const startBtn = document.getElementById('startBtn');
-        if (running) {
-            badge.className = 'status-badge running';
-            dot.className = 'status-dot running';
-            text.textContent = 'Running';
-            startBtn.disabled = true;
-            startBtn.style.opacity = '0.5';
-        } else {
-            badge.className = 'status-badge stopped';
-            dot.className = 'status-dot';
-            text.textContent = 'Stopped';
-            startBtn.disabled = false;
-            startBtn.style.opacity = '1';
-        }
-    }
-
-    async function checkQuota() {
-        parseConfig();
-        const btn = document.getElementById('quotaBtn');
-        const panel = document.getElementById('quotaPanel');
-        const user = document.getElementById('cfgUser').value;
-        const key = document.getElementById('cfgKey').value;
-        if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
-        btn.disabled = true; btn.textContent = 'Scanning...';
-        panel.style.display = 'block';
-        panel.innerHTML = '<div style="font-size:12px;color:var(--text-muted);">Fetching quota usage...</div>';
-        try {
-            const res = await fetch('/api/free-tier-status', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    user: user, tenancy: document.getElementById('cfgTenancy').value,
-                    fingerprint: document.getElementById('cfgFingerprint').value,
-                    region: document.getElementById('cfgRegion').value,
-                    private_key: key, timezone: userTimezone
-                })
-            });
-            const data = await res.json();
-            if (data.success) {
-                const u = data.usage;
-                let html = '';
-                const sColor = u.storage.percent >= 90 ? 'var(--danger)' : u.storage.percent >= 70 ? 'var(--warning)' : 'var(--positive)';
-                html += '<div class="quota-item"><div class="quota-header"><span style="color:var(--text-secondary)">Storage</span><span style="color:var(--text);font-weight:500">' + u.storage.used_gb + ' / ' + u.storage.limit_gb + ' GB</span></div><div class="quota-bar"><div class="quota-fill" style="width:' + u.storage.percent + '%;background:' + sColor + '"></div></div></div>';
-                const mColor = u.micro.percent >= 100 ? 'var(--danger)' : u.micro.percent >= 50 ? 'var(--warning)' : 'var(--positive)';
-                html += '<div class="quota-item"><div class="quota-header"><span style="color:var(--text-secondary)">Micro instances</span><span style="color:var(--text);font-weight:500">' + u.micro.used + ' / ' + u.micro.limit + '</span></div><div class="quota-bar"><div class="quota-fill" style="width:' + u.micro.percent + '%;background:' + mColor + '"></div></div></div>';
-                const aColor = u.arm.ocpu_percent >= 100 ? 'var(--danger)' : u.arm.ocpu_percent >= 70 ? 'var(--warning)' : 'var(--positive)';
-                html += '<div class="quota-item"><div class="quota-header"><span style="color:var(--text-secondary)">ARM OCPUs</span><span style="color:var(--text);font-weight:500">' + u.arm.used_ocpus + ' / ' + u.arm.limit_ocpus + '</span></div><div class="quota-bar"><div class="quota-fill" style="width:' + u.arm.ocpu_percent + '%;background:' + aColor + '"></div></div></div>';
-                if (u.all_instances && u.all_instances.length > 0) {
-                    html += '<div style="margin-top:16px;border-top:1px solid var(--border);padding-top:12px;">';
-                    html += '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">';
-                    html += '<span style="font-size:13px;font-weight:600;color:var(--text);">Instances (' + u.all_instances.length + ')</span>';
-                    html += '<button onclick="deleteAllInstances()" style="padding:4px 10px;border:1px solid var(--danger);border-radius:4px;background:rgba(239,68,68,0.1);color:var(--danger);font-size:11px;font-weight:600;cursor:pointer;">&#128293; DELETE ALL</button>';
-                    html += '</div>';
-                    u.all_instances.forEach(inst => {
-                        const shapeInfo = inst.ocpus ? ' (' + inst.ocpus + ' OCPU, ' + inst.memory + ' GB)' : '';
-                        const stateColor = inst.state === 'RUNNING' ? 'var(--positive)' : 'var(--warning)';
-                        const ipLine = inst.public_ip ? '<span style="color:var(--accent);font-weight:500;">IP: ' + inst.public_ip + '</span> | ' : '';
-                        html += '<div class="instance-row">';
-                        html += '<div class="instance-info">';
-                        html += '<div class="instance-name">' + inst.name + '</div>';
-                        html += '<div class="instance-meta">' + ipLine + inst.shape + shapeInfo + ' | <span style="color:' + stateColor + '">' + inst.state + '</span></div>';
-                        html += '</div>';
-                        html += '<button class="instance-delete" onclick="rebootInstance(' + "'" + inst.id + "'" + ',' + "'" + inst.name + "'" + ')" title="Reboot this instance" style="border-color:rgba(245,158,11,0.3);color:var(--warning);margin-right:4px;">&#8635;</button>';
-                        html += '<button class="instance-delete" onclick="deleteInstance(' + "'" + inst.id + "'" + ',' + "'" + inst.name + "'" + ')" title="Delete this instance">&#128465;</button>';
-                        html += '</div>';
-                    });
-                    html += '</div>';
-                } else {
-                    html += '<div style="margin-top:12px;font-size:12px;color:var(--text-muted);">No instances found.</div>';
-                }
-                panel.innerHTML = html;
-                addLog('Free tier quota loaded', 'success');
-            } else {
-                panel.innerHTML = '<div style="color:var(--danger);font-size:12px;">Error: ' + data.error + '</div>';
-                addLog('Quota check failed: ' + data.error, 'error');
-            }
-        } catch (err) {
-            panel.innerHTML = '<div style="color:var(--danger);font-size:12px;">Request error: ' + err.message + '</div>';
-            addLog('Quota request error: ' + err.message, 'error');
-        }
-        btn.disabled = false; btn.textContent = 'Check free tier';
-    }
-
-    async function scanImages() {
-        parseConfig();
-        const btn = document.getElementById('scanBtn');
-        const select = document.getElementById('imageSelect');
-        const user = document.getElementById('cfgUser').value;
-        const key = document.getElementById('cfgKey').value;
-        if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
-        btn.disabled = true; btn.textContent = 'Scanning...';
-        select.innerHTML = '<option>Scanning...</option>';
-        try {
-            const res = await fetch('/api/list-images', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    user: user, tenancy: document.getElementById('cfgTenancy').value,
-                    fingerprint: document.getElementById('cfgFingerprint').value,
-                    region: document.getElementById('cfgRegion').value,
-                    private_key: key, shape: document.getElementById('shapeSelect').value,
-                    all_os_mode: document.getElementById('allOS').checked,
-                    timezone: userTimezone
-                })
-            });
-            const data = await res.json();
-            if (data.success && data.images.length > 0) {
-                select.innerHTML = '';
-                data.images.forEach(img => {
-                    const opt = document.createElement('option');
-                    opt.value = img.id;
-                    opt.textContent = document.getElementById('allOS').checked ? '[' + img.os + '] ' + img.name : img.name;
-                    select.appendChild(opt);
-                });
-                addLog('Found ' + data.images.length + ' compatible images', 'success');
-            } else {
-                select.innerHTML = '<option value="">-- No images found --</option>';
-                addLog('No images found: ' + (data.error || 'None available'), 'warn');
-            }
-        } catch (err) {
-            select.innerHTML = '<option value="">-- Error --</option>';
-            addLog('Image scan error: ' + err.message, 'error');
-        }
-        btn.disabled = false; btn.textContent = 'Scan OS images';
-    }
-
-    async function scanSubnets() {
-        parseConfig();
-        const btn = document.getElementById('scanSubnetBtn2');
-        const select = document.getElementById('subnetSelect');
-        const info = document.getElementById('subnetInfo');
-        const user = document.getElementById('cfgUser').value;
-        const key = document.getElementById('cfgKey').value;
-        if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
-        btn.disabled = true; btn.textContent = 'Scanning...';
-        select.innerHTML = '<option>Scanning...</option>'; info.style.display = 'none';
-        try {
-            const res = await fetch('/api/list-subnets', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    user: user, tenancy: document.getElementById('cfgTenancy').value,
-                    fingerprint: document.getElementById('cfgFingerprint').value,
-                    region: document.getElementById('cfgRegion').value,
-                    private_key: key, timezone: userTimezone
-                })
-            });
-            const data = await res.json();
-            if (data.success && data.subnets.length > 0) {
-                select.innerHTML = '<option value="">-- Auto-select first available --</option>';
-                data.subnets.forEach(sn => {
-                    const opt = document.createElement('option');
-                    opt.value = sn.id;
-                    const pub = sn.public ? 'Public' : 'Private';
-                    opt.textContent = sn.name + ' (' + sn.cidr + ', ' + pub + ', ' + sn.ad + ')';
-                    select.appendChild(opt);
-                });
-                info.innerHTML = 'Found ' + data.subnets.length + ' subnet(s). Select one or leave auto-selected.';
-                info.style.display = 'block';
-                addLog('Found ' + data.subnets.length + ' subnet(s)', 'success');
-            } else {
-                select.innerHTML = '<option value="">-- No subnets found --</option>';
-                info.innerHTML = '<span style="color:var(--warning)">No subnets found.</span> <button onclick="createSubnet()" style="padding:3px 10px;border:1px solid var(--border);border-radius:4px;background:var(--accent);color:#fff;font-size:11px;cursor:pointer;margin-left:6px;">Create subnet</button>';
-                info.style.display = 'block';
-                addLog('No subnets found: ' + (data.error || 'None available'), 'warn');
-            }
-        } catch (err) {
-            select.innerHTML = '<option value="">-- Error --</option>';
-            addLog('Subnet scan error: ' + err.message, 'error');
-        }
-        btn.disabled = false; btn.textContent = 'Scan subnets';
-    }
-
-    async function scanVnics() {
-        parseConfig();
-        const btn = document.getElementById('scanVnicBtn');
-        const user = document.getElementById('cfgUser').value;
-        const key = document.getElementById('cfgKey').value;
-        const subnetId = document.getElementById('subnetSelect').value;
-        const vnicSelect = document.getElementById('vnicSelect');
-        const vnicInfo = document.getElementById('vnicInfo');
-        if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
-        btn.disabled = true; btn.textContent = 'Scanning...';
-        try {
-            const payload = {
-                user: user, tenancy: document.getElementById('cfgTenancy').value,
-                fingerprint: document.getElementById('cfgFingerprint').value,
-                region: document.getElementById('cfgRegion').value,
-                private_key: key, timezone: userTimezone
-            };
-            if (subnetId) payload.subnet_id = subnetId;
-            const res = await fetch('/api/list-vnics', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-            const data = await res.json();
-            if (data.success && data.vnics && data.vnics.length > 0) {
-                const filterLabel = data.filtered_by_subnet ? ' (target subnet)' : '';
-                addLog('Found ' + data.vnics.length + ' VNIC(s)' + filterLabel + ':', 'success');
-                vnicSelect.innerHTML = '<option value="">-- Select a VNIC --</option>';
-                data.vnics.forEach(v => {
-                    const primaryBadge = v.is_primary ? ' [PRIMARY]' : '';
-                    addLog('  ' + v.display_name + primaryBadge + ' | Instance: ' + v.instance_name + ' | IP: ' + v.private_ip + ' | Public: ' + (v.public_ip || 'None'));
-                    const opt = document.createElement('option');
-                    opt.value = v.id;
-                    opt.textContent = v.display_name + primaryBadge + ' (' + v.private_ip + ', ' + v.instance_name + ')';
-                    vnicSelect.appendChild(opt);
-                });
-                vnicInfo.innerHTML = 'Found ' + data.vnics.length + ' VNIC(s). Select one to target.';
-                vnicInfo.style.display = 'block';
-            } else if (data.success) {
-                vnicSelect.innerHTML = '<option value="">-- No VNICs found --</option>';
-                vnicInfo.style.display = 'none';
-                addLog('No VNICs found' + (data.filtered_by_subnet ? ' in target subnet' : ''), 'warn');
-            } else {
-                vnicSelect.innerHTML = '<option value="">-- Error --</option>';
-                addLog('VNIC scan failed: ' + (data.error || 'Unknown error'), 'error');
-            }
-        } catch (err) {
-            vnicSelect.innerHTML = '<option value="">-- Error --</option>';
-            addLog('VNIC scan error: ' + err.message, 'error');
-        }
-        btn.disabled = false; btn.textContent = 'Scan VNICs';
-    }
-
-    async function scanShapes() {
-        parseConfig();
-        const btn = document.getElementById('scanShapeBtn');
-        const select = document.getElementById('shapeSelect');
-        const info = document.getElementById('shapeInfo');
-        const user = document.getElementById('cfgUser').value;
-        const key = document.getElementById('cfgKey').value;
-        if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
-        btn.disabled = true; btn.textContent = 'Scanning...';
-        select.innerHTML = '<option>Scanning...</option>'; info.style.display = 'none';
-        try {
-            const res = await fetch('/api/list-shapes', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    user: user, tenancy: document.getElementById('cfgTenancy').value,
-                    fingerprint: document.getElementById('cfgFingerprint').value,
-                    region: document.getElementById('cfgRegion').value,
-                    private_key: key, timezone: userTimezone
-                })
-            });
-            const data = await res.json();
-            if (data.success && data.shapes.length > 0) {
-                select.innerHTML = '';
-                let freeCount = 0;
-                data.shapes.forEach(sh => {
-                    const opt = document.createElement('option');
-                    opt.value = sh.name;
-                    const isFree = sh.name === 'VM.Standard.A1.Flex' || sh.name === 'VM.Standard.E2.1.Micro';
-                    const freeTag = isFree ? ' [FREE TIER]' : '';
-                    const flexTag = sh.is_flex ? ' (Flex)' : '';
-                    const cpuMem = (sh.ocpus && sh.memory) ? ' - ' + sh.ocpus + ' OCPU, ' + sh.memory + ' GB' : '';
-                    const proc = sh.processor ? ' | ' + sh.processor : '';
-                    opt.textContent = sh.name + freeTag + flexTag + cpuMem + proc;
-                    select.appendChild(opt);
-                    if (isFree) freeCount++;
-                });
-                info.innerHTML = 'Found ' + data.shapes.length + ' shape(s) across ' + data.ad_count + ' AD(s). ' + freeCount + ' free tier.';
-                info.style.display = 'block';
-                addLog('Found ' + data.shapes.length + ' shape(s) (' + freeCount + ' free tier)', 'success');
-                onShapeChange();
-            } else {
-                select.innerHTML = '<option value="VM.Standard.A1.Flex">Ampere A1 Flex (ARM)</option><option value="VM.Standard.E2.1.Micro">AMD E2 Micro</option>';
-                addLog('No shapes found: ' + (data.error || 'None available'), 'warn');
-            }
-        } catch (err) {
-            select.innerHTML = '<option value="VM.Standard.A1.Flex">Ampere A1 Flex (ARM)</option><option value="VM.Standard.E2.1.Micro">AMD E2 Micro</option>';
-            addLog('Shape scan error: ' + err.message, 'error');
-        }
-        btn.disabled = false; btn.textContent = 'Scan shapes';
-    }
-
-    async function createSubnet() {
-        parseConfig();
-        const btn = event.target;
-        const info = document.getElementById('subnetInfo');
-        const select = document.getElementById('subnetSelect');
-        const user = document.getElementById('cfgUser').value;
-        const key = document.getElementById('cfgKey').value;
-        if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
-        btn.disabled = true; btn.textContent = 'Creating...';
-        addLog('Creating subnet via OCI API...', 'info');
-        try {
-            const res = await fetch('/api/create-subnet', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    user: user, tenancy: document.getElementById('cfgTenancy').value,
-                    fingerprint: document.getElementById('cfgFingerprint').value,
-                    region: document.getElementById('cfgRegion').value,
-                    private_key: key, timezone: userTimezone
-                })
-            });
-            const data = await res.json();
-            if (data.success) {
-                select.innerHTML = '';
-                const opt = document.createElement('option');
-                opt.value = data.subnet.id;
-                const pub = data.subnet.public ? 'Public' : 'Private';
-                opt.textContent = data.subnet.name + ' (' + data.subnet.cidr + ', ' + pub + ', ' + data.subnet.ad + ')';
-                select.appendChild(opt);
-                if (data.created) {
-                    info.innerHTML = '<span style="color:var(--positive)">Created subnet: ' + data.subnet.name + ' (' + data.subnet.cidr + ')</span>';
-                    addLog('Subnet created: ' + data.subnet.name + ' (' + data.subnet.cidr + ')', 'success');
-                } else {
-                    info.innerHTML = '<span style="color:var(--positive)">Using existing subnet: ' + data.subnet.name + ' (' + data.subnet.cidr + ')</span>';
-                    addLog('Using existing subnet: ' + data.subnet.name, 'success');
-                }
-                info.style.display = 'block';
-            } else {
-                info.innerHTML = '<span style="color:var(--danger)">Failed to create subnet: ' + data.error + '</span>';
-                info.style.display = 'block';
-                addLog('Subnet creation failed: ' + data.error, 'error');
-            }
-        } catch (err) {
-            info.innerHTML = '<span style="color:var(--danger)">Error: ' + err.message + '</span>';
-            info.style.display = 'block';
-            addLog('Subnet creation error: ' + err.message, 'error');
-        }
-        btn.disabled = false; btn.textContent = 'Create subnet';
-    }
-
-    async function openFirewallNow() {
-        parseConfig();
-        const btn = document.getElementById('openFirewallBtn');
-        const result = document.getElementById('firewallResult');
-        const user = document.getElementById('cfgUser').value;
-        const key = document.getElementById('cfgKey').value;
-        const subnetId = document.getElementById('subnetSelect').value;
-        const ports = document.getElementById('firewallPorts').value.trim() || 'all';
-        const cidr = document.getElementById('firewallCidr').value.trim() || '0.0.0.0/0';
-        const direction = document.getElementById('firewallDirection').value;
-        if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
-        if (!subnetId) {
-            addLog('Error: Select a subnet first', 'error');
-            result.style.display = 'block';
-            result.innerHTML = '<span style="color:var(--warning)">Select a subnet first</span>';
-            return;
-        }
-        const dirLabel = direction === 'ingress' ? 'INBOUND' : direction === 'egress' ? 'OUTBOUND' : 'BOTH';
-        if (!confirm('Open ' + ports + ' ' + dirLabel + ' from ' + cidr + '?')) {
-            addLog('Firewall action cancelled', 'warn'); return;
-        }
-        btn.disabled = true; btn.textContent = 'Opening...'; result.style.display = 'none';
-        try {
-            const res = await fetch('/api/open-firewall', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    user: user, tenancy: document.getElementById('cfgTenancy').value,
-                    fingerprint: document.getElementById('cfgFingerprint').value,
-                    region: document.getElementById('cfgRegion').value,
-                    private_key: key, subnet_id: subnetId, ports: ports, cidr: cidr,
-                    direction: direction, timezone: userTimezone
-                })
-            });
-            const data = await res.json();
-            result.style.display = 'block';
-            if (data.success) {
-                if (data.already_open) {
-                    result.innerHTML = '<span style="color:var(--positive)">Rule(s) already exist for ' + data.ports + ' from ' + data.cidr + '</span>';
-                } else {
-                    result.innerHTML = '<span style="color:var(--positive)">Opened ' + data.ports + ' (' + data.direction + ') from ' + data.cidr + ' via ' + data.method + ' (' + data.rules_added + ' rule(s))</span>';
-                    addLog('Opened port(s) ' + data.ports + ' via ' + data.method, 'success');
-                }
-            } else {
-                result.innerHTML = '<span style="color:var(--danger)">Failed: ' + data.error + '</span>';
-                addLog('Firewall open failed: ' + data.error, 'error');
-            }
-        } catch (err) {
-            result.style.display = 'block';
-            result.innerHTML = '<span style="color:var(--danger)">Error: ' + err.message + '</span>';
-            addLog('Firewall request error: ' + err.message, 'error');
-        }
-        btn.disabled = false; btn.textContent = 'Open port(s) now';
-    }
-
-    async function scanSecurityRules() {
-        parseConfig();
-        const btn = document.getElementById('scanRulesBtn');
-        const result = document.getElementById('firewallResult');
-        const user = document.getElementById('cfgUser').value;
-        const key = document.getElementById('cfgKey').value;
-        const subnetId = document.getElementById('subnetSelect').value;
-        if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
-        if (!subnetId) {
-            addLog('Error: Select a subnet first', 'error');
-            result.style.display = 'block';
-            result.innerHTML = '<span style="color:var(--warning)">Select a subnet first</span>';
-            return;
-        }
-        btn.disabled = true; btn.textContent = 'Scanning...'; result.style.display = 'none';
-        try {
-            const res = await fetch('/api/scan-security-rules', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    user: user, tenancy: document.getElementById('cfgTenancy').value,
-                    fingerprint: document.getElementById('cfgFingerprint').value,
-                    region: document.getElementById('cfgRegion').value,
-                    private_key: key, subnet_id: subnetId, timezone: userTimezone
-                })
-            });
-            const data = await res.json();
-            result.style.display = 'block';
-            if (data.success) {
-                if (data.rules.length === 0) {
-                    result.innerHTML = '<span style="color:var(--warning)">No rules found. Subnet is locked down.</span>';
-                } else {
-                    let html = '<div style="color:var(--text-secondary);margin-bottom:4px;">Found ' + data.rules.length + ' rule(s):</div>';
-                    data.rules.forEach(r => {
-                        const port = r.port_range ? 'port ' + r.port_range : 'all ports';
-                        html += '<div style="color:var(--text-muted);padding:2px 0;">- ' + r.type + ' | ' + r.direction + ' | ' + r.protocol + ' | ' + port + '</div>';
-                    });
-                    result.innerHTML = html;
-                    addLog('Scanned ' + data.rules.length + ' security rule(s)', 'success');
-                }
-            } else {
-                result.innerHTML = '<span style="color:var(--danger)">Failed: ' + data.error + '</span>';
-            }
-        } catch (err) {
-            result.style.display = 'block';
-            result.innerHTML = '<span style="color:var(--danger)">Error: ' + err.message + '</span>';
-            addLog('Security rule scan error: ' + err.message, 'error');
-        }
-        btn.disabled = false; btn.textContent = 'Scan existing rules';
-    }
-
-    async function testTelegram() {
-        const btn = document.getElementById('tgTestBtn');
-        const result = document.getElementById('tgResult');
-        const token = document.getElementById('tgToken').value.trim();
-        const chat = document.getElementById('tgChat').value.trim();
-        if (!token || !chat) {
-            result.innerHTML = '<span style="color:var(--warning)">Fill both fields first</span>';
-            return;
-        }
-        btn.disabled = true; btn.textContent = 'Testing...';
-        try {
-            const res = await fetch('/api/test-telegram', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ bot_token: token, chat_id: chat, timezone: userTimezone })
-            });
-            const data = await res.json();
-            if (data.success) {
-                result.innerHTML = '<span style="color:var(--positive)">Connected! Test message sent.</span>';
-                addLog('Telegram alerts configured', 'success');
-            } else {
-                result.innerHTML = '<span style="color:var(--danger)">Failed: ' + data.error + '</span>';
-            }
-        } catch (err) {
-            result.innerHTML = '<span style="color:var(--danger)">Error: ' + err.message + '</span>';
-        }
-        btn.disabled = false; btn.textContent = 'Test connection';
-    }
-
-    async function rebootInstance(instanceId, instanceName) {
-        parseConfig();
-        const user = document.getElementById('cfgUser').value;
-        const key = document.getElementById('cfgKey').value;
-        if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
-        if (!confirm('Reboot instance "' + instanceName + '"?')) {
-            addLog('Reboot cancelled', 'warn'); return;
-        }
-        addLog('Rebooting instance "' + instanceName + '"...', 'warn');
-        try {
-            const res = await fetch('/api/reboot-instance', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    user: user, tenancy: document.getElementById('cfgTenancy').value,
-                    fingerprint: document.getElementById('cfgFingerprint').value,
-                    region: document.getElementById('cfgRegion').value,
-                    private_key: key, instance_id: instanceId, timezone: userTimezone
-                })
-            });
-            const data = await res.json();
-            if (data.success) {
-                addLog('Rebooted: ' + data.message, 'success');
-                setTimeout(checkQuota, 3000);
-            } else {
-                addLog('Reboot failed: ' + data.error, 'error');
-            }
-        } catch (err) {
-            addLog('Reboot error: ' + err.message, 'error');
-        }
-    }
-
-    async function deleteInstance(instanceId, instanceName) {
-        parseConfig();
-        const user = document.getElementById('cfgUser').value;
-        const key = document.getElementById('cfgKey').value;
-        if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
-        const confirmMsg = 'DANGER: Delete instance "' + instanceName + '"?' + String.fromCharCode(10) + String.fromCharCode(10) + 'This action CANNOT be undone. The instance and all attached boot volumes will be permanently lost.' + String.fromCharCode(10) + String.fromCharCode(10) + 'Are you sure?';
-        if (!confirm(confirmMsg)) {
-            addLog('Delete cancelled', 'warn'); return;
-        }
-        addLog('Deleting instance "' + instanceName + '"...', 'warn');
-        try {
-            const res = await fetch('/api/delete-instance', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    user: user, tenancy: document.getElementById('cfgTenancy').value,
-                    fingerprint: document.getElementById('cfgFingerprint').value,
-                    region: document.getElementById('cfgRegion').value,
-                    private_key: key, instance_id: instanceId, timezone: userTimezone
-                })
-            });
-            const data = await res.json();
-            if (data.success) {
-                addLog('Deleted: ' + data.message, 'success');
-                setTimeout(checkQuota, 2000);
-            } else {
-                addLog('Delete failed: ' + data.error, 'error');
-            }
-        } catch (err) {
-            addLog('Delete error: ' + err.message, 'error');
-        }
-    }
-
-    async function deleteAllInstances() {
-        parseConfig();
-        const user = document.getElementById('cfgUser').value;
-        const key = document.getElementById('cfgKey').value;
-        if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
-        const confirmMsg = 'DANGER: Delete ALL instances in this tenancy?' + String.fromCharCode(10) + String.fromCharCode(10) + 'This will terminate EVERY running and stopped instance.' + String.fromCharCode(10) + String.fromCharCode(10) + 'This action CANNOT be undone.' + String.fromCharCode(10) + String.fromCharCode(10) + 'Type DELETE to confirm:';
-        const input = prompt(confirmMsg);
-        if (input !== 'DELETE') {
-            addLog('Bulk delete cancelled', 'warn'); return;
-        }
-        addLog('Initiating deletion of ALL instances...', 'error');
-        try {
-            const res = await fetch('/api/delete-all-instances', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    user: user, tenancy: document.getElementById('cfgTenancy').value,
-                    fingerprint: document.getElementById('cfgFingerprint').value,
-                    region: document.getElementById('cfgRegion').value,
-                    private_key: key, timezone: userTimezone
-                })
-            });
-            const data = await res.json();
-            if (data.success) {
-                addLog('Deleted ' + data.deleted + ' instance(s)', 'success');
-                if (data.failed && data.failed.length > 0) {
-                    data.failed.forEach(f => addLog('Failed: ' + f.name + ' - ' + f.error, 'error'));
-                }
-                setTimeout(checkQuota, 3000);
-            } else {
-                addLog('Bulk delete failed: ' + data.error, 'error');
-            }
-        } catch (err) {
-            addLog('Bulk delete error: ' + err.message, 'error');
-        }
-    }
-
-    async function startLoop() {
-        const image = document.getElementById('imageSelect').value;
-        const ssh = document.getElementById('sshKey').value.trim();
-        const user = document.getElementById('cfgUser').value;
-        const key = document.getElementById('cfgKey').value;
-        if (!user || !key) { addLog('Error: Credentials required', 'error'); return; }
-        if (!image) { addLog('Error: Select an OS image first', 'error'); return; }
-        if (!ssh) { addLog('Error: SSH public key required', 'error'); return; }
-        const payload = {
-            user: user, tenancy: document.getElementById('cfgTenancy').value,
-            fingerprint: document.getElementById('cfgFingerprint').value,
-            region: document.getElementById('cfgRegion').value,
-            private_key: key, shape: document.getElementById('shapeSelect').value,
-            image_id: image, subnet_id: document.getElementById('subnetSelect').value,
-            ad_preference: document.getElementById('adSelect').value,
-            display_name: document.getElementById('vmName').value,
-            ocpus: document.getElementById('ocpus').value,
-            memory: document.getElementById('memory').value,
-            boot_volume_gb: document.getElementById('bootVol').value,
-            ssh_key: ssh,
-            telegram_bot_token: document.getElementById('tgToken').value.trim(),
-            telegram_chat_id: document.getElementById('tgChat').value.trim(),
-            telegram_live_log: document.getElementById('tgLiveLog').checked,
-            retry_delay: parseInt(document.getElementById('retryDelay').value) || 60,
-            randomize_delay: delayMode === 'random',
-            random_min: 25, random_max: 60,
-            timezone: userTimezone
-        };
-        try {
-            const res = await fetch('/api/auto-launch-loop', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-            const data = await res.json();
-            if (data.success) {
-                updateStatus(true);
-                addLog('Provisioning loop started', 'success');
-                startPolling();
-            } else {
-                addLog('Failed: ' + data.error, 'error');
-            }
-        } catch (err) {
-            addLog('Request error: ' + err.message, 'error');
-        }
-    }
-
-    async function stopLoop() {
-        try {
-            const res = await fetch('/api/stop-loop', { method: 'POST' });
-            const data = await res.json();
-            addLog(data.message, 'warn');
-            updateStatus(false);
-            stopPolling();
-        } catch (err) {
-            addLog('Stop error: ' + err.message, 'error');
-        }
-    }
-
-    async function fetchLogs() {
-        try {
-            const res = await fetch('/api/logs?offset=' + logOffset);
-            const data = await res.json();
-            if (data.logs && data.logs.length > 0) {
-                const term = document.getElementById('terminalBody');
-                data.logs.forEach(line => {
-                    const div = document.createElement('div');
-                    div.className = 'log-line';
-                    div.textContent = line;
-                    term.appendChild(div);
-                });
-                logOffset = data.next_offset;
-                term.scrollTop = term.scrollHeight;
-            }
-        } catch (e) {}
-    }
-
-    async function checkStatus() {
-        try {
-            const res = await fetch('/api/status');
-            const data = await res.json();
-            if (data.success) {
-                updateStatus(data.running);
-                if (data.running && !pollInterval) startPolling();
-                if (!data.running && pollInterval) stopPolling();
-            }
-        } catch (e) {}
-    }
-
-    function startPolling() {
-        if (pollInterval) return;
-        pollInterval = setInterval(fetchLogs, 2000);
-        statusInterval = setInterval(checkStatus, 5000);
-    }
-
-    function stopPolling() {
-        if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
-        if (statusInterval) { clearInterval(statusInterval); statusInterval = null; }
-    }
-
-    function onTgLiveLogChange() {
-        document.getElementById('tgLiveWarning').style.display = document.getElementById('tgLiveLog').checked ? 'block' : 'none';
-    }
-
-    function onAllOSChange() {
-        document.getElementById('imageSelect').innerHTML = '<option value="">-- Scan images --</option>';
-    }
-
-    function clearAll() {
-        if (isRunning) { addLog('Stop the provisioning loop before clearing', 'warn'); return; }
-        document.getElementById('rawConfig').value = '';
-        document.getElementById('cfgUser').value = '';
-        document.getElementById('cfgTenancy').value = '';
-        document.getElementById('cfgFingerprint').value = '';
-        document.getElementById('cfgRegion').value = '';
-        document.getElementById('cfgKey').value = '';
-        document.getElementById('keyZone').classList.remove('success');
-        document.getElementById('keyZoneContent').innerHTML =
-            '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="color:var(--text-muted);margin-bottom:6px;">' +
-            '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>' +
-            '<div style="font-size:12px;color:var(--text-muted);">Click to upload .pem, .txt, or .key</div>';
-        document.getElementById('keyFile').value = '';
-        document.getElementById('imageSelect').innerHTML = '<option value="">-- Scan images first --</option>';
-        document.getElementById('subnetSelect').innerHTML = '<option value="">-- Auto-select first available --</option>';
-        document.getElementById('subnetInfo').style.display = 'none';
-        document.getElementById('vnicSelect').innerHTML = '<option value="">-- Scan VNICs first --</option>';
-        document.getElementById('vnicInfo').style.display = 'none';
-        document.getElementById('vmName').value = 'Arm';
-        document.getElementById('ocpus').value = '2';
-        document.getElementById('memory').value = '12';
-        document.getElementById('bootVol').value = '50';
-        document.getElementById('sshKey').value = '';
-        document.getElementById('sshZone').classList.remove('success');
-        document.getElementById('sshZoneContent').innerHTML =
-            '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="color:var(--text-muted);margin-bottom:6px;">' +
-            '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>' +
-            '<div style="font-size:12px;color:var(--text-muted);">Click to upload .pub or .txt</div>';
-        document.getElementById('sshFile').value = '';
-        document.getElementById('tgToken').value = '';
-        document.getElementById('tgChat').value = '';
-        document.getElementById('tgLiveLog').checked = false;
-        document.getElementById('tgLiveWarning').style.display = 'none';
-        document.getElementById('tgResult').innerHTML = '';
-        document.getElementById('quotaPanel').style.display = 'none';
-        document.getElementById('quotaPanel').innerHTML = '';
-        document.getElementById('shapeInfo').style.display = 'none';
-        document.getElementById('shapeInfo').innerHTML = '';
-        clearLogs();
-        addLog('All fields cleared', 'success');
-    }
-
-    window.addEventListener('load', () => {
-        fetchLogs();
-        checkStatus();
-        setInterval(checkStatus, 5000);
-    });
-    
-// ---- NEW BOOT VOLUME FUNCTIONS ----
-async function listBootVolumes() {
-    parseConfig();
-    const btn = document.querySelector('#bootvolBody .btn-primary');
-    const result = document.getElementById('bootVolResult');
-    const user = document.getElementById('cfgUser').value;
-    const key = document.getElementById('cfgKey').value;
-    if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
-    const instanceId = document.getElementById('bootInstId').value.trim();
-    btn.textContent = 'Scanning...'; btn.disabled = true; result.style.display = 'none';
-    try {
-        const payload = {
-            user: user, tenancy: document.getElementById('cfgTenancy').value,
-            fingerprint: document.getElementById('cfgFingerprint').value,
-            region: document.getElementById('cfgRegion').value,
-            private_key: key, timezone: userTimezone
-        };
-        if (instanceId) payload.instance_id = instanceId;
-        const res = await fetch('/api/list-boot-volumes', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        });
-        const data = await res.json();
-        result.style.display = 'block';
-        if (data.success) {
-            if (data.volumes && data.volumes.length > 0) {
-                let html = '<div style="color:var(--positive);font-weight:600;margin-bottom:6px;">Found ' + data.volumes.length + ' boot volume(s)' + (data.filtered_by_instance ? ' for instance' : '') + ':</div>';
-                data.volumes.forEach(v => {
-                    const stateColor = v.lifecycle_state === 'AVAILABLE' ? 'var(--positive)' : 'var(--warning)';
-                    html += '<div style="padding:6px 8px;background:var(--surface-raised);border:1px solid var(--border);border-radius:var(--radius-sm);margin-bottom:6px;font-size:12px;">';
-                    html += '<div style="font-weight:600;color:var(--text);">' + (v.display_name || 'Unnamed') + '</div>';
-                    html += '<div style="color:var(--text-muted);margin-top:2px;">ID: ' + v.id + ' | Size: ' + v.size_in_gbs + ' GB | State: <span style="color:' + stateColor + '">' + v.lifecycle_state + '</span></div>';
-                    html += '<div style="color:var(--text-muted);">Instance: ' + (v.instance_name || 'Not attached') + ' | Attachment: ' + v.attachment_state + '</div>';
-                    html += '</div>';
-                });
-                result.innerHTML = html;
-                addLog('Found ' + data.volumes.length + ' boot volume(s)', 'success');
-            } else {
-                result.innerHTML = '<span style="color:var(--text-muted);">No boot volumes found.</span>';
-            }
-        } else {
-            result.innerHTML = '<span style="color:var(--danger);">Error: ' + data.error + '</span>';
-            addLog('List boot volumes failed: ' + data.error, 'error');
-        }
-    } catch (err) {
-        result.style.display = 'block';
-        result.innerHTML = '<span style="color:var(--danger);">Request error: ' + err.message + '</span>';
-        addLog('List boot volumes request error: ' + err.message, 'error');
-    }
-    btn.textContent = 'List volumes'; btn.disabled = false;
-}
-
-async function detachBootVolume() {
-    parseConfig();
-    const user = document.getElementById('cfgUser').value;
-    const key = document.getElementById('cfgKey').value;
-    if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
-    const instanceId = document.getElementById('bootInstId').value.trim();
-    const volumeId = document.getElementById('bootVolId').value.trim();
-    if (!instanceId || !volumeId) { addLog('Error: instance_id and boot_volume_id required', 'error'); return; }
-    if (!confirm('Detach boot volume ' + volumeId + ' from instance ' + instanceId + '?')) { addLog('Detach cancelled', 'warn'); return; }
-    addLog('Detaching boot volume ' + volumeId + ' from ' + instanceId + '...', 'warn');
-    try {
-        const res = await fetch('/api/detach-boot-volume', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                user: user, tenancy: document.getElementById('cfgTenancy').value,
-                fingerprint: document.getElementById('cfgFingerprint').value,
-                region: document.getElementById('cfgRegion').value,
-                private_key: key, instance_id: instanceId, boot_volume_id: volumeId, timezone: userTimezone
+@app.route('/api/list-images', methods=['POST'])
+@require_auth
+def list_available_images():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    shape = data.get('shape')
+    all_os_mode = data.get('all_os_mode', False)
+    try:
+        oci.config.validate_config(config)
+        compute = oci.core.ComputeClient(config)
+        kwargs = {'compartment_id': config['tenancy']}
+        if shape:
+            kwargs['shape'] = shape
+        images = compute.list_images(**kwargs).data
+        min_dt = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc).astimezone(PHNOM_PENH_TZ)
+        images = sorted(images, key=lambda i: i.time_created.astimezone(PHNOM_PENH_TZ) if i.time_created else min_dt, reverse=True)
+        valid = []
+        for img in images:
+            if getattr(img, 'lifecycle_state', '') != 'AVAILABLE':
+                continue
+            os_name = (getattr(img, 'operating_system', '') or '').lower()
+            version = (getattr(img, 'operating_system_version', '') or '').strip()
+            display_name = (img.display_name or '').lower()
+            if not all_os_mode:
+                if 'ubuntu' not in os_name:
+                    continue
+                major = 0
+                if version:
+                    try:
+                        major = int(str(version).split('.')[0])
+                    except (ValueError, IndexError):
+                        major = 0
+                else:
+                    m = re.search(r'ubuntu[-_\s]?(\d+)', display_name)
+                    if m:
+                        major = int(m.group(1))
+                if major < 18:
+                    continue
+            valid.append({
+                'id': img.id,
+                'name': img.display_name or f"{getattr(img, 'operating_system', 'Unknown')} {version}",
+                'version': version,
+                'os': getattr(img, 'operating_system', 'Unknown'),
+                'os_version': version
             })
-        });
-        const data = await res.json();
-        if (data.success) {
-            addLog('Detached: ' + data.message, 'success');
-        } else {
-            addLog('Detach failed: ' + data.error, 'error');
-        }
-    } catch (err) {
-        addLog('Detach error: ' + err.message, 'error');
-    }
-}
+        return jsonify({'success': True, 'images': valid[:50]})
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
 
-async function attachBootVolume() {
-    parseConfig();
-    const user = document.getElementById('cfgUser').value;
-    const key = document.getElementById('cfgKey').value;
-    if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
-    const instanceId = document.getElementById('bootInstId').value.trim();
-    const volumeId = document.getElementById('bootVolId').value.trim();
-    if (!instanceId || !volumeId) { addLog('Error: instance_id and boot_volume_id required', 'error'); return; }
-    if (!confirm('Attach boot volume ' + volumeId + ' to instance ' + instanceId + '?')) { addLog('Attach cancelled', 'warn'); return; }
-    addLog('Attaching boot volume ' + volumeId + ' to ' + instanceId + '...', 'warn');
-    try {
-        const res = await fetch('/api/attach-boot-volume', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                user: user, tenancy: document.getElementById('cfgTenancy').value,
-                fingerprint: document.getElementById('cfgFingerprint').value,
-                region: document.getElementById('cfgRegion').value,
-                private_key: key, instance_id: instanceId, boot_volume_id: volumeId, timezone: userTimezone
+@app.route('/api/list-subnets', methods=['POST'])
+@require_auth
+def list_available_subnets():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    try:
+        oci.config.validate_config(config)
+        network_client = oci.core.VirtualNetworkClient(config)
+        identity_client = oci.identity.IdentityClient(config)
+        tenancy = config['tenancy']
+        ads = identity_client.list_availability_domains(compartment_id=tenancy).data
+        vcns = network_client.list_vcns(compartment_id=tenancy).data
+        if not vcns:
+            return jsonify({'success': False, 'error': 'No VCNs found in this tenancy'})
+        all_subnets = []
+        for vcn in vcns:
+            subnets = network_client.list_subnets(compartment_id=tenancy, vcn_id=vcn.id).data
+            for sn in subnets:
+                if getattr(sn, 'lifecycle_state', '') != 'AVAILABLE':
+                    continue
+                all_subnets.append({
+                    'id': sn.id,
+                    'name': sn.display_name or 'Unnamed',
+                    'cidr': sn.cidr_block or 'N/A',
+                    'vcn_name': vcn.display_name or 'Unnamed VCN',
+                    'vcn_id': vcn.id,
+                    'ad': sn.availability_domain or 'Regional',
+                    'public': getattr(sn, 'prohibit_public_ip_on_vnic', False) == False,
+                    'dns': sn.dns_label or 'N/A'
+                })
+        return jsonify({'success': True, 'subnets': all_subnets})
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+
+@app.route('/api/list-shapes', methods=['POST'])
+@require_auth
+def list_available_shapes():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    try:
+        oci.config.validate_config(config)
+        compute_client = oci.core.ComputeClient(config)
+        identity_client = oci.identity.IdentityClient(config)
+        tenancy = config['tenancy']
+        ads = identity_client.list_availability_domains(compartment_id=tenancy).data
+        all_shapes = []
+        seen = set()
+        ad_availability = {}
+        for ad in ads:
+            try:
+                shapes = compute_client.list_shapes(compartment_id=tenancy, availability_domain=ad.name).data
+                for shape in shapes:
+                    name = shape.shape
+                    if name in seen:
+                        ad_availability.setdefault(name, []).append(ad.name)
+                        continue
+                    seen.add(name)
+                    ad_availability[name] = [ad.name]
+                    all_shapes.append({
+                        'name': name,
+                        'ocpus': getattr(shape, 'ocpus', None),
+                        'memory': getattr(shape, 'memory_in_gbs', None),
+                        'processor': getattr(shape, 'processor_description', None),
+                        'is_flex': 'Flex' in name,
+                        'is_burstable': getattr(shape, 'is_burstable', False),
+                        'max_vnic_attachment': getattr(shape, 'networking_bandwidth_in_gbps', None)
+                    })
+            except Exception:
+                continue
+        for s in all_shapes:
+            s['ads'] = list(set(ad_availability.get(s['name'], [])))
+        free_tier = {'VM.Standard.A1.Flex', 'VM.Standard.E2.1.Micro'}
+        all_shapes.sort(key=lambda s: (s['name'] not in free_tier, s['name']))
+        return jsonify({'success': True, 'shapes': all_shapes, 'ad_count': len(ads)})
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+
+@app.route('/api/create-subnet', methods=['POST'])
+@require_auth
+def create_subnet():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    vcn_cidr = data.get('vcn_cidr', '10.0.0.0/16').strip()
+    subnet_cidr = data.get('subnet_cidr', '10.0.0.0/24').strip()
+    subnet_name = data.get('subnet_name', 'provisioner-subnet').strip()
+    vcn_name = data.get('vcn_name', 'provisioner-vcn').strip()
+    try:
+        oci.config.validate_config(config)
+        network_client = oci.core.VirtualNetworkClient(config)
+        identity_client = oci.identity.IdentityClient(config)
+        tenancy = config['tenancy']
+        ads = identity_client.list_availability_domains(compartment_id=tenancy).data
+        target_ad = ads[0].name if ads else None
+        vcns = network_client.list_vcns(compartment_id=tenancy).data
+        vcn = None
+        if vcns:
+            vcn = vcns[0]
+            add_log(f"Using existing VCN: {vcn.display_name} ({vcn.id[:20]}...)")
+        else:
+            add_log(f"Creating VCN '{vcn_name}' with CIDR {vcn_cidr}...")
+            vcn = network_client.create_vcn(
+                create_vcn_details=oci.core.models.CreateVcnDetails(
+                    compartment_id=tenancy, cidr_block=vcn_cidr,
+                    display_name=vcn_name, dns_label='provvcn'
+                )
+            ).data
+            add_log(f"VCN created: {vcn.id[:20]}...")
+            time.sleep(2)
+        existing_subnets = network_client.list_subnets(compartment_id=tenancy, vcn_id=vcn.id).data
+        if existing_subnets:
+            subnet = existing_subnets[0]
+            return jsonify({
+                'success': True, 'created': False, 'message': 'Subnet already exists',
+                'subnet': {
+                    'id': subnet.id, 'name': subnet.display_name,
+                    'cidr': subnet.cidr_block, 'vcn_name': vcn.display_name,
+                    'vcn_id': vcn.id, 'ad': subnet.availability_domain or 'Regional',
+                    'public': getattr(subnet, 'prohibit_public_ip_on_vnic', False) == False
+                }
             })
-        });
-        const data = await res.json();
-        if (data.success) {
-            addLog('Attached: ' + data.message, 'success');
-        } else {
-            addLog('Attach failed: ' + data.error, 'error');
-        }
-    } catch (err) {
-        addLog('Attach error: ' + err.message, 'error');
-    }
-}
+        igws = network_client.list_internet_gateways(compartment_id=tenancy, vcn_id=vcn.id).data
+        igw = None
+        for g in igws:
+            if getattr(g, 'lifecycle_state', '') == 'AVAILABLE':
+                igw = g
+                break
+        if not igw:
+            add_log("Creating Internet Gateway...")
+            igw = network_client.create_internet_gateway(
+                create_internet_gateway_details=oci.core.models.CreateInternetGatewayDetails(
+                    compartment_id=tenancy, vcn_id=vcn.id,
+                    display_name='provisioner-igw', is_enabled=True
+                )
+            ).data
+            add_log(f"Internet Gateway created: {igw.id[:20]}...")
+            time.sleep(1)
+        else:
+            add_log(f"Using existing Internet Gateway: {igw.id[:20]}...")
+        route_tables = network_client.list_route_tables(compartment_id=tenancy, vcn_id=vcn.id).data
+        if route_tables:
+            rt = route_tables[0]
+            routes = list(getattr(rt, 'route_rules', []))
+            has_internet_route = any(
+                getattr(r, 'destination', '') == '0.0.0.0/0' and getattr(r, 'network_entity_id', '') == igw.id
+                for r in routes
+            )
+            if not has_internet_route:
+                add_log("Adding default route to Internet Gateway...")
+                routes.append(oci.core.models.RouteRule(
+                    destination='0.0.0.0/0', destination_type='CIDR_BLOCK', network_entity_id=igw.id
+                ))
+                network_client.update_route_table(
+                    rt_id=rt.id,
+                    update_route_table_details=oci.core.models.UpdateRouteTableDetails(route_rules=routes)
+                )
+                add_log("Route table updated.")
+        add_log(f"Creating subnet '{subnet_name}' with CIDR {subnet_cidr}...")
+        create_subnet_details = oci.core.models.CreateSubnetDetails(
+            compartment_id=tenancy, vcn_id=vcn.id, cidr_block=subnet_cidr,
+            display_name=subnet_name, dns_label='provsubnet',
+            prohibit_public_ip_on_vnic=False
+        )
+        if target_ad:
+            create_subnet_details.availability_domain = target_ad
+        subnet = network_client.create_subnet(create_subnet_details=create_subnet_details).data
+        add_log(f"Subnet created: {subnet.id[:20]}...")
+        for _ in range(10):
+            sn = network_client.get_subnet(subnet_id=subnet.id).data
+            if getattr(sn, 'lifecycle_state', '') == 'AVAILABLE':
+                break
+            time.sleep(1)
+        return jsonify({
+            'success': True, 'created': True, 'message': 'Subnet created successfully',
+            'subnet': {
+                'id': subnet.id, 'name': subnet.display_name,
+                'cidr': subnet.cidr_block, 'vcn_name': vcn.display_name,
+                'vcn_id': vcn.id, 'ad': subnet.availability_domain or 'Regional',
+                'public': getattr(subnet, 'prohibit_public_ip_on_vnic', False) == False
+            }
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
 
-async function deleteBootVolume() {
-    parseConfig();
-    const user = document.getElementById('cfgUser').value;
-    const key = document.getElementById('cfgKey').value;
-    if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
-    const volumeId = document.getElementById('bootVolId').value.trim();
-    if (!volumeId) { addLog('Error: boot_volume_id required', 'error'); return; }
-    if (!confirm('DELETE boot volume ' + volumeId + '? This cannot be undone!')) { addLog('Delete cancelled', 'warn'); return; }
-    addLog('Deleting boot volume ' + volumeId + '...', 'warn');
-    try {
-        const res = await fetch('/api/delete-boot-volume', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                user: user, tenancy: document.getElementById('cfgTenancy').value,
-                fingerprint: document.getElementById('cfgFingerprint').value,
-                region: document.getElementById('cfgRegion').value,
-                private_key: key, boot_volume_id: volumeId, timezone: userTimezone
+@app.route('/api/test-launch', methods=['POST'])
+@require_auth
+def test_launch():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    try:
+        oci.config.validate_config(config)
+        compute_client = oci.core.ComputeClient(config)
+        network_client = oci.core.VirtualNetworkClient(config)
+        identity_client = oci.identity.IdentityClient(config)
+        block_client = oci.core.BlockstorageClient(config)
+        tenancy = config['tenancy']
+        ads = identity_client.list_availability_domains(compartment_id=tenancy).data
+        vcns = network_client.list_vcns(compartment_id=tenancy).data
+        subnets = []
+        if vcns:
+            subnets = network_client.list_subnets(compartment_id=tenancy, vcn_id=vcns[0].id).data
+        image_id = data.get('image_id')
+        shape = data.get('shape')
+        subnet_id = data.get('subnet_id')
+        image_valid = False
+        image_details = None
+        if image_id:
+            try:
+                img = compute_client.get_image(image_id=image_id).data
+                image_valid = getattr(img, 'lifecycle_state', '') == 'AVAILABLE'
+                image_details = {
+                    'display_name': img.display_name,
+                    'os': getattr(img, 'operating_system', 'N/A'),
+                    'os_version': getattr(img, 'operating_system_version', 'N/A'),
+                    'size_in_mbs': getattr(img, 'size_in_mbs', 'N/A'),
+                    'lifecycle_state': getattr(img, 'lifecycle_state', 'N/A')
+                }
+            except Exception as e:
+                image_details = {'error': str(e)[:100]}
+        subnet_valid = False
+        subnet_details = None
+        if subnet_id:
+            try:
+                sn = network_client.get_subnet(subnet_id=subnet_id).data
+                subnet_valid = getattr(sn, 'lifecycle_state', '') == 'AVAILABLE'
+                subnet_details = {
+                    'display_name': sn.display_name,
+                    'cidr_block': getattr(sn, 'cidr_block', 'N/A'),
+                    'availability_domain': getattr(sn, 'availability_domain', 'Regional'),
+                    'prohibit_public_ip': getattr(sn, 'prohibit_public_ip_on_vnic', False),
+                    'lifecycle_state': getattr(sn, 'lifecycle_state', 'N/A')
+                }
+            except Exception as e:
+                subnet_details = {'error': str(e)[:100]}
+        shape_compat = []
+        if image_id:
+            try:
+                shapes = compute_client.list_image_shape_compatibility_entries(image_id=image_id).data
+                shape_compat = [s.shape for s in shapes]
+            except Exception as e:
+                shape_compat = ['Error: ' + str(e)[:80]]
+        ok, err = check_free_tier_limits(config, data, compute_client, block_client, identity_client)
+        return jsonify({
+            'success': True,
+            'debug': {
+                'region': config.get('region'),
+                'ad': ads[0].name if ads else 'N/A',
+                'ads_available': [ad.name for ad in ads],
+                'vcns_found': len(vcns),
+                'subnets_found': len(subnets),
+                'image_valid': image_valid,
+                'image_details': image_details,
+                'subnet_valid': subnet_valid,
+                'subnet_details': subnet_details,
+                'shape': shape,
+                'shape_compatible_with_image': shape_compat,
+                'free_tier_ok': ok,
+                'free_tier_error': err
+            }
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+
+@app.route('/api/list-vnics', methods=['POST'])
+@require_auth
+def list_vnics():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    target_subnet_id = data.get('subnet_id', '').strip() or None
+    try:
+        oci.config.validate_config(config)
+        compute_client = oci.core.ComputeClient(config)
+        network_client = oci.core.VirtualNetworkClient(config)
+        tenancy = config['tenancy']
+        vcns = {v.id: v for v in network_client.list_vcns(compartment_id=tenancy).data}
+        subnets = {s.id: s for s in network_client.list_subnets(compartment_id=tenancy).data}
+        instances = {i.id: i for i in compute_client.list_instances(compartment_id=tenancy).data}
+        vnics = []
+        vnic_attachments = compute_client.list_vnic_attachments(compartment_id=tenancy).data
+        for att in vnic_attachments:
+            try:
+                vnic = network_client.get_vnic(vnic_id=att.vnic_id).data
+                subnet = subnets.get(vnic.subnet_id)
+                vcn = vcns.get(subnet.vcn_id) if subnet else None
+                if target_subnet_id and vnic.subnet_id != target_subnet_id:
+                    continue
+                instance = instances.get(att.instance_id)
+                vnics.append({
+                    'id': vnic.id, 'display_name': vnic.display_name or 'Unnamed',
+                    'private_ip': vnic.private_ip, 'public_ip': vnic.public_ip or 'None',
+                    'subnet_id': vnic.subnet_id, 'subnet_name': subnet.display_name if subnet else 'Unknown',
+                    'vcn_id': vcn.id if vcn else 'Unknown', 'vcn_name': vcn.display_name if vcn else 'Unknown',
+                    'lifecycle_state': vnic.lifecycle_state, 'is_primary': getattr(att, 'is_primary', False),
+                    'instance_id': att.instance_id, 'instance_name': instance.display_name if instance else 'Unknown'
+                })
+            except Exception:
+                pass
+        vcn_list = [{'id': v.id, 'name': v.display_name or 'Unnamed'} for v in vcns.values()]
+        return jsonify({'success': True, 'vnics': vnics, 'vcns': vcn_list, 'filtered_by_subnet': target_subnet_id})
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+
+@app.route('/api/open-firewall', methods=['POST'])
+@require_auth
+def open_firewall():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    subnet_id = data.get('subnet_id')
+    ports = data.get('ports', 'all')
+    cidr = data.get('cidr', '0.0.0.0/0').strip()
+    direction = data.get('direction', 'ingress')
+    if not subnet_id:
+        return jsonify({'success': False, 'error': 'subnet_id required'})
+    import ipaddress as _ipaddress
+    try:
+        _ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        return jsonify({'success': False, 'error': f'Invalid CIDR: {cidr!r}'})
+    if direction not in ('ingress', 'egress', 'both'):
+        return jsonify({'success': False, 'error': f'Invalid direction: {direction!r}'})
+    if ports not in ('all', '*'):
+        for p in str(ports).split(','):
+            p = p.strip()
+            if not p.isdigit() or not (1 <= int(p) <= 65535):
+                return jsonify({'success': False, 'error': f'Invalid port: {p!r} (use 1-65535 or "all")'})
+    try:
+        oci.config.validate_config(config)
+        network_client = oci.core.VirtualNetworkClient(config)
+        subnet = network_client.get_subnet(subnet_id=subnet_id).data
+        port_list = []
+        if ports == 'all' or ports == '*':
+            port_list = ['all']
+        else:
+            port_list = [p.strip() for p in str(ports).split(',') if p.strip()]
+        directions_to_add = []
+        if direction in ('ingress', 'both'):
+            directions_to_add.append('INGRESS')
+        if direction in ('egress', 'both'):
+            directions_to_add.append('EGRESS')
+        nsg_ids = getattr(subnet, 'network_security_group_ids', [])
+        if nsg_ids and len(nsg_ids) > 0:
+            rules = []
+            for dir in directions_to_add:
+                for port in port_list:
+                    if port == 'all':
+                        rules.append(oci.core.models.AddSecurityRuleDetails(
+                            direction=dir, protocol='all',
+                            source=cidr if dir == 'INGRESS' else None,
+                            destination=cidr if dir == 'EGRESS' else None,
+                            description='OCI Provisioner: ' + dir.lower() + ' all traffic'
+                        ))
+                    else:
+                        rules.append(oci.core.models.AddSecurityRuleDetails(
+                            direction=dir, protocol='6',
+                            source=cidr if dir == 'INGRESS' else None,
+                            destination=cidr if dir == 'EGRESS' else None,
+                            tcp_options=oci.core.models.TcpOptions(
+                                destination_port_range=oci.core.models.PortRange(min=int(port), max=int(port))
+                            ),
+                            description='OCI Provisioner: ' + dir.lower() + ' port ' + port
+                        ))
+            result = network_client.add_network_security_group_security_rules(
+                network_security_group_id=nsg_ids[0],
+                add_network_security_group_security_rules_details=oci.core.models.AddNetworkSecurityGroupSecurityRulesDetails(
+                    security_rules=rules
+                )
+            )
+            return jsonify({
+                'success': True, 'method': 'NSG', 'nsg_id': nsg_ids[0],
+                'rules_added': len(result.data.security_rules),
+                'ports': ports, 'cidr': cidr, 'direction': direction
             })
-        });
-        const data = await res.json();
-        if (data.success) {
-            addLog('Deleted: ' + data.message, 'success');
-        } else {
-            addLog('Delete failed: ' + data.error, 'error');
-        }
-    } catch (err) {
-        addLog('Delete error: ' + err.message, 'error');
-    }
-}
+        sec_list_ids = getattr(subnet, 'security_list_ids', [])
+        if not sec_list_ids:
+            return jsonify({'success': False, 'error': 'No security list or NSG found on subnet'})
+        sec_list = network_client.get_security_list(security_list_id=sec_list_ids[0]).data
+        new_ingress = list(getattr(sec_list, 'ingress_security_rules', []))
+        new_egress = list(getattr(sec_list, 'egress_security_rules', []))
+        added = []
+        for dir in directions_to_add:
+            existing = new_ingress if dir == 'INGRESS' else new_egress
+            for port in port_list:
+                if port == 'all':
+                    already = any(getattr(r, 'source' if dir == 'INGRESS' else 'destination', '') == cidr and getattr(r, 'protocol', '') == 'all' for r in existing)
+                    if not already:
+                        rule = oci.core.models.IngressSecurityRule(
+                            source=cidr, protocol='all', is_stateless=False,
+                            description='OCI Provisioner: ' + dir.lower() + ' all traffic'
+                        ) if dir == 'INGRESS' else oci.core.models.EgressSecurityRule(
+                            destination=cidr, protocol='all', is_stateless=False,
+                            description='OCI Provisioner: ' + dir.lower() + ' all traffic'
+                        )
+                        existing.append(rule)
+                        added.append(dir.lower() + ':all')
+                else:
+                    already = any(
+                        getattr(r, 'source' if dir == 'INGRESS' else 'destination', '') == cidr and
+                        getattr(r, 'protocol', '') == '6' and
+                        getattr(getattr(r, 'tcp_options', None), 'destination_port_range', None) and
+                        getattr(getattr(r, 'tcp_options', None), 'destination_port_range').min == int(port)
+                        for r in existing
+                    )
+                    if not already:
+                        rule = oci.core.models.IngressSecurityRule(
+                            source=cidr, protocol='6', is_stateless=False,
+                            tcp_options=oci.core.models.TcpOptions(
+                                destination_port_range=oci.core.models.PortRange(min=int(port), max=int(port))
+                            ),
+                            description='OCI Provisioner: ' + dir.lower() + ' port ' + port
+                        ) if dir == 'INGRESS' else oci.core.models.EgressSecurityRule(
+                            destination=cidr, protocol='6', is_stateless=False,
+                            tcp_options=oci.core.models.TcpOptions(
+                                destination_port_range=oci.core.models.PortRange(min=int(port), max=int(port))
+                            ),
+                            description='OCI Provisioner: ' + dir.lower() + ' port ' + port
+                        )
+                        existing.append(rule)
+                        added.append(dir.lower() + ':' + port)
+        if not added:
+            return jsonify({'success': True, 'already_open': True, 'message': 'Rule(s) already exist', 'ports': ports, 'cidr': cidr, 'direction': direction})
+        network_client.update_security_list(
+            security_list_id=sec_list_ids[0],
+            update_security_list_details=oci.core.models.UpdateSecurityListDetails(
+                ingress_security_rules=new_ingress, egress_security_rules=new_egress
+            )
+        )
+        return jsonify({
+            'success': True, 'method': 'SecurityList', 'sec_list_id': sec_list_ids[0],
+            'rules_added': len(added), 'ports_added': added,
+            'ports': ports, 'cidr': cidr, 'direction': direction
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
 
-async function replaceBootVolume() {
-    parseConfig();
-    const user = document.getElementById('cfgUser').value;
-    const key = document.getElementById('cfgKey').value;
-    if (!user || !key) { addLog('Error: Credentials required first', 'error'); return; }
-    const instanceId = document.getElementById('bootInstId').value.trim();
-    const oldVolId = document.getElementById('bootVolId').value.trim();
-    const newVolId = document.getElementById('bootNewVolId').value.trim();
-    if (!instanceId) { addLog('Error: instance_id required', 'error'); return; }
-    if (!confirm('Replace boot volume on instance ' + instanceId + '?' + (newVolId ? ' New volume: ' + newVolId : '') + (oldVolId ? ' Old volume: ' + oldVolId : ''))) { addLog('Replace cancelled', 'warn'); return; }
-    addLog('Replacing boot volume on ' + instanceId + '...', 'warn');
-    try {
-        const res = await fetch('/api/replace-boot-volume', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                user: user, tenancy: document.getElementById('cfgTenancy').value,
-                fingerprint: document.getElementById('cfgFingerprint').value,
-                region: document.getElementById('cfgRegion').value,
-                private_key: key, instance_id: instanceId,
-                old_boot_volume_id: oldVolId || null,
-                new_boot_volume_id: newVolId || null,
-                timezone: userTimezone
+@app.route('/api/scan-security-rules', methods=['POST'])
+@require_auth
+def scan_security_rules():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    subnet_id = data.get('subnet_id')
+    if not subnet_id:
+        return jsonify({'success': False, 'error': 'subnet_id required'})
+    try:
+        oci.config.validate_config(config)
+        network_client = oci.core.VirtualNetworkClient(config)
+        subnet = network_client.get_subnet(subnet_id=subnet_id).data
+        rules = []
+        nsg_ids = getattr(subnet, 'network_security_group_ids', [])
+        for nsg_id in nsg_ids:
+            nsg = network_client.get_network_security_group(network_security_group_id=nsg_id).data
+            nsg_rules = network_client.list_network_security_group_security_rules(network_security_group_id=nsg_id).data
+            for r in nsg_rules:
+                rules.append({
+                    'type': 'NSG', 'direction': r.direction, 'protocol': r.protocol,
+                    'source': getattr(r, 'source', 'N/A'), 'destination': getattr(r, 'destination', 'N/A'),
+                    'description': getattr(r, 'description', '')
+                })
+        sec_list_ids = getattr(subnet, 'security_list_ids', [])
+        for sec_id in sec_list_ids:
+            sec_list = network_client.get_security_list(security_list_id=sec_id).data
+            for r in getattr(sec_list, 'ingress_security_rules', []):
+                tcp_opts = getattr(r, 'tcp_options', None)
+                port_range = None
+                if tcp_opts and getattr(tcp_opts, 'destination_port_range', None):
+                    port_range = str(tcp_opts.destination_port_range.min)
+                    if tcp_opts.destination_port_range.max != tcp_opts.destination_port_range.min:
+                        port_range += '-' + str(tcp_opts.destination_port_range.max)
+                rules.append({
+                    'type': 'SecurityList', 'direction': 'INGRESS',
+                    'protocol': getattr(r, 'protocol', 'N/A'), 'source': getattr(r, 'source', 'N/A'),
+                    'destination': 'N/A', 'port_range': port_range,
+                    'description': getattr(r, 'description', '')
+                })
+            for r in getattr(sec_list, 'egress_security_rules', []):
+                tcp_opts = getattr(r, 'tcp_options', None)
+                port_range = None
+                if tcp_opts and getattr(tcp_opts, 'destination_port_range', None):
+                    port_range = str(tcp_opts.destination_port_range.min)
+                    if tcp_opts.destination_port_range.max != tcp_opts.destination_port_range.min:
+                        port_range += '-' + str(tcp_opts.destination_port_range.max)
+                rules.append({
+                    'type': 'SecurityList', 'direction': 'EGRESS',
+                    'protocol': getattr(r, 'protocol', 'N/A'), 'source': 'N/A',
+                    'destination': getattr(r, 'destination', 'N/A'), 'port_range': port_range,
+                    'description': getattr(r, 'description', '')
+                })
+        return jsonify({'success': True, 'rules': rules, 'nsg_count': len(nsg_ids), 'sec_list_count': len(sec_list_ids)})
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+
+def check_free_tier_limits(config, account_config, compute_client, block_client, identity_client):
+    tenancy = config['tenancy']
+    requested_shape = account_config.get('shape')
+    requested_boot_gb = int(account_config.get('boot_volume_gb', 50))
+    if requested_boot_gb < 50:
+        requested_boot_gb = 50
+    ads = identity_client.list_availability_domains(compartment_id=tenancy).data
+    total_storage = 0
+    for ad in ads:
+        boot_volumes = block_client.list_boot_volumes(compartment_id=tenancy, availability_domain=ad.name).data
+        total_storage += sum(int(v.size_in_gbs) for v in boot_volumes if v.lifecycle_state != 'TERMINATED')
+    if total_storage + requested_boot_gb > 200:
+        return False, f"Storage would exceed 200 GB free tier limit (used {total_storage} GB + requested {requested_boot_gb} GB)"
+    instances = compute_client.list_instances(compartment_id=tenancy).data
+    if requested_shape == 'VM.Standard.E2.1.Micro':
+        micro_count = sum(1 for inst in instances if inst.shape == 'VM.Standard.E2.1.Micro' and inst.lifecycle_state != 'TERMINATED')
+        if micro_count >= 2:
+            return False, f"Free tier allows only 2 Micro instances (found {micro_count})"
+        return True, ""
+    if requested_shape == 'VM.Standard.A1.Flex':
+        requested_ocpus = int(account_config.get('ocpus', 4))
+        requested_memory = int(account_config.get('memory', 24))
+        total_ocpus = 0
+        total_memory = 0
+        for inst in instances:
+            if inst.shape == 'VM.Standard.A1.Flex' and inst.lifecycle_state != 'TERMINATED':
+                cfg = inst.shape_config
+                if cfg:
+                    total_ocpus += int(cfg.ocpus or 0)
+                    total_memory += int(cfg.memory_in_gbs or 0)
+        if total_ocpus + requested_ocpus > 2:
+            return False, f"A1 OCPUs would exceed 2 (used {total_ocpus} + requested {requested_ocpus})"
+        if total_memory + requested_memory > 12:
+            return False, f"A1 memory would exceed 12 GB (used {total_memory} + requested {requested_memory})"
+        return True, ""
+    return True, ""
+
+@app.route('/api/free-tier-status', methods=['POST'])
+@require_auth
+def free_tier_status():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    try:
+        oci.config.validate_config(config)
+        compute_client = oci.core.ComputeClient(config)
+        block_client = oci.core.BlockstorageClient(config)
+        identity_client = oci.identity.IdentityClient(config)
+        usage = get_free_tier_usage(config, compute_client, block_client, identity_client)
+        return jsonify({'success': True, 'usage': usage})
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+
+def get_free_tier_usage(config, compute_client, block_client, identity_client):
+    tenancy = config['tenancy']
+    network_client = oci.core.VirtualNetworkClient(config)
+    ads = identity_client.list_availability_domains(compartment_id=tenancy).data
+    total_storage = 0
+    for ad in ads:
+        boot_volumes = block_client.list_boot_volumes(compartment_id=tenancy, availability_domain=ad.name).data
+        total_storage += sum(int(v.size_in_gbs) for v in boot_volumes if v.lifecycle_state != 'TERMINATED')
+    storage_remaining = max(0, 200 - total_storage)
+    instances = compute_client.list_instances(compartment_id=tenancy).data
+    micro_count = sum(1 for inst in instances if inst.shape == 'VM.Standard.E2.1.Micro' and inst.lifecycle_state != 'TERMINATED')
+    micro_remaining = max(0, 2 - micro_count)
+    total_ocpus = 0
+    total_memory = 0
+    arm_instances = []
+    for inst in instances:
+        if inst.shape == 'VM.Standard.A1.Flex' and inst.lifecycle_state != 'TERMINATED':
+            cfg = inst.shape_config
+            if cfg:
+                ocpus = int(cfg.ocpus or 0)
+                memory = int(cfg.memory_in_gbs or 0)
+                total_ocpus += ocpus
+                total_memory += memory
+                arm_instances.append({'name': inst.display_name, 'ocpus': ocpus, 'memory': memory, 'state': inst.lifecycle_state})
+    ocpus_remaining = max(0, 2 - total_ocpus)
+    memory_remaining = max(0, 12 - total_memory)
+    all_instances = list_all_instances(config, compute_client, identity_client, network_client)
+    return {
+        'storage': {'used_gb': total_storage, 'limit_gb': 200, 'remaining_gb': storage_remaining, 'percent': round((total_storage / 200) * 100, 1) if total_storage > 0 else 0},
+        'micro': {'used': micro_count, 'limit': 2, 'remaining': micro_remaining, 'percent': round((micro_count / 2) * 100, 1) if micro_count > 0 else 0},
+        'arm': {'used_ocpus': total_ocpus, 'limit_ocpus': 2, 'remaining_ocpus': ocpus_remaining, 'used_memory_gb': total_memory, 'limit_memory_gb': 12, 'remaining_memory_gb': memory_remaining, 'instances': arm_instances, 'ocpu_percent': round((total_ocpus / 2) * 100, 1) if total_ocpus > 0 else 0, 'memory_percent': round((total_memory / 12) * 100, 1) if total_memory > 0 else 0},
+        'all_instances': all_instances
+    }
+
+@app.route('/api/status', methods=['GET'])
+@require_auth
+def get_status():
+    with automation_lock:
+        return jsonify({'success': True, 'running': automation_running, 'shape': automation_shape})
+
+@app.route('/api/auto-launch-loop', methods=['POST'])
+@require_auth
+def auto_launch():
+    global automation_running, tg_live_enabled, tg_live_bot_token, tg_live_chat_id
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    try:
+        oci.config.validate_config(config)
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+    requested_shape = data.get('shape', '')
+    bot_token = data.get('telegram_bot_token', '').strip()
+    chat_id = data.get('telegram_chat_id', '').strip()
+    enable_live = data.get('telegram_live_log', False)
+    with tg_live_lock:
+        tg_live_enabled = bool(enable_live and bot_token and chat_id)
+        tg_live_bot_token = bot_token if enable_live else None
+        tg_live_chat_id = chat_id if enable_live else None
+        tg_live_last_sent = 0
+    if enable_live and (not bot_token or not chat_id):
+        return jsonify({'success': False, 'error': 'Telegram live log enabled but bot token or chat ID is missing'})
+    with automation_lock:
+        if automation_running:
+            if automation_shape and automation_shape != requested_shape:
+                return jsonify({'success': False, 'error': f"A provisioning loop is already running for shape '{automation_shape}'. Stop it first before starting '{requested_shape}'."})
+            return jsonify({'success': False, 'error': 'A provisioning loop is already running.'})
+        automation_running = True
+        automation_shape = requested_shape
+        stop_event.clear()
+    try:
+        compute_client = oci.core.ComputeClient(config)
+        network_client = oci.core.VirtualNetworkClient(config)
+        identity_client = oci.identity.IdentityClient(config)
+        retry_delay = int(data.get('retry_delay', 60))
+        if retry_delay < 10:
+            retry_delay = 10
+        randomize_delay = data.get('randomize_delay', False)
+        random_min = int(data.get('random_min', 25))
+        random_max = int(data.get('random_max', 60))
+        thread = threading.Thread(
+            target=run_automated_creation,
+            args=(config, data, compute_client, network_client, identity_client,
+                  retry_delay, randomize_delay, random_min, random_max,
+                  data.get('telegram_bot_token'), data.get('telegram_chat_id'),
+                  get_current_tz()),
+            daemon=True
+        )
+        thread.start()
+        return jsonify({'success': True, 'message': 'Provisioning loop started.' + (' Live Telegram logging enabled.' if tg_live_enabled else '')})
+    except Exception as e:
+        with automation_lock:
+            automation_running = False
+            automation_shape = None
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+
+@app.route('/api/stop-loop', methods=['POST'])
+@require_auth
+def stop_loop():
+    global tg_live_enabled
+    stop_event.set()
+    with tg_live_lock:
+        tg_live_enabled = False
+    return jsonify({'success': True, 'message': 'Stop signal sent.'})
+
+@app.route('/api/logs', methods=['GET'])
+@require_auth
+def fetch_live_logs():
+    try:
+        offset = max(0, int(request.args.get('offset', 0)))
+    except (TypeError, ValueError):
+        offset = 0
+    with logs_lock:
+        batch = global_logs[offset:]
+        total = len(global_logs)
+    return jsonify({'logs': batch, 'next_offset': total})
+
+@app.route('/api/test-telegram', methods=['POST'])
+@require_auth
+def test_telegram():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    bot_token = data.get('bot_token', '').strip()
+    chat_id = data.get('chat_id', '').strip()
+    if not bot_token or not chat_id:
+        return jsonify({'success': False, 'error': 'Bot token and chat ID are required'})
+    user_time = format_user_time(tz_name=get_current_tz())
+    ok, err = send_telegram_message(
+        bot_token, chat_id,
+        f"&#9989; <b>OCI Instance loop Connected</b>\n\nYour Telegram alerts are now active.\n<b>Time:</b> {user_time}\n\nYou will receive notifications when provisioning succeeds or fails.",
+        get_current_tz()
+    )
+    if ok:
+        return jsonify({'success': True, 'message': 'Test message sent successfully'})
+    return jsonify({'success': False, 'error': err})
+
+@app.route('/api/send-telegram', methods=['POST'])
+@require_auth
+def send_telegram():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    ok, err = send_telegram_message(
+        data.get('bot_token'), data.get('chat_id'), data.get('message', ''), get_current_tz()
+    )
+    return jsonify({'success': ok, 'error': err})
+
+@app.route('/api/list-instances', methods=['POST'])
+@require_auth
+def api_list_instances():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    try:
+        oci.config.validate_config(config)
+        compute_client = oci.core.ComputeClient(config)
+        identity_client = oci.identity.IdentityClient(config)
+        instances = list_all_instances(config, compute_client, identity_client)
+        return jsonify({'success': True, 'instances': instances})
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+
+@app.route('/api/delete-instance', methods=['POST'])
+@require_auth
+def api_delete_instance():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    instance_id = data.get('instance_id')
+    if not instance_id:
+        return jsonify({'success': False, 'error': 'instance_id required'})
+    try:
+        oci.config.validate_config(config)
+        compute_client = oci.core.ComputeClient(config)
+        try:
+            inst = compute_client.get_instance(instance_id=instance_id).data
+            name = inst.display_name
+        except:
+            name = instance_id[:20]
+        ok, err = terminate_instance(compute_client, instance_id)
+        if ok:
+            add_log(f"Instance '{name}' ({instance_id[:20]}...) termination initiated.")
+            return jsonify({'success': True, 'message': f"Instance '{name}' termination initiated"})
+        else:
+            return jsonify({'success': False, 'error': err})
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+
+@app.route('/api/reboot-instance', methods=['POST'])
+@require_auth
+def api_reboot_instance():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    instance_id = data.get('instance_id')
+    if not instance_id:
+        return jsonify({'success': False, 'error': 'instance_id required'})
+    try:
+        oci.config.validate_config(config)
+        compute_client = oci.core.ComputeClient(config)
+        try:
+            inst = compute_client.get_instance(instance_id=instance_id).data
+            name = inst.display_name
+        except:
+            name = instance_id[:20]
+        compute_client.instance_action(instance_id=instance_id, action='RESET')
+        add_log(f"Instance '{name}' ({instance_id[:20]}...) reboot initiated.")
+        return jsonify({'success': True, 'message': f"Instance '{name}' reboot initiated"})
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+
+@app.route('/api/delete-all-instances', methods=['POST'])
+@require_auth
+def api_delete_all_instances():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    try:
+        oci.config.validate_config(config)
+        compute_client = oci.core.ComputeClient(config)
+        identity_client = oci.identity.IdentityClient(config)
+        instances = list_all_instances(config, compute_client, identity_client)
+        if not instances:
+            return jsonify({'success': True, 'message': 'No instances to delete', 'deleted': 0})
+        deleted = 0
+        failed = []
+        for inst in instances:
+            ok, err = terminate_instance(compute_client, inst['id'])
+            if ok:
+                add_log(f"Terminating '{inst['name']}' ({inst['id'][:20]}...)")
+                deleted += 1
+            else:
+                failed.append({'name': inst['name'], 'error': err})
+        return jsonify({'success': True, 'message': f"Initiated termination for {deleted} instance(s)", 'deleted': deleted, 'failed': failed})
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+
+def get_instance_public_ip(config, compute_client, network_client, instance_id):
+    try:
+        for _ in range(30):
+            inst = compute_client.get_instance(instance_id=instance_id).data
+            if inst.lifecycle_state == 'RUNNING':
+                break
+            if inst.lifecycle_state in ('TERMINATED', 'TERMINATING'):
+                return None, 'Instance terminated'
+            time.sleep(2)
+        attachments = compute_client.list_vnic_attachments(compartment_id=config['tenancy'], instance_id=instance_id).data
+        for att in attachments:
+            if getattr(att, 'lifecycle_state', '') == 'ATTACHED':
+                vnic = network_client.get_vnic(vnic_id=att.vnic_id).data
+                if vnic.public_ip:
+                    return vnic.public_ip, None
+        return None, 'No public IP assigned'
+    except Exception as e:
+        return None, str(e)
+
+def list_all_instances(config, compute_client, identity_client, network_client=None):
+    tenancy = config['tenancy']
+    instances = compute_client.list_instances(compartment_id=tenancy).data
+    result = []
+    if network_client is None:
+        network_client = oci.core.VirtualNetworkClient(config)
+    for inst in instances:
+        if inst.lifecycle_state in ('TERMINATED', 'TERMINATING'):
+            continue
+        shape = inst.shape
+        ocpus = None
+        memory = None
+        public_ip = None
+        if hasattr(inst, 'shape_config') and inst.shape_config:
+            ocpus = inst.shape_config.ocpus
+            memory = inst.shape_config.memory_in_gbs
+        try:
+            attachments = compute_client.list_vnic_attachments(compartment_id=tenancy, instance_id=inst.id).data
+            for att in attachments:
+                if getattr(att, 'lifecycle_state', '') == 'ATTACHED':
+                    vnic = network_client.get_vnic(vnic_id=att.vnic_id).data
+                    if vnic.public_ip:
+                        public_ip = vnic.public_ip
+                        break
+        except Exception:
+            pass
+        result.append({
+            'id': inst.id, 'name': inst.display_name, 'shape': shape,
+            'state': inst.lifecycle_state, 'ocpus': ocpus, 'memory': memory,
+            'public_ip': public_ip,
+            'time_created': inst.time_created.isoformat() if inst.time_created else None,
+            'availability_domain': inst.availability_domain
+        })
+    return result
+
+def terminate_instance(compute_client, instance_id):
+    try:
+        compute_client.terminate_instance(instance_id=instance_id)
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+def get_oci_username(config, identity_client):
+    try:
+        user_ocid = config.get('user')
+        if not user_ocid:
+            add_log("Username detection skipped: no user OCID in config")
+            return None
+        add_log(f"Fetching user info from Identity API...")
+        user = identity_client.get_user(user_id=user_ocid).data
+        name = getattr(user, 'name', None)
+        email = getattr(user, 'email', None)
+        desc = getattr(user, 'description', None)
+        if name and email:
+            result = f"{name} ({email})"
+        elif name:
+            result = name
+        elif email:
+            result = email
+        elif desc and desc != user_ocid:
+            result = desc
+        else:
+            result = user_ocid
+        add_log(f"Detected OCI user: {result}")
+        return result
+    except oci.exceptions.ServiceError as e:
+        add_log(f"Identity API error (status {e.status}): {e.message}")
+        return None
+    except Exception as e:
+        add_log(f"Error fetching user info: {str(e)}")
+        return None
+
+def send_telegram_message(bot_token, chat_id, message, tz_name=None):
+    if not bot_token or not chat_id:
+        return False, "Missing bot token or chat ID"
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+        response = requests.post(url, json=payload, timeout=10)
+        data = response.json()
+        if data.get("ok"):
+            return True, "Message sent"
+        else:
+            return False, data.get("description", "Unknown Telegram error")
+    except Exception as e:
+        return False, str(e)
+
+# Simplified automated creation (original preserved in logic)
+def run_automated_creation(config, account_config, compute_client, network_client, identity_client,
+                           retry_delay=60, randomize_delay=False, random_min=25, random_max=60,
+                           telegram_bot_token=None, telegram_chat_id=None, tz_name=None):
+    global automation_running
+    set_user_tz(tz_name)
+    oci_username = None
+    target_region = config.get('region', 'unknown')
+    target_name = account_config.get('display_name', 'AlwaysFree-Bot')
+    try:
+        oci_username = get_oci_username(config, identity_client)
+        if oci_username:
+            add_log(f"OCI username detected: {oci_username}")
+    except Exception as e:
+        add_log(f"Could not detect OCI username: {str(e)}")
+    try:
+        block_client = oci.core.BlockstorageClient(config)
+        ok, err = check_free_tier_limits(config, account_config, compute_client, block_client, identity_client)
+        if not ok:
+            add_log(f"Free tier limit check failed: {err}")
+            return
+        add_log(f"Initializing infrastructure scan inside: {target_region}...")
+        ads = identity_client.list_availability_domains(compartment_id=config['tenancy']).data
+        ad_list = [ad.name for ad in ads] if ads else []
+        add_log(f"Availability domains found: {len(ad_list)} — {', '.join(ad_list)}")
+        ad_preference = account_config.get('ad_preference', '')
+        if ad_preference and ad_preference in ad_list:
+            ad_list.remove(ad_preference)
+            ad_list.insert(0, ad_preference)
+            add_log(f"Using preferred AD: {ad_preference}")
+        elif ad_preference:
+            add_log(f"Preferred AD '{ad_preference}' not found, using auto-rotation")
+        subnet_id = account_config.get('subnet_id')
+        if not subnet_id:
+            vcns = network_client.list_vcns(compartment_id=config['tenancy']).data
+            if not vcns:
+                add_log("Error: No VCN found.")
+                return
+            subnets = network_client.list_subnets(compartment_id=config['tenancy'], vcn_id=vcns[0].id).data
+            if not subnets:
+                add_log("Error: No subnet found.")
+                return
+            subnet_id = subnets[0].id
+            add_log("Auto-selected subnet: " + subnet_id[:20] + "...")
+        else:
+            add_log("Using selected subnet: " + subnet_id[:20] + "...")
+        image_id = account_config.get('image_id')
+        if not image_id:
+            add_log("Error: No OS image selected.")
+            return
+        ssh_key = account_config.get('ssh_key', '').strip()
+        if not ssh_key:
+            add_log("Error: SSH public key is required.")
+            return
+        valid_prefixes = ('ssh-rsa', 'ssh-ed25519', 'ssh-dss', 'ecdsa-sha2-nistp256',
+                          'ecdsa-sha2-nistp384', 'ecdsa-sha2-nistp521', 'sk-ssh-ed25519')
+        if not any(ssh_key.startswith(p) for p in valid_prefixes):
+            add_log("Error: SSH key does not appear to be a valid public key.")
+            return
+        boot_gb = int(account_config.get('boot_volume_gb', 50))
+        if boot_gb < 50:
+            add_log("Boot volume raised to minimum 50 GB.")
+            boot_gb = 50
+        if boot_gb > 200:
+            add_log("Boot volume capped at 200 GB (free tier total limit).")
+            boot_gb = 200
+        add_log(f"Setup Verified -> Subnet: {subnet_id[:20]}... | Image: {image_id[:20]}... | Zone: {ad_list[0] if ad_list else 'N/A'}")
+        add_log(f"Debug -> Shape: {account_config['shape']} | Boot: {boot_gb}GB | OCPUs: {account_config.get('ocpus', 'N/A')} | RAM: {account_config.get('memory', 'N/A')}GB")
+        add_log(f"Debug -> Subnet details: assign_public_ip=True")
+        shape = account_config.get('shape', '')
+        is_flex = '.Flex' in shape
+        add_log(f"Debug -> Shape='{shape}', is_flex={is_flex}")
+        shape_config = None
+        if is_flex:
+            ocpus = max(1, min(int(account_config.get('ocpus', 2)), 4))
+            memory = max(6, min(int(account_config.get('memory', 12)), 24))
+            shape_config = oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=ocpus, memory_in_gbs=memory)
+            add_log(f"Debug -> Flex shape config: ocpus={ocpus}, memory={memory}")
+        else:
+            add_log(f"Debug -> Non-flex shape, no shape_config needed")
+        instance_details = oci.core.models.LaunchInstanceDetails(
+            compartment_id=config['tenancy'],
+            availability_domain=ad_list[0] if ad_list else '',
+            shape=account_config['shape'],
+            shape_config=shape_config,
+            source_details=oci.core.models.InstanceSourceViaImageDetails(
+                image_id=image_id, boot_volume_size_in_gbs=boot_gb
+            ),
+            create_vnic_details=oci.core.models.CreateVnicDetails(
+                subnet_id=subnet_id, assign_public_ip=True
+            ),
+            metadata={"ssh_authorized_keys": ssh_key},
+            display_name=target_name
+        )
+        add_log(f"Launching provisioning loop for '{target_name}'...")
+        attempts = 0
+        success = False
+        ad_index = 0
+        if len(ad_list) > 1:
+            random.shuffle(ad_list)
+            add_log(f"AD order randomized for faster discovery: {', '.join(ad_list)}")
+        while True:
+            attempts += 1
+            if MAX_ATTEMPTS and attempts > MAX_ATTEMPTS:
+                add_log(f"Attempt limit reached ({MAX_ATTEMPTS}). Giving up.")
+                break
+            if stop_event.is_set():
+                add_log("Provisioning loop stopped by user.")
+                break
+            current_ad = ad_list[ad_index % len(ad_list)] if ad_list else ''
+            if len(ad_list) > 1:
+                add_log(f"Attempt {attempts}: trying AD '{current_ad}'...")
+            instance_details.availability_domain = current_ad
+            try:
+                add_log(f"Attempt {attempts}: sending instance launch request...")
+                response = compute_client.launch_instance(instance_details)
+                instance_id = response.data.id
+                add_log(f"SUCCESS! Instance created: {instance_id[:20]}...")
+                add_log("Fetching instance public IP...")
+                public_ip, ip_err = get_instance_public_ip(config, compute_client, network_client, instance_id)
+                if public_ip:
+                    add_log(f"Public IP: {public_ip}")
+                elif ip_err:
+                    add_log(f"Could not get public IP: {ip_err}")
+                success = True
+                if telegram_bot_token and telegram_chat_id:
+                    instance_name = account_config.get('display_name', 'AlwaysFree-Bot')
+                    shape_name = account_config.get('shape', 'Unknown')
+                    region_name = config.get('region', 'unknown')
+                    user_time = format_user_time(tz_name=get_current_tz())
+                    user_line = f"<b>User:</b> {oci_username}\n" if oci_username else ""
+                    ip_line = f"<b>Public IP:</b> {public_ip}\n" if public_ip else ""
+                    tg_msg = (
+                        f"&#9989; <b>OCI Provisioner Success!</b>\n\n"
+                        f"<b>Instance:</b> {instance_name}\n"
+                        f"<b>Shape:</b> {shape_name}\n"
+                        f"<b>Region:</b> {region_name}\n"
+                        f"{ip_line}"
+                        f"{user_line}"
+                        f"<b>Time:</b> {user_time}\n"
+                        f"<b>Status:</b> Running\n\n"
+                        f"Your Always Free instance has been successfully provisioned!"
+                    )
+                    tg_ok, tg_err = send_telegram_message(telegram_bot_token, telegram_chat_id, tg_msg, get_current_tz())
+                    if tg_ok:
+                        add_log("Telegram success alert sent.")
+                    else:
+                        add_log(f"Telegram alert failed: {tg_err}")
+                break
+            except oci.exceptions.ServiceError as e:
+                msg = str(e)
+                code = getattr(e, 'code', 'N/A')
+                status = getattr(e, 'status', 'N/A')
+                add_log(f"Debug -> ServiceError code={code}, status={status}, msg={e.message[:120]}")
+                if "Out of capacity" in msg or status in (500, 429, 503, 504):
+                    user_info = f" [user: {oci_username}]" if oci_username else ""
+                    add_log(f"Capacity busy in '{target_region}' AD '{current_ad}'.{user_info} Retrying...")
+                    if len(ad_list) > 1:
+                        ad_index += 1
+                        next_ad = ad_list[ad_index % len(ad_list)]
+                        add_log(f"Switching to next AD: '{next_ad}'")
+                elif "NotAuthorizedOrNotFound" in msg or "Authorization failed" in msg or status == 404:
+                    add_log(f"Auth/NotFound error — possible causes:")
+                    add_log(f"  1. Image {image_id[:25]}... not found in AD {current_ad}")
+                    add_log(f"  2. Shape {account_config['shape']} not available in this AD")
+                    add_log(f"  3. Subnet {subnet_id[:25]}... missing permissions")
+                    add_log(f"  4. Check OCI Console > Instances > Create — test manually")
+                    if len(ad_list) > 1:
+                        ad_index += 1
+                        add_log(f"Trying next AD...")
+                        continue
+                    break
+                else:
+                    add_log(f"OCI API error: {e.message}")
+                    if len(ad_list) > 1:
+                        ad_index += 1
+                        add_log(f"Trying next AD...")
+                        continue
+                    break
+            except (ConnectionError, OSError) as e:
+                user_info = f" [user: {oci_username}]" if oci_username else ""
+                add_log(f"Connection issue in '{target_region}': {type(e).__name__}.{user_info} Retrying...")
+            except Exception as e:
+                msg = str(e)
+                if "Remote end closed connection" in msg or "Connection aborted" in msg or "timeout" in msg.lower():
+                    user_info = f" [user: {oci_username}]" if oci_username else ""
+                    add_log(f"Network hiccup in '{target_region}': connection dropped.{user_info} Retrying...")
+                else:
+                    add_log(f"Automation engine failure: {msg}")
+                    break
+            actual_delay = retry_delay
+            if randomize_delay:
+                actual_delay = random.randint(random_min, random_max)
+                add_log(f"Dynamic retry: waiting {actual_delay}s (randomized {random_min}-{random_max}s)")
+            if stop_event.wait(actual_delay):
+                add_log("Provisioning loop stopped while waiting.")
+                break
+        if not success:
+            add_log("Provisioning loop ended without success.")
+            if telegram_bot_token and telegram_chat_id:
+                user_line = f"<b>User:</b> {oci_username}\n" if oci_username else ""
+                user_time = format_user_time(tz_name=get_current_tz())
+                tg_msg = (
+                    f"&#10060; <b>OCI Provisioner Stopped</b>\n\n"
+                    f"{user_line}"
+                    f"Loop stopped after {attempts} attempts without success.\n"
+                    f"<b>Region:</b> {config.get('region', 'unknown')}\n"
+                    f"<b>Time:</b> {user_time}"
+                )
+                send_telegram_message(telegram_bot_token, telegram_chat_id, tg_msg, get_current_tz())
+    except Exception as e:
+        msg = str(e)
+        if "Remote end closed connection" in msg or "Connection aborted" in msg:
+            add_log(f"Network connection lost. Loop ended.")
+        else:
+            add_log(f"Automation engine failure: {msg}")
+        if telegram_bot_token and telegram_chat_id:
+            user_line = f"<b>User:</b> {oci_username}\n" if oci_username else ""
+            user_time = format_user_time(tz_name=get_current_tz())
+            tg_msg = (
+                f"&#10060; <b>OCI Provisioner Error</b>\n\n"
+                f"{user_line}"
+                f"Automation engine failure:\n{msg[:200]}\n"
+                f"<b>Time:</b> {user_time}"
+            )
+            send_telegram_message(telegram_bot_token, telegram_chat_id, tg_msg, get_current_tz())
+    finally:
+        with automation_lock:
+            automation_running = False
+            automation_shape = None
+
+# =====================================================================
+# NEW BOOT VOLUME MANAGEMENT FUNCTIONS (Full Integration)
+# =====================================================================
+
+# Helper: get boot volume attachments for an instance
+@app.route('/api/list-boot-volumes', methods=['POST'])
+@require_auth
+def api_list_boot_volumes():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    instance_id = data.get('instance_id', '').strip() or None
+    try:
+        oci.config.validate_config(config)
+        compute_client = oci.core.ComputeClient(config)
+        block_client = oci.core.BlockstorageClient(config)
+        tenancy = config['tenancy']
+        volumes = []
+        # List boot volume attachments
+        attachments = compute_client.list_boot_volume_attachments(compartment_id=tenancy).data
+        for att in attachments:
+            # Filter by instance if requested
+            if instance_id and att.instance_id != instance_id:
+                continue
+            try:
+                vol = block_client.get_boot_volume(boot_volume_id=att.boot_volume_id).data
+                volumes.append({
+                    'id': vol.id,
+                    'display_name': vol.display_name,
+                    'size_in_gbs': vol.size_in_gbs,
+                    'lifecycle_state': vol.lifecycle_state,
+                    'instance_id': att.instance_id,
+                    'instance_name': data.get('instance_name_lookup', {}).get(att.instance_id, att.instance_id[:20] + '...'),
+                    'attachment_state': getattr(att, 'lifecycle_state', 'UNKNOWN'),
+                    'time_created': vol.time_created.isoformat() if vol.time_created else None
+                })
+            except Exception:
+                pass
+        # Also list unattached boot volumes
+        unattached = block_client.list_boot_volumes(compartment_id=tenancy).data
+        for vol in unattached:
+            if vol.lifecycle_state == 'TERMINATED':
+                continue
+            # Check if this volume is already in attachments
+            if any(v['id'] == vol.id for v in volumes):
+                continue
+            volumes.append({
+                'id': vol.id,
+                'display_name': vol.display_name,
+                'size_in_gbs': vol.size_in_gbs,
+                'lifecycle_state': vol.lifecycle_state,
+                'instance_id': None,
+                'instance_name': 'Not attached',
+                'attachment_state': 'DETACHED',
+                'time_created': vol.time_created.isoformat() if vol.time_created else None
             })
-        });
-        const data = await res.json();
-        if (data.success) {
-            addLog('Replaced: ' + data.message, 'success');
-        } else {
-            addLog('Replace failed: ' + data.error, 'error');
-        }
-    } catch (err) {
-        addLog('Replace error: ' + err.message, 'error');
-    }
-}
+        return jsonify({'success': True, 'volumes': volumes, 'filtered_by_instance': instance_id})
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
 
-</script>
-<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a35b73607b11dd53',t:'MTc4ODUwODcyMw=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
-</html>
+# Detach boot volume
+@app.route('/api/detach-boot-volume', methods=['POST'])
+@require_auth
+def api_detach_boot_volume():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    instance_id = data.get('instance_id', '').strip() or None
+    boot_volume_id = data.get('boot_volume_id', '').strip() or None
+    if not instance_id or not boot_volume_id:
+        return jsonify({'success': False, 'error': 'instance_id and boot_volume_id are required'})
+    try:
+        oci.config.validate_config(config)
+        compute_client = oci.core.ComputeClient(config)
+        compute_client.detach_boot_volume(
+            instance_id=instance_id,
+            boot_volume_id=boot_volume_id
+        )
+        add_log(f"Boot volume {boot_volume_id[:20]}... detached from instance {instance_id[:20]}...")
+        return jsonify({
+            'success': True,
+            'message': f"Boot volume {boot_volume_id[:20]}... detached from instance {instance_id[:20]}...",
+            'instance_id': instance_id,
+            'boot_volume_id': boot_volume_id
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+
+# Re-attach boot volume
+@app.route('/api/attach-boot-volume', methods=['POST'])
+@require_auth
+def api_attach_boot_volume():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    instance_id = data.get('instance_id', '').strip() or None
+    boot_volume_id = data.get('boot_volume_id', '').strip() or None
+    if not instance_id or not boot_volume_id:
+        return jsonify({'success': False, 'error': 'instance_id and boot_volume_id are required'})
+    try:
+        oci.config.validate_config(config)
+        compute_client = oci.core.ComputeClient(config)
+        attach_details = oci.core.models.AttachBootVolumeDetails(
+            instance_id=instance_id,
+            boot_volume_id=boot_volume_id,
+            display_name=f"attach-{boot_volume_id[-8:]}"
+        )
+        compute_client.attach_boot_volume(attach_boot_volume_details=attach_details)
+        add_log(f"Boot volume {boot_volume_id[:20]}... attached to instance {instance_id[:20]}...")
+        return jsonify({
+            'success': True,
+            'message': f"Boot volume {boot_volume_id[:20]}... attached to instance {instance_id[:20]}...",
+            'instance_id': instance_id,
+            'boot_volume_id': boot_volume_id
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+
+# Delete boot volume
+@app.route('/api/delete-boot-volume', methods=['POST'])
+@require_auth
+def api_delete_boot_volume():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    boot_volume_id = data.get('boot_volume_id', '').strip() or None
+    if not boot_volume_id:
+        return jsonify({'success': False, 'error': 'boot_volume_id is required'})
+    try:
+        oci.config.validate_config(config)
+        block_client = oci.core.BlockstorageClient(config)
+        # Ensure it's detached first (optional guard)
+        block_client.delete_boot_volume(boot_volume_id=boot_volume_id)
+        add_log(f"Boot volume {boot_volume_id[:20]}... deleted.")
+        return jsonify({
+            'success': True,
+            'message': f"Boot volume {boot_volume_id[:20]}... deleted successfully.",
+            'boot_volume_id': boot_volume_id
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+
+# Replace boot volume (detach old + delete old + attach new? Or replace on instance)
+# Implementation: if new_volume specified -> attach new, then detach old; else just replace by detaching current and attaching a backup/new
+@app.route('/api/replace-boot-volume', methods=['POST'])
+@require_auth
+def api_replace_boot_volume():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    config = build_config(data)
+    instance_id = data.get('instance_id', '').strip() or None
+    new_volume_id = data.get('new_boot_volume_id', '').strip() or None
+    old_volume_id = data.get('old_boot_volume_id', '').strip() or None
+    if not instance_id:
+        return jsonify({'success': False, 'error': 'instance_id is required'})
+    # If no old specified, try to find current boot volume attachment
+    try:
+        oci.config.validate_config(config)
+        compute_client = oci.core.ComputeClient(config)
+        block_client = oci.core.BlockstorageClient(config)
+        if not old_volume_id:
+            attachments = compute_client.list_boot_volume_attachments(compartment_id=config['tenancy'], instance_id=instance_id).data
+            if attachments:
+                old_volume_id = attachments[0].boot_volume_id
+        # If new_volume_id provided: attach new first (if not already attached), then detach old
+        if new_volume_id:
+            # Check if new volume is already attached to this instance
+            already_attached = False
+            for att in compute_client.list_boot_volume_attachments(compartment_id=config['tenancy'], instance_id=instance_id).data:
+                if att.boot_volume_id == new_volume_id:
+                    already_attached = True
+                    break
+            if not already_attached:
+                attach_details = oci.core.models.AttachBootVolumeDetails(
+                    instance_id=instance_id,
+                    boot_volume_id=new_volume_id,
+                    display_name=f"replace-{new_volume_id[-8:]}"
+                )
+                compute_client.attach_boot_volume(attach_boot_volume_details=attach_details)
+                add_log(f"New boot volume {new_volume_id[:20]}... attached to instance {instance_id[:20]}...")
+        # Detach old
+        if old_volume_id:
+            # Check attachment exists
+            attachments = compute_client.list_boot_volume_attachments(compartment_id=config['tenancy'], instance_id=instance_id).data
+            if any(att.boot_volume_id == old_volume_id for att in attachments):
+                compute_client.detach_boot_volume(instance_id=instance_id, boot_volume_id=old_volume_id)
+                add_log(f"Old boot volume {old_volume_id[:20]}... detached from instance {instance_id[:20]}...")
+            else:
+                add_log(f"Old boot volume {old_volume_id[:20]}... not attached (already detached).")
+        return jsonify({
+            'success': True,
+            'message': f"Boot volume replacement completed for instance {instance_id[:20]}...",
+            'instance_id': instance_id,
+            'old_volume_id': old_volume_id,
+            'new_volume_id': new_volume_id
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error_str(e)})
+
+# =====================================================================
+# END NEW FUNCTIONS
+# =====================================================================
+
+if __name__ == '__main__':
+    _port_raw = os.environ.get("PORT", "5000")
+    try:
+        port = int(_port_raw)
+    except ValueError:
+        print(f"WARNING: PORT value '{_port_raw}' is not a valid integer. Falling back to 5000.")
+        port = 5000
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
