@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OCI Sniper v5</title>
+    <title>OCI Provisioner Portal v2</title>
     <style>
         :root {
             --bg: #0f0f12;
@@ -349,8 +349,8 @@
     <div class="container">
         <div class="header">
             <div>
-                <h1>🎯 OCI Sniper</h1>
-                <p>Always Free capacity hunter · v5</p>
+                <h1>OCI Provisioner Portal</h1>
+                <p>Always free tier automation v2</p>
             </div>
             <div style="display:flex;align-items:center;gap:8px;">
                 <button onclick="clearAll()" style="padding:5px 12px;border:1px solid var(--border);border-radius:20px;background:var(--surface-raised);color:var(--text-muted);font-size:11px;font-weight:500;cursor:pointer;">Clear all</button>
@@ -592,8 +592,6 @@
     <input type="hidden" id="cfgTenancy">
     <input type="hidden" id="cfgFingerprint">
     <input type="hidden" id="cfgRegion">
-    <label title="Keep OCI identifiers in this browser's localStorage. Private key is NEVER saved."><input type="checkbox" id="rememberCreds"> Remember account info</label>
-    <button type="button" onclick="wipeCreds()" style="display:none;" id="wipeCredsBtn"></button>
     <textarea id="cfgKey" style="display:none;"></textarea>
 
     <script>
@@ -604,7 +602,6 @@
     let statusInterval = null;
     let userTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
     addLog('Timezone detected: ' + userTimezone, 'info');
-    loadCreds();
 
     function togglePanel(name) {
         const body = document.getElementById(name + 'Body');
@@ -613,34 +610,6 @@
         chev.classList.toggle('collapsed');
     }
 
-    // ---- Credential persistence (localStorage, opt-in) ----
-    const CFG_FIELDS = ['cfgUser', 'cfgTenancy', 'cfgFingerprint', 'cfgRegion'];
-    function saveCreds() {
-        try {
-            if (!document.getElementById('rememberCreds') || !document.getElementById('rememberCreds').checked) return;
-            const blob = {};
-            CFG_FIELDS.forEach(id => { const el = document.getElementById(id); if (el) blob[id] = el.value; });
-            localStorage.setItem('oci_prov_cfg', JSON.stringify(blob));
-        } catch (e) {}
-    }
-    function loadCreds() {
-        try {
-            const raw = localStorage.getItem('oci_prov_cfg');
-            if (!raw) return;
-            const blob = JSON.parse(raw);
-            CFG_FIELDS.forEach(id => { const el = document.getElementById(id); if (el && blob[id]) el.value = blob[id]; });
-            const cb = document.getElementById('rememberCreds');
-            if (cb) cb.checked = true;
-            parseConfig && parseConfig();
-        } catch (e) {}
-    }
-    function wipeCreds() {
-        try { localStorage.removeItem('oci_prov_cfg'); } catch (e) {}
-        CFG_FIELDS.forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
-        const cb = document.getElementById('rememberCreds');
-        if (cb) cb.checked = false;
-        addLog('Saved credentials wiped', 'warn');
-    }
     function parseConfig() {
         const text = document.getElementById('rawConfig').value;
         const user = text.match(/user\s*=\s*(ocid1\.user\.[^\s#\n,]+)/i);
@@ -651,7 +620,6 @@
         if (tenancy) document.getElementById('cfgTenancy').value = tenancy[1].trim();
         if (fp) document.getElementById('cfgFingerprint').value = fp[1].trim();
         if (region) document.getElementById('cfgRegion').value = region[1].trim();
-        saveCreds();
     }
 
     function handleConfigFile() {
