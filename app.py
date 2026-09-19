@@ -9,27 +9,17 @@ import requests
 from flask import Flask, render_template, request, jsonify, Response
 import oci
 
-# ---- Timezone Configuration (User device timezone) ----
-from zoneinfo import ZoneInfo, available_timezones
-
-def get_user_tz(tz_name=None):
-    if tz_name and tz_name in available_timezones():
-        return ZoneInfo(tz_name)
-    return ZoneInfo("UTC")
-
-def get_user_time(tz_name=None):
-    tz = get_user_tz(tz_name)
-    return datetime.datetime.now(tz)
-
-def format_user_time(dt=None, tz_name=None):
-    if dt is None:
-        dt = get_user_time(tz_name)
-    return dt.strftime('%Y-%m-%d %H:%M:%S')
-
-# Legacy alias
+# ---- Timezone Configuration (Phnom Penh - ICT, UTC+7) ----
+from zoneinfo import ZoneInfo
 PHNOM_PENH_TZ = ZoneInfo("Asia/Phnom_Penh")
-get_phnom_penh_time = lambda: get_user_time("Asia/Phnom_Penh")
-format_phnom_penh_time = lambda dt=None: format_user_time(dt, "Asia/Phnom_Penh")
+
+def get_phnom_penh_time():
+    return datetime.datetime.now(PHNOM_PENH_TZ)
+
+def format_phnom_penh_time(dt=None):
+    if dt is None:
+        dt = get_phnom_penh_time()
+    return dt.strftime('%Y-%m-%d %H:%M:%S')
 
 app = Flask(__name__)
 
@@ -58,48 +48,46 @@ automation_running = False
 automation_shape = None
 stop_event = threading.Event()
 
-# Per-request timezone
-_user_tz = threading.local()
-
-def set_user_tz(tz_name):
-    _user_tz.name = tz_name
-
-def get_current_tz():
-    return getattr(_user_tz, 'name', None)
-
 # ---- Telegram live log settings ----
 tg_live_lock = threading.Lock()
 tg_live_enabled = False
 tg_live_bot_token = None
 tg_live_chat_id = None
 tg_live_last_sent = 0
-tg_live_min_interval = 3
+tg_live_min_interval = 3  # seconds between live log sends
 
 
 def add_log(message):
-    tz = get_current_tz()
-    timestamp = format_user_time(tz_name=tz)
+    timestamp = format_phnom_penh_time()
     line = f"[{timestamp}] {message}"
     print(line)
     with logs_lock:
         global_logs.append(line)
         if len(global_logs) > 200:
             global_logs.pop(0)
+
+    # Send to Telegram if live logging is enabled
     _send_live_log_to_telegram(line)
 
 def _send_live_log_to_telegram(line):
+    """Send a single log line to Telegram if live logging is enabled. Throttled to avoid rate limits."""
     global tg_live_enabled, tg_live_bot_token, tg_live_chat_id, tg_live_last_sent
+
     with tg_live_lock:
         if not tg_live_enabled or not tg_live_bot_token or not tg_live_chat_id:
             return
+
         now = time.time()
         if now - tg_live_last_sent < tg_live_min_interval:
             return
         tg_live_last_sent = now
+
+    # Send outside the lock to avoid blocking
     try:
         clean_msg = line
         if len(clean_msg) > 4000:
             clean_msg = clean_msg[:4000] + "..."
+
         url = f"https://api.telegram.org/bot{tg_live_bot_token}/sendMessage"
         payload = {
             "chat_id": tg_live_chat_id,
@@ -137,11 +125,6 @@ def require_auth(f):
     return decorated
 
 
-@app.route('/health')
-def health():
-    return jsonify({'status': 'ok'}), 200
-
-
 @app.route('/')
 def home():
     try:
@@ -154,7 +137,6 @@ def home():
 @require_auth
 def list_available_images():
     data = request.json or {}
-    set_user_tz(data.get('timezone'))
     config = build_config(data)
     shape = data.get('shape')
     all_os_mode = data.get('all_os_mode', False)
@@ -162,23 +144,29 @@ def list_available_images():
     try:
         oci.config.validate_config(config)
         compute = oci.core.ComputeClient(config)
+
         kwargs = {'compartment_id': config['tenancy']}
         if shape:
             kwargs['shape'] = shape
+
         images = compute.list_images(**kwargs).data
+
         min_dt = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc).astimezone(PHNOM_PENH_TZ)
         images = sorted(
             images,
             key=lambda i: i.time_created.astimezone(PHNOM_PENH_TZ) if i.time_created else min_dt,
             reverse=True
         )
+
         valid = []
         for img in images:
             if getattr(img, 'lifecycle_state', '') != 'AVAILABLE':
                 continue
+
             os_name = (getattr(img, 'operating_system', '') or '').lower()
             version = (getattr(img, 'operating_system_version', '') or '').strip()
             display_name = (img.display_name or '').lower()
+
             if not all_os_mode:
                 if 'ubuntu' not in os_name:
                     continue
@@ -194,6 +182,7 @@ def list_available_images():
                         major = int(m.group(1))
                 if major < 18:
                     continue
+
             valid.append({
                 'id': img.id,
                 'name': img.display_name or f"{getattr(img, 'operating_system', 'Unknown')} {version}",
@@ -201,7 +190,9 @@ def list_available_images():
                 'os': getattr(img, 'operating_system', 'Unknown'),
                 'os_version': version
             })
+
         return jsonify({'success': True, 'images': valid[:50]})
+
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
@@ -210,20 +201,26 @@ def list_available_images():
 @require_auth
 def list_available_subnets():
     data = request.json or {}
-    set_user_tz(data.get('timezone'))
     config = build_config(data)
+
     try:
         oci.config.validate_config(config)
         network_client = oci.core.VirtualNetworkClient(config)
         identity_client = oci.identity.IdentityClient(config)
+
         tenancy = config['tenancy']
         ads = identity_client.list_availability_domains(compartment_id=tenancy).data
+
         vcns = network_client.list_vcns(compartment_id=tenancy).data
         if not vcns:
             return jsonify({'success': False, 'error': 'No VCNs found in this tenancy'})
+
         all_subnets = []
         for vcn in vcns:
-            subnets = network_client.list_subnets(compartment_id=tenancy, vcn_id=vcn.id).data
+            subnets = network_client.list_subnets(
+                compartment_id=tenancy,
+                vcn_id=vcn.id
+            ).data
             for sn in subnets:
                 if getattr(sn, 'lifecycle_state', '') != 'AVAILABLE':
                     continue
@@ -237,160 +234,9 @@ def list_available_subnets():
                     'public': getattr(sn, 'prohibit_public_ip_on_vnic', False) == False,
                     'dns': sn.dns_label or 'N/A'
                 })
+
         return jsonify({'success': True, 'subnets': all_subnets})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
 
-
-@app.route('/api/list-shapes', methods=['POST'])
-@require_auth
-def list_available_shapes():
-    data = request.json or {}
-    set_user_tz(data.get('timezone'))
-    config = build_config(data)
-    try:
-        oci.config.validate_config(config)
-        compute_client = oci.core.ComputeClient(config)
-        identity_client = oci.identity.IdentityClient(config)
-        tenancy = config['tenancy']
-        ads = identity_client.list_availability_domains(compartment_id=tenancy).data
-        all_shapes = []
-        seen = set()
-        ad_availability = {}
-        for ad in ads:
-            try:
-                shapes = compute_client.list_shapes(compartment_id=tenancy, availability_domain=ad.name).data
-                for shape in shapes:
-                    name = shape.shape
-                    if name in seen:
-                        ad_availability.setdefault(name, []).append(ad.name)
-                        continue
-                    seen.add(name)
-                    ad_availability[name] = [ad.name]
-                    all_shapes.append({
-                        'name': name,
-                        'ocpus': getattr(shape, 'ocpus', None),
-                        'memory': getattr(shape, 'memory_in_gbs', None),
-                        'processor': getattr(shape, 'processor_description', None),
-                        'is_flex': 'Flex' in name,
-                        'is_burstable': getattr(shape, 'is_burstable', False),
-                        'max_vnic_attachment': getattr(shape, 'networking_bandwidth_in_gbps', None)
-                    })
-            except Exception:
-                continue
-        for s in all_shapes:
-            s['ads'] = list(set(ad_availability.get(s['name'], [])))
-        free_tier = {'VM.Standard.A1.Flex', 'VM.Standard.E2.1.Micro'}
-        all_shapes.sort(key=lambda s: (s['name'] not in free_tier, s['name']))
-        return jsonify({'success': True, 'shapes': all_shapes, 'ad_count': len(ads)})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
-
-
-@app.route('/api/create-subnet', methods=['POST'])
-@require_auth
-def create_subnet():
-    data = request.json or {}
-    set_user_tz(data.get('timezone'))
-    config = build_config(data)
-    vcn_cidr = data.get('vcn_cidr', '10.0.0.0/16').strip()
-    subnet_cidr = data.get('subnet_cidr', '10.0.0.0/24').strip()
-    subnet_name = data.get('subnet_name', 'provisioner-subnet').strip()
-    vcn_name = data.get('vcn_name', 'provisioner-vcn').strip()
-    try:
-        oci.config.validate_config(config)
-        network_client = oci.core.VirtualNetworkClient(config)
-        identity_client = oci.identity.IdentityClient(config)
-        tenancy = config['tenancy']
-        ads = identity_client.list_availability_domains(compartment_id=tenancy).data
-        target_ad = ads[0].name if ads else None
-        vcns = network_client.list_vcns(compartment_id=tenancy).data
-        vcn = None
-        if vcns:
-            vcn = vcns[0]
-            add_log(f"Using existing VCN: {vcn.display_name} ({vcn.id[:20]}...)")
-        else:
-            add_log(f"Creating VCN '{vcn_name}' with CIDR {vcn_cidr}...")
-            vcn = network_client.create_vcn(
-                create_vcn_details=oci.core.models.CreateVcnDetails(
-                    compartment_id=tenancy, cidr_block=vcn_cidr,
-                    display_name=vcn_name, dns_label='provvcn'
-                )
-            ).data
-            add_log(f"VCN created: {vcn.id[:20]}...")
-            time.sleep(2)
-        existing_subnets = network_client.list_subnets(compartment_id=tenancy, vcn_id=vcn.id).data
-        if existing_subnets:
-            subnet = existing_subnets[0]
-            return jsonify({
-                'success': True, 'created': False, 'message': 'Subnet already exists',
-                'subnet': {
-                    'id': subnet.id, 'name': subnet.display_name,
-                    'cidr': subnet.cidr_block, 'vcn_name': vcn.display_name,
-                    'vcn_id': vcn.id, 'ad': subnet.availability_domain or 'Regional',
-                    'public': getattr(subnet, 'prohibit_public_ip_on_vnic', False) == False
-                }
-            })
-        igws = network_client.list_internet_gateways(compartment_id=tenancy, vcn_id=vcn.id).data
-        igw = None
-        for g in igws:
-            if getattr(g, 'lifecycle_state', '') == 'AVAILABLE':
-                igw = g
-                break
-        if not igw:
-            add_log("Creating Internet Gateway...")
-            igw = network_client.create_internet_gateway(
-                create_internet_gateway_details=oci.core.models.CreateInternetGatewayDetails(
-                    compartment_id=tenancy, vcn_id=vcn.id,
-                    display_name='provisioner-igw', is_enabled=True
-                )
-            ).data
-            add_log(f"Internet Gateway created: {igw.id[:20]}...")
-            time.sleep(1)
-        else:
-            add_log(f"Using existing Internet Gateway: {igw.id[:20]}...")
-        route_tables = network_client.list_route_tables(compartment_id=tenancy, vcn_id=vcn.id).data
-        if route_tables:
-            rt = route_tables[0]
-            routes = list(getattr(rt, 'route_rules', []))
-            has_internet_route = any(
-                getattr(r, 'destination', '') == '0.0.0.0/0' and getattr(r, 'network_entity_id', '') == igw.id
-                for r in routes
-            )
-            if not has_internet_route:
-                add_log("Adding default route to Internet Gateway...")
-                routes.append(oci.core.models.RouteRule(
-                    destination='0.0.0.0/0', destination_type='CIDR_BLOCK', network_entity_id=igw.id
-                ))
-                network_client.update_route_table(
-                    rt_id=rt.id,
-                    update_route_table_details=oci.core.models.UpdateRouteTableDetails(route_rules=routes)
-                )
-                add_log("Route table updated.")
-        add_log(f"Creating subnet '{subnet_name}' with CIDR {subnet_cidr}...")
-        create_subnet_details = oci.core.models.CreateSubnetDetails(
-            compartment_id=tenancy, vcn_id=vcn.id, cidr_block=subnet_cidr,
-            display_name=subnet_name, dns_label='provsubnet',
-            prohibit_public_ip_on_vnic=False
-        )
-        if target_ad:
-            create_subnet_details.availability_domain = target_ad
-        subnet = network_client.create_subnet(create_subnet_details=create_subnet_details).data
-        add_log(f"Subnet created: {subnet.id[:20]}...")
-        for _ in range(10):
-            sn = network_client.get_subnet(subnet_id=subnet.id).data
-            if getattr(sn, 'lifecycle_state', '') == 'AVAILABLE':
-                break
-            time.sleep(1)
-        return jsonify({
-            'success': True, 'created': True, 'message': 'Subnet created successfully',
-            'subnet': {
-                'id': subnet.id, 'name': subnet.display_name,
-                'cidr': subnet.cidr_block, 'vcn_name': vcn.display_name,
-                'vcn_id': vcn.id, 'ad': subnet.availability_domain or 'Regional',
-                'public': getattr(subnet, 'prohibit_public_ip_on_vnic', False) == False
-            }
-        })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
@@ -398,24 +244,29 @@ def create_subnet():
 @app.route('/api/test-launch', methods=['POST'])
 @require_auth
 def test_launch():
+    """Debug endpoint: validates launch params without actually creating instance."""
     data = request.json or {}
-    set_user_tz(data.get('timezone'))
     config = build_config(data)
+
     try:
         oci.config.validate_config(config)
         compute_client = oci.core.ComputeClient(config)
         network_client = oci.core.VirtualNetworkClient(config)
         identity_client = oci.identity.IdentityClient(config)
         block_client = oci.core.BlockstorageClient(config)
+
         tenancy = config['tenancy']
         ads = identity_client.list_availability_domains(compartment_id=tenancy).data
         vcns = network_client.list_vcns(compartment_id=tenancy).data
         subnets = []
         if vcns:
             subnets = network_client.list_subnets(compartment_id=tenancy, vcn_id=vcns[0].id).data
+
         image_id = data.get('image_id')
         shape = data.get('shape')
         subnet_id = data.get('subnet_id')
+
+        # Validate image exists
         image_valid = False
         image_details = None
         if image_id:
@@ -431,6 +282,8 @@ def test_launch():
                 }
             except Exception as e:
                 image_details = {'error': str(e)[:100]}
+
+        # Validate subnet
         subnet_valid = False
         subnet_details = None
         if subnet_id:
@@ -446,6 +299,8 @@ def test_launch():
                 }
             except Exception as e:
                 subnet_details = {'error': str(e)[:100]}
+
+        # Check shape compatibility with image
         shape_compat = []
         if image_id:
             try:
@@ -453,7 +308,10 @@ def test_launch():
                 shape_compat = [s.shape for s in shapes]
             except Exception as e:
                 shape_compat = ['Error: ' + str(e)[:80]]
+
+        # Free tier check
         ok, err = check_free_tier_limits(config, data, compute_client, block_client, identity_client)
+
         return jsonify({
             'success': True,
             'debug': {
@@ -472,6 +330,7 @@ def test_launch():
                 'free_tier_error': err
             }
         })
+
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
@@ -479,18 +338,23 @@ def test_launch():
 @app.route('/api/list-vnics', methods=['POST'])
 @require_auth
 def list_vnics():
+    """List VNICs (network interfaces) for debugging network setup."""
     data = request.json or {}
-    set_user_tz(data.get('timezone'))
     config = build_config(data)
     target_subnet_id = data.get('subnet_id', '').strip() or None
+
     try:
         oci.config.validate_config(config)
         compute_client = oci.core.ComputeClient(config)
         network_client = oci.core.VirtualNetworkClient(config)
         tenancy = config['tenancy']
+
+        # Pre-fetch all VCNs and subnets for name resolution
         vcns = {v.id: v for v in network_client.list_vcns(compartment_id=tenancy).data}
         subnets = {s.id: s for s in network_client.list_subnets(compartment_id=tenancy).data}
         instances = {i.id: i for i in compute_client.list_instances(compartment_id=tenancy).data}
+
+        # List all VNIC attachments in the tenancy
         vnics = []
         vnic_attachments = compute_client.list_vnic_attachments(compartment_id=tenancy).data
         for att in vnic_attachments:
@@ -498,21 +362,40 @@ def list_vnics():
                 vnic = network_client.get_vnic(vnic_id=att.vnic_id).data
                 subnet = subnets.get(vnic.subnet_id)
                 vcn = vcns.get(subnet.vcn_id) if subnet else None
+
+                # Filter by subnet if specified
                 if target_subnet_id and vnic.subnet_id != target_subnet_id:
                     continue
+
                 instance = instances.get(att.instance_id)
+
                 vnics.append({
-                    'id': vnic.id, 'display_name': vnic.display_name or 'Unnamed',
-                    'private_ip': vnic.private_ip, 'public_ip': vnic.public_ip or 'None',
-                    'subnet_id': vnic.subnet_id, 'subnet_name': subnet.display_name if subnet else 'Unknown',
-                    'vcn_id': vcn.id if vcn else 'Unknown', 'vcn_name': vcn.display_name if vcn else 'Unknown',
-                    'lifecycle_state': vnic.lifecycle_state, 'is_primary': getattr(att, 'is_primary', False),
-                    'instance_id': att.instance_id, 'instance_name': instance.display_name if instance else 'Unknown'
+                    'id': vnic.id,
+                    'display_name': vnic.display_name or 'Unnamed',
+                    'private_ip': vnic.private_ip,
+                    'public_ip': vnic.public_ip or 'None',
+                    'subnet_id': vnic.subnet_id,
+                    'subnet_name': subnet.display_name if subnet else 'Unknown',
+                    'vcn_id': vcn.id if vcn else 'Unknown',
+                    'vcn_name': vcn.display_name if vcn else 'Unknown',
+                    'lifecycle_state': vnic.lifecycle_state,
+                    'is_primary': getattr(att, 'is_primary', False),
+                    'instance_id': att.instance_id,
+                    'instance_name': instance.display_name if instance else 'Unknown'
                 })
             except Exception:
                 pass
+
+        # Build VCN summary for the dropdown
         vcn_list = [{'id': v.id, 'name': v.display_name or 'Unnamed'} for v in vcns.values()]
-        return jsonify({'success': True, 'vnics': vnics, 'vcns': vcn_list, 'filtered_by_subnet': target_subnet_id})
+
+        return jsonify({
+            'success': True,
+            'vnics': vnics,
+            'vcns': vcn_list,
+            'filtered_by_subnet': target_subnet_id
+        })
+
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
@@ -521,28 +404,33 @@ def list_vnics():
 @require_auth
 def open_firewall():
     data = request.json or {}
-    set_user_tz(data.get('timezone'))
     config = build_config(data)
     subnet_id = data.get('subnet_id')
     ports = data.get('ports', 'all')
     cidr = data.get('cidr', '0.0.0.0/0')
     direction = data.get('direction', 'ingress')
+
     if not subnet_id:
         return jsonify({'success': False, 'error': 'subnet_id required'})
+
     try:
         oci.config.validate_config(config)
         network_client = oci.core.VirtualNetworkClient(config)
+
         subnet = network_client.get_subnet(subnet_id=subnet_id).data
+
         port_list = []
         if ports == 'all' or ports == '*':
             port_list = ['all']
         else:
             port_list = [p.strip() for p in str(ports).split(',') if p.strip()]
+
         directions_to_add = []
         if direction in ('ingress', 'both'):
             directions_to_add.append('INGRESS')
         if direction in ('egress', 'both'):
             directions_to_add.append('EGRESS')
+
         nsg_ids = getattr(subnet, 'network_security_group_ids', [])
         if nsg_ids and len(nsg_ids) > 0:
             rules = []
@@ -565,6 +453,7 @@ def open_firewall():
                             ),
                             description='OCI Provisioner: ' + dir.lower() + ' port ' + port
                         ))
+
             result = network_client.add_network_security_group_security_rules(
                 network_security_group_id=nsg_ids[0],
                 add_network_security_group_security_rules_details=oci.core.models.AddNetworkSecurityGroupSecurityRulesDetails(
@@ -572,17 +461,25 @@ def open_firewall():
                 )
             )
             return jsonify({
-                'success': True, 'method': 'NSG', 'nsg_id': nsg_ids[0],
+                'success': True,
+                'method': 'NSG',
+                'nsg_id': nsg_ids[0],
                 'rules_added': len(result.data.security_rules),
-                'ports': ports, 'cidr': cidr, 'direction': direction
+                'ports': ports,
+                'cidr': cidr,
+                'direction': direction
             })
+
         sec_list_ids = getattr(subnet, 'security_list_ids', [])
         if not sec_list_ids:
             return jsonify({'success': False, 'error': 'No security list or NSG found on subnet'})
+
         sec_list = network_client.get_security_list(security_list_id=sec_list_ids[0]).data
+
         new_ingress = list(getattr(sec_list, 'ingress_security_rules', []))
         new_egress = list(getattr(sec_list, 'egress_security_rules', []))
         added = []
+
         for dir in directions_to_add:
             existing = new_ingress if dir == 'INGRESS' else new_egress
             for port in port_list:
@@ -600,7 +497,7 @@ def open_firewall():
                         added.append(dir.lower() + ':all')
                 else:
                     already = any(
-                        getattr(r, 'source' if dir == 'INGRESS' else 'destination', '') == cidr and
+                        getattr(r, 'source' if dir == 'INGRESS' else 'destination', '') == cidr and 
                         getattr(r, 'protocol', '') == '6' and
                         getattr(getattr(r, 'tcp_options', None), 'destination_port_range', None) and
                         getattr(getattr(r, 'tcp_options', None), 'destination_port_range').min == int(port)
@@ -622,19 +519,29 @@ def open_firewall():
                         )
                         existing.append(rule)
                         added.append(dir.lower() + ':' + port)
+
         if not added:
             return jsonify({'success': True, 'already_open': True, 'message': 'Rule(s) already exist', 'ports': ports, 'cidr': cidr, 'direction': direction})
+
         network_client.update_security_list(
             security_list_id=sec_list_ids[0],
             update_security_list_details=oci.core.models.UpdateSecurityListDetails(
-                ingress_security_rules=new_ingress, egress_security_rules=new_egress
+                ingress_security_rules=new_ingress,
+                egress_security_rules=new_egress
             )
         )
+
         return jsonify({
-            'success': True, 'method': 'SecurityList', 'sec_list_id': sec_list_ids[0],
-            'rules_added': len(added), 'ports_added': added,
-            'ports': ports, 'cidr': cidr, 'direction': direction
+            'success': True,
+            'method': 'SecurityList',
+            'sec_list_id': sec_list_ids[0],
+            'rules_added': len(added),
+            'ports_added': added,
+            'ports': ports,
+            'cidr': cidr,
+            'direction': direction
         })
+
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
@@ -642,30 +549,43 @@ def open_firewall():
 @app.route('/api/scan-security-rules', methods=['POST'])
 @require_auth
 def scan_security_rules():
+    """Scan existing security rules on a subnet."""
     data = request.json or {}
-    set_user_tz(data.get('timezone'))
     config = build_config(data)
     subnet_id = data.get('subnet_id')
+
     if not subnet_id:
         return jsonify({'success': False, 'error': 'subnet_id required'})
+
     try:
         oci.config.validate_config(config)
         network_client = oci.core.VirtualNetworkClient(config)
+
         subnet = network_client.get_subnet(subnet_id=subnet_id).data
+
         rules = []
+
+        # Check NSG rules
         nsg_ids = getattr(subnet, 'network_security_group_ids', [])
         for nsg_id in nsg_ids:
             nsg = network_client.get_network_security_group(network_security_group_id=nsg_id).data
             nsg_rules = network_client.list_network_security_group_security_rules(network_security_group_id=nsg_id).data
             for r in nsg_rules:
                 rules.append({
-                    'type': 'NSG', 'direction': r.direction, 'protocol': r.protocol,
-                    'source': getattr(r, 'source', 'N/A'), 'destination': getattr(r, 'destination', 'N/A'),
+                    'type': 'NSG',
+                    'direction': r.direction,
+                    'protocol': r.protocol,
+                    'source': getattr(r, 'source', 'N/A'),
+                    'destination': getattr(r, 'destination', 'N/A'),
                     'description': getattr(r, 'description', '')
                 })
+
+        # Check Security List rules
         sec_list_ids = getattr(subnet, 'security_list_ids', [])
         for sec_id in sec_list_ids:
             sec_list = network_client.get_security_list(security_list_id=sec_id).data
+
+            # Ingress rules
             for r in getattr(sec_list, 'ingress_security_rules', []):
                 tcp_opts = getattr(r, 'tcp_options', None)
                 port_range = None
@@ -673,12 +593,18 @@ def scan_security_rules():
                     port_range = str(tcp_opts.destination_port_range.min)
                     if tcp_opts.destination_port_range.max != tcp_opts.destination_port_range.min:
                         port_range += '-' + str(tcp_opts.destination_port_range.max)
+
                 rules.append({
-                    'type': 'SecurityList', 'direction': 'INGRESS',
-                    'protocol': getattr(r, 'protocol', 'N/A'), 'source': getattr(r, 'source', 'N/A'),
-                    'destination': 'N/A', 'port_range': port_range,
+                    'type': 'SecurityList',
+                    'direction': 'INGRESS',
+                    'protocol': getattr(r, 'protocol', 'N/A'),
+                    'source': getattr(r, 'source', 'N/A'),
+                    'destination': 'N/A',
+                    'port_range': port_range,
                     'description': getattr(r, 'description', '')
                 })
+
+            # Egress rules
             for r in getattr(sec_list, 'egress_security_rules', []):
                 tcp_opts = getattr(r, 'tcp_options', None)
                 port_range = None
@@ -686,13 +612,19 @@ def scan_security_rules():
                     port_range = str(tcp_opts.destination_port_range.min)
                     if tcp_opts.destination_port_range.max != tcp_opts.destination_port_range.min:
                         port_range += '-' + str(tcp_opts.destination_port_range.max)
+
                 rules.append({
-                    'type': 'SecurityList', 'direction': 'EGRESS',
-                    'protocol': getattr(r, 'protocol', 'N/A'), 'source': 'N/A',
-                    'destination': getattr(r, 'destination', 'N/A'), 'port_range': port_range,
+                    'type': 'SecurityList',
+                    'direction': 'EGRESS',
+                    'protocol': getattr(r, 'protocol', 'N/A'),
+                    'source': 'N/A',
+                    'destination': getattr(r, 'destination', 'N/A'),
+                    'port_range': port_range,
                     'description': getattr(r, 'description', '')
                 })
+
         return jsonify({'success': True, 'rules': rules, 'nsg_count': len(nsg_ids), 'sec_list_count': len(sec_list_ids)})
+
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
@@ -703,22 +635,41 @@ def check_free_tier_limits(config, account_config, compute_client, block_client,
     requested_boot_gb = int(account_config.get('boot_volume_gb', 50))
     if requested_boot_gb < 50:
         requested_boot_gb = 50
+
     ads = identity_client.list_availability_domains(compartment_id=tenancy).data
     total_storage = 0
     for ad in ads:
-        boot_volumes = block_client.list_boot_volumes(compartment_id=tenancy, availability_domain=ad.name).data
-        total_storage += sum(int(v.size_in_gbs) for v in boot_volumes if v.lifecycle_state != 'TERMINATED')
+        boot_volumes = block_client.list_boot_volumes(
+            compartment_id=tenancy,
+            availability_domain=ad.name
+        ).data
+        total_storage += sum(
+            int(v.size_in_gbs) for v in boot_volumes
+            if v.lifecycle_state != 'TERMINATED'
+        )
+
     if total_storage + requested_boot_gb > 200:
-        return False, f"Storage would exceed 200 GB free tier limit (used {total_storage} GB + requested {requested_boot_gb} GB)"
+        return False, (
+            f"Storage would exceed 200 GB free tier limit "
+            f"(used {total_storage} GB + requested {requested_boot_gb} GB)"
+        )
+
     instances = compute_client.list_instances(compartment_id=tenancy).data
+
     if requested_shape == 'VM.Standard.E2.1.Micro':
-        micro_count = sum(1 for inst in instances if inst.shape == 'VM.Standard.E2.1.Micro' and inst.lifecycle_state != 'TERMINATED')
+        micro_count = sum(
+            1 for inst in instances
+            if inst.shape == 'VM.Standard.E2.1.Micro'
+            and inst.lifecycle_state != 'TERMINATED'
+        )
         if micro_count >= 2:
             return False, f"Free tier allows only 2 Micro instances (found {micro_count})"
         return True, ""
+
     if requested_shape == 'VM.Standard.A1.Flex':
         requested_ocpus = int(account_config.get('ocpus', 4))
         requested_memory = int(account_config.get('memory', 24))
+
         total_ocpus = 0
         total_memory = 0
         for inst in instances:
@@ -727,94 +678,45 @@ def check_free_tier_limits(config, account_config, compute_client, block_client,
                 if cfg:
                     total_ocpus += int(cfg.ocpus or 0)
                     total_memory += int(cfg.memory_in_gbs or 0)
+
         if total_ocpus + requested_ocpus > 2:
-            return False, f"A1 OCPUs would exceed 2 (used {total_ocpus} + requested {requested_ocpus})"
+            return False, (
+                f"A1 OCPUs would exceed 2 (used {total_ocpus} + requested {requested_ocpus})"
+            )
         if total_memory + requested_memory > 12:
-            return False, f"A1 memory would exceed 12 GB (used {total_memory} + requested {requested_memory})"
+            return False, (
+                f"A1 memory would exceed 12 GB (used {total_memory} + requested {requested_memory})"
+            )
         return True, ""
+
     return True, ""
-
-
-def get_instance_public_ip(config, compute_client, network_client, instance_id):
-    try:
-        for _ in range(30):
-            inst = compute_client.get_instance(instance_id=instance_id).data
-            if inst.lifecycle_state == 'RUNNING':
-                break
-            if inst.lifecycle_state in ('TERMINATED', 'TERMINATING'):
-                return None, 'Instance terminated'
-            time.sleep(2)
-        attachments = compute_client.list_vnic_attachments(compartment_id=config['tenancy'], instance_id=instance_id).data
-        for att in attachments:
-            if getattr(att, 'lifecycle_state', '') == 'ATTACHED':
-                vnic = network_client.get_vnic(vnic_id=att.vnic_id).data
-                if vnic.public_ip:
-                    return vnic.public_ip, None
-        return None, 'No public IP assigned'
-    except Exception as e:
-        return None, str(e)
-
-
-def list_all_instances(config, compute_client, identity_client, network_client=None):
-    tenancy = config['tenancy']
-    instances = compute_client.list_instances(compartment_id=tenancy).data
-    result = []
-    # Create network client if not provided
-    if network_client is None:
-        network_client = oci.core.VirtualNetworkClient(config)
-    for inst in instances:
-        if inst.lifecycle_state in ('TERMINATED', 'TERMINATING'):
-            continue
-        shape = inst.shape
-        ocpus = None
-        memory = None
-        public_ip = None
-        if hasattr(inst, 'shape_config') and inst.shape_config:
-            ocpus = inst.shape_config.ocpus
-            memory = inst.shape_config.memory_in_gbs
-        # Try to get public IP from VNIC attachments
-        try:
-            attachments = compute_client.list_vnic_attachments(
-                compartment_id=tenancy, instance_id=inst.id
-            ).data
-            for att in attachments:
-                if getattr(att, 'lifecycle_state', '') == 'ATTACHED':
-                    vnic = network_client.get_vnic(vnic_id=att.vnic_id).data
-                    if vnic.public_ip:
-                        public_ip = vnic.public_ip
-                        break
-        except Exception:
-            pass
-        result.append({
-            'id': inst.id, 'name': inst.display_name, 'shape': shape,
-            'state': inst.lifecycle_state, 'ocpus': ocpus, 'memory': memory,
-            'public_ip': public_ip,
-            'time_created': inst.time_created.isoformat() if inst.time_created else None,
-            'availability_domain': inst.availability_domain
-        })
-    return result
-
-
-def terminate_instance(compute_client, instance_id):
-    try:
-        compute_client.terminate_instance(instance_id=instance_id)
-        return True, None
-    except Exception as e:
-        return False, str(e)
 
 
 def get_free_tier_usage(config, compute_client, block_client, identity_client):
     tenancy = config['tenancy']
-    network_client = oci.core.VirtualNetworkClient(config)
     ads = identity_client.list_availability_domains(compartment_id=tenancy).data
+
     total_storage = 0
     for ad in ads:
-        boot_volumes = block_client.list_boot_volumes(compartment_id=tenancy, availability_domain=ad.name).data
-        total_storage += sum(int(v.size_in_gbs) for v in boot_volumes if v.lifecycle_state != 'TERMINATED')
+        boot_volumes = block_client.list_boot_volumes(
+            compartment_id=tenancy,
+            availability_domain=ad.name
+        ).data
+        total_storage += sum(
+            int(v.size_in_gbs) for v in boot_volumes
+            if v.lifecycle_state != 'TERMINATED'
+        )
     storage_remaining = max(0, 200 - total_storage)
+
     instances = compute_client.list_instances(compartment_id=tenancy).data
-    micro_count = sum(1 for inst in instances if inst.shape == 'VM.Standard.E2.1.Micro' and inst.lifecycle_state != 'TERMINATED')
+
+    micro_count = sum(
+        1 for inst in instances
+        if inst.shape == 'VM.Standard.E2.1.Micro'
+        and inst.lifecycle_state != 'TERMINATED'
+    )
     micro_remaining = max(0, 2 - micro_count)
+
     total_ocpus = 0
     total_memory = 0
     arm_instances = []
@@ -826,24 +728,53 @@ def get_free_tier_usage(config, compute_client, block_client, identity_client):
                 memory = int(cfg.memory_in_gbs or 0)
                 total_ocpus += ocpus
                 total_memory += memory
-                arm_instances.append({'name': inst.display_name, 'ocpus': ocpus, 'memory': memory, 'state': inst.lifecycle_state})
+                arm_instances.append({
+                    'name': inst.display_name,
+                    'ocpus': ocpus,
+                    'memory': memory,
+                    'state': inst.lifecycle_state
+                })
+
     ocpus_remaining = max(0, 2 - total_ocpus)
     memory_remaining = max(0, 12 - total_memory)
-    all_instances = list_all_instances(config, compute_client, identity_client, network_client)
+
     return {
-        'storage': {'used_gb': total_storage, 'limit_gb': 200, 'remaining_gb': storage_remaining, 'percent': round((total_storage / 200) * 100, 1) if total_storage > 0 else 0},
-        'micro': {'used': micro_count, 'limit': 2, 'remaining': micro_remaining, 'percent': round((micro_count / 2) * 100, 1) if micro_count > 0 else 0},
-        'arm': {'used_ocpus': total_ocpus, 'limit_ocpus': 2, 'remaining_ocpus': ocpus_remaining, 'used_memory_gb': total_memory, 'limit_memory_gb': 12, 'remaining_memory_gb': memory_remaining, 'instances': arm_instances, 'ocpu_percent': round((total_ocpus / 2) * 100, 1) if total_ocpus > 0 else 0, 'memory_percent': round((total_memory / 12) * 100, 1) if total_memory > 0 else 0},
-        'all_instances': all_instances
+        'storage': {
+            'used_gb': total_storage,
+            'limit_gb': 200,
+            'remaining_gb': storage_remaining,
+            'percent': round((total_storage / 200) * 100, 1) if total_storage > 0 else 0
+        },
+        'micro': {
+            'used': micro_count,
+            'limit': 2,
+            'remaining': micro_remaining,
+            'percent': round((micro_count / 2) * 100, 1) if micro_count > 0 else 0
+        },
+        'arm': {
+            'used_ocpus': total_ocpus,
+            'limit_ocpus': 2,
+            'remaining_ocpus': ocpus_remaining,
+            'used_memory_gb': total_memory,
+            'limit_memory_gb': 12,
+            'remaining_memory_gb': memory_remaining,
+            'instances': arm_instances,
+            'ocpu_percent': round((total_ocpus / 2) * 100, 1) if total_ocpus > 0 else 0,
+            'memory_percent': round((total_memory / 12) * 100, 1) if total_memory > 0 else 0
+        }
     }
 
 
-def send_telegram_message(bot_token, chat_id, message, tz_name=None):
+def send_telegram_message(bot_token, chat_id, message):
     if not bot_token or not chat_id:
         return False, "Missing bot token or chat ID"
     try:
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+        payload = {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "HTML"
+        }
         response = requests.post(url, json=payload, timeout=10)
         data = response.json()
         if data.get("ok"):
@@ -860,11 +791,14 @@ def get_oci_username(config, identity_client):
         if not user_ocid:
             add_log("Username detection skipped: no user OCID in config")
             return None
+
         add_log(f"Fetching user info from Identity API...")
         user = identity_client.get_user(user_id=user_ocid).data
+
         name = getattr(user, 'name', None)
         email = getattr(user, 'email', None)
         desc = getattr(user, 'description', None)
+
         if name and email:
             result = f"{name} ({email})"
         elif name:
@@ -875,8 +809,10 @@ def get_oci_username(config, identity_client):
             result = desc
         else:
             result = user_ocid
+
         add_log(f"Detected OCI user: {result}")
         return result
+
     except oci.exceptions.ServiceError as e:
         add_log(f"Identity API error (status {e.status}): {e.message}")
         return None
@@ -887,42 +823,57 @@ def get_oci_username(config, identity_client):
 
 def run_automated_creation(config, account_config, compute_client, network_client, identity_client,
                            retry_delay=60, randomize_delay=False, random_min=25, random_max=60,
-                           telegram_bot_token=None, telegram_chat_id=None, tz_name=None):
+                           telegram_bot_token=None, telegram_chat_id=None):
     global automation_running
-    set_user_tz(tz_name)
+
     oci_username = None
     target_region = config.get('region', 'unknown')
     target_name = account_config.get('display_name', 'AlwaysFree-Bot')
+
     try:
         oci_username = get_oci_username(config, identity_client)
         if oci_username:
             add_log(f"OCI username detected: {oci_username}")
     except Exception as e:
         add_log(f"Could not detect OCI username: {str(e)}")
+
     try:
         block_client = oci.core.BlockstorageClient(config)
-        ok, err = check_free_tier_limits(config, account_config, compute_client, block_client, identity_client)
+        ok, err = check_free_tier_limits(
+            config, account_config, compute_client, block_client, identity_client
+        )
         if not ok:
             add_log(f"Free tier limit check failed: {err}")
             return
+
         add_log(f"Initializing infrastructure scan inside: {target_region}...")
-        ads = identity_client.list_availability_domains(compartment_id=config['tenancy']).data
+
+        ads = identity_client.list_availability_domains(
+            compartment_id=config['tenancy']
+        ).data
         ad_list = [ad.name for ad in ads] if ads else []
         add_log(f"Availability domains found: {len(ad_list)} — {', '.join(ad_list)}")
+
+        # Handle AD preference from user
         ad_preference = account_config.get('ad_preference', '')
         if ad_preference and ad_preference in ad_list:
+            # Move preferred AD to front of list
             ad_list.remove(ad_preference)
             ad_list.insert(0, ad_preference)
             add_log(f"Using preferred AD: {ad_preference}")
         elif ad_preference:
             add_log(f"Preferred AD '{ad_preference}' not found, using auto-rotation")
+
         subnet_id = account_config.get('subnet_id')
         if not subnet_id:
             vcns = network_client.list_vcns(compartment_id=config['tenancy']).data
             if not vcns:
                 add_log("Error: No VCN found.")
                 return
-            subnets = network_client.list_subnets(compartment_id=config['tenancy'], vcn_id=vcns[0].id).data
+            subnets = network_client.list_subnets(
+                compartment_id=config['tenancy'],
+                vcn_id=vcns[0].id
+            ).data
             if not subnets:
                 add_log("Error: No subnet found.")
                 return
@@ -930,104 +881,116 @@ def run_automated_creation(config, account_config, compute_client, network_clien
             add_log("Auto-selected subnet: " + subnet_id[:20] + "...")
         else:
             add_log("Using selected subnet: " + subnet_id[:20] + "...")
+
         image_id = account_config.get('image_id')
         if not image_id:
             add_log("Error: No OS image selected.")
             return
+
         ssh_key = account_config.get('ssh_key', '').strip()
         if not ssh_key:
             add_log("Error: SSH public key is required.")
             return
+
         valid_prefixes = ('ssh-rsa', 'ssh-ed25519', 'ssh-dss', 'ecdsa-sha2-nistp256',
                           'ecdsa-sha2-nistp384', 'ecdsa-sha2-nistp521', 'sk-ssh-ed25519')
         if not any(ssh_key.startswith(p) for p in valid_prefixes):
             add_log("Error: SSH key does not appear to be a valid public key.")
             return
+
         boot_gb = int(account_config.get('boot_volume_gb', 50))
         if boot_gb < 50:
             add_log("Boot volume raised to minimum 50 GB.")
             boot_gb = 50
-        add_log(f"Setup Verified -> Subnet: {subnet_id[:20]}... | Image: {image_id[:20]}... | Zone: {ad_list[0] if ad_list else 'N/A'}")
-        add_log(f"Debug -> Shape: {account_config['shape']} | Boot: {boot_gb}GB | OCPUs: {account_config.get('ocpus', 'N/A')} | RAM: {account_config.get('memory', 'N/A')}GB")
+
+        add_log(f"Setup Verified -> Subnet: {subnet_id[:20]}... | "
+                f"Image: {image_id[:20]}... | Zone: {ad_list[0] if ad_list else 'N/A'}")
+        add_log(f"Debug -> Shape: {account_config['shape']} | Boot: {boot_gb}GB | "
+                f"OCPUs: {account_config.get('ocpus', 'N/A')} | RAM: {account_config.get('memory', 'N/A')}GB")
         add_log(f"Debug -> Subnet details: assign_public_ip=True")
-        shape = account_config.get('shape', '')
-        is_flex = '.Flex' in shape
-        add_log(f"Debug -> Shape='{shape}', is_flex={is_flex}")
+
+        is_arm = account_config.get('shape') == "VM.Standard.A1.Flex"
         shape_config = None
-        if is_flex:
+        if is_arm:
             ocpus = int(account_config.get('ocpus', 2))
             memory = int(account_config.get('memory', 12))
-            shape_config = oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=ocpus, memory_in_gbs=memory)
-            add_log(f"Debug -> Flex shape config: ocpus={ocpus}, memory={memory}")
-        else:
-            add_log(f"Debug -> Non-flex shape, no shape_config needed")
+            shape_config = oci.core.models.LaunchInstanceShapeConfigDetails(
+                ocpus=ocpus, memory_in_gbs=memory
+            )
+            add_log(f"Debug -> ARM shape config: ocpus={ocpus}, memory={memory}")
+
         instance_details = oci.core.models.LaunchInstanceDetails(
             compartment_id=config['tenancy'],
             availability_domain=ad_list[0] if ad_list else '',
             shape=account_config['shape'],
             shape_config=shape_config,
             source_details=oci.core.models.InstanceSourceViaImageDetails(
-                image_id=image_id, boot_volume_size_in_gbs=boot_gb
+                image_id=image_id,
+                boot_volume_size_in_gbs=boot_gb
             ),
             create_vnic_details=oci.core.models.CreateVnicDetails(
-                subnet_id=subnet_id, assign_public_ip=True
+                subnet_id=subnet_id,
+                assign_public_ip=True
             ),
             metadata={"ssh_authorized_keys": ssh_key},
             display_name=target_name
         )
+
         add_log(f"Launching provisioning loop for '{target_name}'...")
+
         attempts = 0
         success = False
         ad_index = 0
+
+        # Shuffle AD list for random order (speeds up finding capacity)
         import random as _random
         if len(ad_list) > 1:
             _random.shuffle(ad_list)
             add_log(f"AD order randomized for faster discovery: {', '.join(ad_list)}")
+
         while True:
             attempts += 1
+
             if stop_event.is_set():
                 add_log("Provisioning loop stopped by user.")
                 break
+
+            # Rotate through availability domains (randomized order)
             current_ad = ad_list[ad_index % len(ad_list)] if ad_list else ''
             if len(ad_list) > 1:
                 add_log(f"Attempt {attempts}: trying AD '{current_ad}'...")
+
+            # Update instance details with current AD
             instance_details.availability_domain = current_ad
+
             try:
                 add_log(f"Attempt {attempts}: sending instance launch request...")
-                response = compute_client.launch_instance(instance_details)
-                instance_id = response.data.id
-                add_log(f"SUCCESS! Instance created: {instance_id[:20]}...")
-                add_log("Fetching instance public IP...")
-                public_ip, ip_err = get_instance_public_ip(config, compute_client, network_client, instance_id)
-                if public_ip:
-                    add_log(f"Public IP: {public_ip}")
-                elif ip_err:
-                    add_log(f"Could not get public IP: {ip_err}")
+                compute_client.launch_instance(instance_details)
+                add_log("SUCCESS! Instance created and running.")
                 success = True
                 if telegram_bot_token and telegram_chat_id:
                     instance_name = account_config.get('display_name', 'AlwaysFree-Bot')
                     shape = account_config.get('shape', 'Unknown')
                     region = config.get('region', 'unknown')
-                    user_time = format_user_time(tz_name=get_current_tz())
+                    pp_time = format_phnom_penh_time()
                     user_line = f"<b>User:</b> {oci_username}\n" if oci_username else ""
-                    ip_line = f"<b>Public IP:</b> {public_ip}\n" if public_ip else ""
                     tg_msg = (
                         f"&#9989; <b>OCI Provisioner Success!</b>\n\n"
                         f"<b>Instance:</b> {instance_name}\n"
                         f"<b>Shape:</b> {shape}\n"
                         f"<b>Region:</b> {region}\n"
-                        f"{ip_line}"
                         f"{user_line}"
-                        f"<b>Time:</b> {user_time}\n"
+                        f"<b>Time:</b> {pp_time} (Phnom Penh)\n"
                         f"<b>Status:</b> Running\n\n"
                         f"Your Always Free instance has been successfully provisioned!"
                     )
-                    tg_ok, tg_err = send_telegram_message(telegram_bot_token, telegram_chat_id, tg_msg, get_current_tz())
+                    tg_ok, tg_err = send_telegram_message(telegram_bot_token, telegram_chat_id, tg_msg)
                     if tg_ok:
                         add_log("Telegram success alert sent.")
                     else:
                         add_log(f"Telegram alert failed: {tg_err}")
                 break
+
             except oci.exceptions.ServiceError as e:
                 msg = str(e)
                 code = getattr(e, 'code', 'N/A')
@@ -1069,26 +1032,30 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                 else:
                     add_log(f"Automation engine failure: {msg}")
                     break
+
             actual_delay = retry_delay
             if randomize_delay:
                 actual_delay = random.randint(random_min, random_max)
                 add_log(f"Dynamic retry: waiting {actual_delay}s (randomized {random_min}-{random_max}s)")
+
             if stop_event.wait(actual_delay):
                 add_log("Provisioning loop stopped while waiting.")
                 break
+
         if not success:
             add_log("Provisioning loop ended without success.")
             if telegram_bot_token and telegram_chat_id:
                 user_line = f"<b>User:</b> {oci_username}\n" if oci_username else ""
-                user_time = format_user_time(tz_name=get_current_tz())
+                pp_time = format_phnom_penh_time()
                 tg_msg = (
                     f"&#10060; <b>OCI Provisioner Stopped</b>\n\n"
                     f"{user_line}"
                     f"Loop stopped after {attempts} attempts without success.\n"
                     f"<b>Region:</b> {config.get('region', 'unknown')}\n"
-                    f"<b>Time:</b> {user_time}"
+                    f"<b>Time:</b> {pp_time} (Phnom Penh)"
                 )
-                send_telegram_message(telegram_bot_token, telegram_chat_id, tg_msg, get_current_tz())
+                send_telegram_message(telegram_bot_token, telegram_chat_id, tg_msg)
+
     except Exception as e:
         msg = str(e)
         if "Remote end closed connection" in msg or "Connection aborted" in msg:
@@ -1097,14 +1064,15 @@ def run_automated_creation(config, account_config, compute_client, network_clien
             add_log(f"Automation engine failure: {msg}")
         if telegram_bot_token and telegram_chat_id:
             user_line = f"<b>User:</b> {oci_username}\n" if oci_username else ""
-            user_time = format_user_time(tz_name=get_current_tz())
+            pp_time = format_phnom_penh_time()
             tg_msg = (
                 f"&#10060; <b>OCI Provisioner Error</b>\n\n"
                 f"{user_line}"
                 f"Automation engine failure:\n{msg[:200]}\n"
-                f"<b>Time:</b> {user_time}"
+                f"<b>Time:</b> {pp_time} (Phnom Penh)"
             )
-            send_telegram_message(telegram_bot_token, telegram_chat_id, tg_msg, get_current_tz())
+            send_telegram_message(telegram_bot_token, telegram_chat_id, tg_msg)
+
     finally:
         with automation_lock:
             automation_running = False
@@ -1115,15 +1083,21 @@ def run_automated_creation(config, account_config, compute_client, network_clien
 @require_auth
 def free_tier_status():
     data = request.json or {}
-    set_user_tz(data.get('timezone'))
     config = build_config(data)
+
     try:
         oci.config.validate_config(config)
         compute_client = oci.core.ComputeClient(config)
         block_client = oci.core.BlockstorageClient(config)
         identity_client = oci.identity.IdentityClient(config)
+
         usage = get_free_tier_usage(config, compute_client, block_client, identity_client)
-        return jsonify({'success': True, 'usage': usage})
+
+        return jsonify({
+            'success': True,
+            'usage': usage
+        })
+
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
@@ -1132,7 +1106,11 @@ def free_tier_status():
 @require_auth
 def get_status():
     with automation_lock:
-        return jsonify({'success': True, 'running': automation_running, 'shape': automation_shape})
+        return jsonify({
+            'success': True,
+            'running': automation_running,
+            'shape': automation_shape
+        })
 
 
 @app.route('/api/auto-launch-loop', methods=['POST'])
@@ -1140,51 +1118,71 @@ def get_status():
 def auto_launch():
     global automation_running, tg_live_enabled, tg_live_bot_token, tg_live_chat_id
     data = request.json or {}
-    set_user_tz(data.get('timezone'))
     config = build_config(data)
+
     try:
         oci.config.validate_config(config)
     except Exception as e:
         return jsonify({'success': False, 'error': f"Invalid OCI config: {e}"})
+
     requested_shape = data.get('shape', '')
+
+    # Configure Telegram live logging
     bot_token = data.get('telegram_bot_token', '').strip()
     chat_id = data.get('telegram_chat_id', '').strip()
     enable_live = data.get('telegram_live_log', False)
+
     with tg_live_lock:
         tg_live_enabled = bool(enable_live and bot_token and chat_id)
         tg_live_bot_token = bot_token if enable_live else None
         tg_live_chat_id = chat_id if enable_live else None
         tg_live_last_sent = 0
+
     if enable_live and (not bot_token or not chat_id):
         return jsonify({'success': False, 'error': 'Telegram live log enabled but bot token or chat ID is missing'})
+
     with automation_lock:
         if automation_running:
             if automation_shape and automation_shape != requested_shape:
-                return jsonify({'success': False, 'error': f"A provisioning loop is already running for shape '{automation_shape}'. Stop it first before starting '{requested_shape}'."})
-            return jsonify({'success': False, 'error': 'A provisioning loop is already running.'})
+                return jsonify({
+                    'success': False,
+                    'error': f"A provisioning loop is already running for shape '{automation_shape}'. Stop it first before starting '{requested_shape}'."
+                })
+            return jsonify({
+                'success': False,
+                'error': 'A provisioning loop is already running.'
+            })
         automation_running = True
         automation_shape = requested_shape
         stop_event.clear()
+
     try:
         compute_client = oci.core.ComputeClient(config)
         network_client = oci.core.VirtualNetworkClient(config)
         identity_client = oci.identity.IdentityClient(config)
+
         retry_delay = int(data.get('retry_delay', 60))
         if retry_delay < 10:
             retry_delay = 10
+
         randomize_delay = data.get('randomize_delay', False)
         random_min = int(data.get('random_min', 25))
         random_max = int(data.get('random_max', 60))
+
         thread = threading.Thread(
             target=run_automated_creation,
             args=(config, data, compute_client, network_client, identity_client,
                   retry_delay, randomize_delay, random_min, random_max,
-                  data.get('telegram_bot_token'), data.get('telegram_chat_id'),
-                  get_current_tz()),
+                  data.get('telegram_bot_token'), data.get('telegram_chat_id')),
             daemon=True
         )
         thread.start()
-        return jsonify({'success': True, 'message': 'Provisioning loop started.' + (' Live Telegram logging enabled.' if tg_live_enabled else '')})
+
+        return jsonify({
+            'success': True,
+            'message': 'Provisioning loop started.' + (' Live Telegram logging enabled.' if tg_live_enabled else '')
+        })
+
     except Exception as e:
         with automation_lock:
             automation_running = False
@@ -1216,19 +1214,17 @@ def fetch_live_logs():
 @require_auth
 def test_telegram():
     data = request.json or {}
-    set_user_tz(data.get('timezone'))
     bot_token = data.get('bot_token', '').strip()
     chat_id = data.get('chat_id', '').strip()
     if not bot_token or not chat_id:
         return jsonify({'success': False, 'error': 'Bot token and chat ID are required'})
-    user_time = format_user_time(tz_name=get_current_tz())
+    pp_time = format_phnom_penh_time()
     ok, err = send_telegram_message(
         bot_token, chat_id,
         f"&#9989; <b>OCI Instance loop Connected</b>\n\n"
         f"Your Telegram alerts are now active.\n"
-        f"<b>Time:</b> {user_time}\n\n"
-        f"You will receive notifications when provisioning succeeds or fails.",
-        get_current_tz()
+        f"<b>Server Time:</b> {pp_time} (Phnom Penh, ICT)\n\n"
+        f"You will receive notifications when provisioning succeeds or fails."
     )
     if ok:
         return jsonify({'success': True, 'message': 'Test message sent successfully'})
@@ -1239,112 +1235,10 @@ def test_telegram():
 @require_auth
 def send_telegram():
     data = request.json or {}
-    set_user_tz(data.get('timezone'))
     ok, err = send_telegram_message(
-        data.get('bot_token'), data.get('chat_id'), data.get('message', ''), get_current_tz()
+        data.get('bot_token'), data.get('chat_id'), data.get('message', '')
     )
     return jsonify({'success': ok, 'error': err})
-
-
-@app.route('/api/list-instances', methods=['POST'])
-@require_auth
-def api_list_instances():
-    data = request.json or {}
-    set_user_tz(data.get('timezone'))
-    config = build_config(data)
-    try:
-        oci.config.validate_config(config)
-        compute_client = oci.core.ComputeClient(config)
-        identity_client = oci.identity.IdentityClient(config)
-        instances = list_all_instances(config, compute_client, identity_client)
-        return jsonify({'success': True, 'instances': instances})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
-
-
-@app.route('/api/delete-instance', methods=['POST'])
-@require_auth
-def api_delete_instance():
-    data = request.json or {}
-    set_user_tz(data.get('timezone'))
-    config = build_config(data)
-    instance_id = data.get('instance_id')
-    if not instance_id:
-        return jsonify({'success': False, 'error': 'instance_id required'})
-    try:
-        oci.config.validate_config(config)
-        compute_client = oci.core.ComputeClient(config)
-        try:
-            inst = compute_client.get_instance(instance_id=instance_id).data
-            name = inst.display_name
-        except:
-            name = instance_id[:20]
-        ok, err = terminate_instance(compute_client, instance_id)
-        if ok:
-            add_log(f"Instance '{name}' ({instance_id[:20]}...) termination initiated.")
-            return jsonify({'success': True, 'message': f"Instance '{name}' termination initiated"})
-        else:
-            return jsonify({'success': False, 'error': err})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
-
-
-
-
-@app.route('/api/reboot-instance', methods=['POST'])
-@require_auth
-def api_reboot_instance():
-    """Reboot a single instance by ID."""
-    data = request.json or {}
-    set_user_tz(data.get('timezone'))
-    config = build_config(data)
-    instance_id = data.get('instance_id')
-
-    if not instance_id:
-        return jsonify({'success': False, 'error': 'instance_id required'})
-
-    try:
-        oci.config.validate_config(config)
-        compute_client = oci.core.ComputeClient(config)
-
-        # Get instance name before rebooting for logging
-        try:
-            inst = compute_client.get_instance(instance_id=instance_id).data
-            name = inst.display_name
-        except:
-            name = instance_id[:20]
-
-        compute_client.instance_action(instance_id=instance_id, action='RESET')
-        add_log(f"Instance '{name}' ({instance_id[:20]}...) reboot initiated.")
-        return jsonify({'success': True, 'message': f"Instance '{name}' reboot initiated"})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
-
-@app.route('/api/delete-all-instances', methods=['POST'])
-@require_auth
-def api_delete_all_instances():
-    data = request.json or {}
-    set_user_tz(data.get('timezone'))
-    config = build_config(data)
-    try:
-        oci.config.validate_config(config)
-        compute_client = oci.core.ComputeClient(config)
-        identity_client = oci.identity.IdentityClient(config)
-        instances = list_all_instances(config, compute_client, identity_client)
-        if not instances:
-            return jsonify({'success': True, 'message': 'No instances to delete', 'deleted': 0})
-        deleted = 0
-        failed = []
-        for inst in instances:
-            ok, err = terminate_instance(compute_client, inst['id'])
-            if ok:
-                add_log(f"Terminating '{inst['name']}' ({inst['id'][:20]}...)")
-                deleted += 1
-            else:
-                failed.append({'name': inst['name'], 'error': err})
-        return jsonify({'success': True, 'message': f"Initiated termination for {deleted} instance(s)", 'deleted': deleted, 'failed': failed})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
 
 
 if __name__ == '__main__':
