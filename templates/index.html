@@ -449,7 +449,7 @@
                         <label class="form-label">Boot vol (GB)</label>
                         <div style="display:flex;gap:4px;">
                             <input type="number" id="bootVol" class="form-input" value="50" min="50" max="200" style="flex:1;">
-                            <button class="btn" onclick="setMaxBoot()" style="padding:0 10px;font-size:11px;white-space:nowrap;">Max</button>
+                            <button class="btn" onclick="setMaxBoot(event)" style="padding:0 10px;font-size:11px;white-space:nowrap;">Max</button>
                         </div>
                     </div>
                 </div>
@@ -572,6 +572,8 @@
     let logOffset = 0;
     let pollInterval = null;
     let statusInterval = null;
+    const LOG_POLL_MS = 5000;
+    const STATUS_POLL_MS = 10000;
 
     function togglePanel(name) {
         const body = document.getElementById(name + 'Body');
@@ -683,9 +685,9 @@
         return base;
     }
 
-    async function setMaxBoot() {
+    async function setMaxBoot(event) {
         parseConfig();
-        const btn = event.target;
+        const btn = event.currentTarget;
         const input = document.getElementById('bootVol');
         const user = document.getElementById('cfgUser').value;
         const key = document.getElementById('cfgKey').value;
@@ -755,14 +757,21 @@
         if (type === 'success') cls = 'log-success';
         if (type === 'error') cls = 'log-error';
         if (type === 'warn') cls = 'log-warn';
-        line.innerHTML = '<span class="log-time">[' + now + ']</span> <span class="' + cls + '">' + msg + '</span>';
+        const time = document.createElement('span');
+        time.className = 'log-time';
+        time.textContent = '[' + now + ']';
+        const message = document.createElement('span');
+        message.className = cls;
+        message.textContent = msg;
+        line.append(time, document.createTextNode(' '), message);
         term.appendChild(line);
         term.scrollTop = term.scrollHeight;
     }
 
     function clearLogs() {
         document.getElementById('terminalBody').innerHTML = '';
-        logOffset = 0;
+        // Keep the server cursor; resetting it would append the same bounded
+        // log buffer again on the next poll.
     }
 
     function updateStatus(running) {
@@ -1306,13 +1315,11 @@
 
     function startPolling() {
         if (pollInterval) return;
-        pollInterval = setInterval(fetchLogs, 2000);
-        statusInterval = setInterval(checkStatus, 5000);
+        pollInterval = setInterval(fetchLogs, LOG_POLL_MS);
     }
 
     function stopPolling() {
         if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
-        if (statusInterval) { clearInterval(statusInterval); statusInterval = null; }
     }
 
     function onTgLiveLogChange() {
@@ -1375,7 +1382,9 @@
     window.addEventListener('load', () => {
         fetchLogs();
         checkStatus();
-        setInterval(checkStatus, 5000);
+        // Status is useful while stopped too, but does not need a request every
+        // few seconds. Log polling only runs while provisioning is active.
+        statusInterval = setInterval(checkStatus, STATUS_POLL_MS);
     });
     </script>
 </body>

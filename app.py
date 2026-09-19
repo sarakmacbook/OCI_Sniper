@@ -1,13 +1,51 @@
-import os
-import re
-import time
-import random
-import threading
 import datetime
 import functools
+import html
+import importlib
+import os
+import random
+import re
+import threading
+import time
+
 import requests
-from flask import Flask, render_template, request, jsonify, Response
-import oci
+from flask import Flask, Response, jsonify, render_template, request
+
+# The OCI SDK is large. Keep it out of the web process until an OCI operation is
+# actually requested. This makes health checks and the UI cheap on small hosts,
+# while keeping the SDK available for all API endpoints.
+oci = None
+_oci_import_lock = threading.Lock()
+
+
+def get_oci():
+    global oci
+    if oci is None:
+        with _oci_import_lock:
+            if oci is None:
+                oci = importlib.import_module('oci')
+    return oci
+
+
+def create_oci_client(client_class, config):
+    """Create a bounded client and let this app, not the SDK, control retries."""
+    sdk = get_oci()
+    try:
+        retry_strategy = sdk.retry.NoneRetryStrategy()
+    except AttributeError:
+        # A minimal SDK-compatible test double may not expose retry helpers.
+        return client_class(config)
+    kwargs = {
+        'retry_strategy': retry_strategy,
+        'timeout': (10, 60),
+    }
+    try:
+        return client_class(config, **kwargs)
+    except TypeError as exc:
+        # Keeps simple test doubles and older compatible SDK clients usable.
+        if 'unexpected keyword' not in str(exc):
+            raise
+        return client_class(config)
 
 # ---- Timezone Configuration (Phnom Penh - ICT, UTC+7) ----
 from zoneinfo import ZoneInfo
@@ -22,31 +60,63 @@ def format_phnom_penh_time(dt=None):
     return dt.strftime('%Y-%m-%d %H:%M:%S')
 
 app = Flask(__name__)
+# A config/private key is normally only a few KB. Reject accidental uploads and
+# oversized JSON before Flask buffers them in memory.
+try:
+    _max_content_length = int(os.environ.get('MAX_CONTENT_LENGTH', 64 * 1024))
+except (TypeError, ValueError):
+    _max_content_length = 64 * 1024
+app.config['MAX_CONTENT_LENGTH'] = max(4096, min(_max_content_length, 1024 * 1024))
 
-# ---- Security Headers ----
+# ---- Security headers ----
 @app.after_request
 def add_security_headers(response):
     response.headers['X-Frame-Options'] = 'DENY'
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Referrer-Policy'] = 'no-referrer'
     response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
+
 
 # ---- Config ----
 ADMIN_PASSWORD = os.environ.get('APP_PASSWORD')
 if not ADMIN_PASSWORD:
     print("WARNING: APP_PASSWORD not set. Running WITHOUT authentication. Set APP_PASSWORD to enable Basic Auth.")
 
-MAX_ATTEMPTS = int(os.environ.get('MAX_ATTEMPTS', 100))
+
+def env_int(name, default, minimum, maximum):
+    """Read a bounded integer without making a bad env var crash the app."""
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+MAX_ATTEMPTS = env_int('MAX_ATTEMPTS', 100, 1, 1000)
+OCI_API_SLOTS = env_int('OCI_API_SLOTS', 2, 1, 8)
+USAGE_CACHE_SECONDS = env_int('USAGE_CACHE_SECONDS', 20, 0, 300)
 
 # ---- Shared state ----
+# A bounded list is enough for the terminal and cannot grow forever during a
+# long-running retry loop.
 global_logs = []
+global_log_base = 0
 logs_lock = threading.Lock()
 
+# Keep the single-process state intentional: the deployment commands below use
+# one Gunicorn worker. Multiple workers would each run their own loop.
 automation_lock = threading.Lock()
 automation_running = False
 automation_shape = None
 stop_event = threading.Event()
+oci_api_slots = threading.BoundedSemaphore(OCI_API_SLOTS)
+
+# The quota screen can otherwise issue the same expensive OCI calls repeatedly.
+# Only the result and a non-secret account key are cached; private keys are not.
+usage_cache = {}
+usage_cache_lock = threading.Lock()
 
 # ---- Telegram live log settings ----
 tg_live_lock = threading.Lock()
@@ -58,6 +128,7 @@ tg_live_min_interval = 3  # seconds between live log sends
 
 
 def add_log(message):
+    global global_log_base
     timestamp = format_phnom_penh_time()
     line = f"[{timestamp}] {message}"
     print(line)
@@ -65,6 +136,7 @@ def add_log(message):
         global_logs.append(line)
         if len(global_logs) > 200:
             global_logs.pop(0)
+            global_log_base += 1
 
     # Send to Telegram if live logging is enabled
     _send_live_log_to_telegram(line)
@@ -87,6 +159,7 @@ def _send_live_log_to_telegram(line):
         clean_msg = line
         if len(clean_msg) > 4000:
             clean_msg = clean_msg[:4000] + "..."
+        clean_msg = html.escape(clean_msg)
 
         url = f"https://api.telegram.org/bot{tg_live_bot_token}/sendMessage"
         payload = {
@@ -125,6 +198,81 @@ def require_auth(f):
     return decorated
 
 
+def limit_oci_requests(f):
+    """Keep concurrent OCI calls bounded on a low-memory/small-CPU host."""
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        if not oci_api_slots.acquire(timeout=2):
+            return jsonify({
+                'success': False,
+                'error': 'The server is busy with another OCI request. Try again shortly.'
+            }), 503
+        try:
+            return f(*args, **kwargs)
+        finally:
+            oci_api_slots.release()
+    return decorated
+
+
+def hold_oci_slot(f):
+    """Hold one slot for the whole background provisioning job."""
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        if not oci_api_slots.acquire(timeout=5):
+            add_log('Provisioning could not start: OCI request limit is busy.')
+            with automation_lock:
+                global automation_running, automation_shape
+                automation_running = False
+                automation_shape = None
+            return
+        try:
+            return f(*args, **kwargs)
+        finally:
+            oci_api_slots.release()
+    return decorated
+
+
+def usage_cache_key(config):
+    # Do not include key_content in the cache key or retain it in memory.
+    return (
+        config.get('tenancy'),
+        config.get('user'),
+        config.get('fingerprint'),
+        config.get('region')
+    )
+
+
+def get_cached_usage(key):
+    if not USAGE_CACHE_SECONDS:
+        return None
+    now = time.monotonic()
+    with usage_cache_lock:
+        cached = usage_cache.get(key)
+        if cached and now - cached[0] < USAGE_CACHE_SECONDS:
+            return cached[1]
+        if cached:
+            usage_cache.pop(key, None)
+    return None
+
+
+def cache_usage(key, usage):
+    if not USAGE_CACHE_SECONDS:
+        return
+    with usage_cache_lock:
+        # There is normally one account per process. Keep this bounded if a
+        # public deployment receives requests for many tenancies.
+        if len(usage_cache) >= 8 and key not in usage_cache:
+            oldest = min(usage_cache, key=lambda item: usage_cache[item][0])
+            usage_cache.pop(oldest, None)
+        usage_cache[key] = (time.monotonic(), usage)
+
+
+@app.route('/healthz')
+def healthz():
+    """Cheap unauthenticated health check for Railway, Docker and systemd."""
+    return jsonify({'status': 'ok'})
+
+
 @app.route('/')
 def home():
     try:
@@ -135,6 +283,7 @@ def home():
 
 @app.route('/api/list-images', methods=['POST'])
 @require_auth
+@limit_oci_requests
 def list_available_images():
     data = request.json or {}
     config = build_config(data)
@@ -142,12 +291,16 @@ def list_available_images():
     all_os_mode = data.get('all_os_mode', False)
 
     try:
-        oci.config.validate_config(config)
-        compute = oci.core.ComputeClient(config)
+        get_oci().config.validate_config(config)
+        compute = create_oci_client(oci.core.ComputeClient, config)
 
-        kwargs = {'compartment_id': config['tenancy']}
+        # Ask OCI for only the data the UI needs. The normal mode is Ubuntu-only
+        # and this keeps the response small in tenancies with many custom images.
+        kwargs = {'compartment_id': config['tenancy'], 'limit': 50}
         if shape:
             kwargs['shape'] = shape
+        if not all_os_mode:
+            kwargs['operating_system'] = 'Canonical Ubuntu'
 
         images = compute.list_images(**kwargs).data
 
@@ -199,18 +352,16 @@ def list_available_images():
 
 @app.route('/api/list-subnets', methods=['POST'])
 @require_auth
+@limit_oci_requests
 def list_available_subnets():
     data = request.json or {}
     config = build_config(data)
 
     try:
-        oci.config.validate_config(config)
-        network_client = oci.core.VirtualNetworkClient(config)
-        identity_client = oci.identity.IdentityClient(config)
+        get_oci().config.validate_config(config)
+        network_client = create_oci_client(oci.core.VirtualNetworkClient, config)
 
         tenancy = config['tenancy']
-        ads = identity_client.list_availability_domains(compartment_id=tenancy).data
-
         vcns = network_client.list_vcns(compartment_id=tenancy).data
         if not vcns:
             return jsonify({'success': False, 'error': 'No VCNs found in this tenancy'})
@@ -243,17 +394,18 @@ def list_available_subnets():
 
 @app.route('/api/test-launch', methods=['POST'])
 @require_auth
+@limit_oci_requests
 def test_launch():
     """Debug endpoint: validates launch params without actually creating instance."""
     data = request.json or {}
     config = build_config(data)
 
     try:
-        oci.config.validate_config(config)
-        compute_client = oci.core.ComputeClient(config)
-        network_client = oci.core.VirtualNetworkClient(config)
-        identity_client = oci.identity.IdentityClient(config)
-        block_client = oci.core.BlockstorageClient(config)
+        get_oci().config.validate_config(config)
+        compute_client = create_oci_client(oci.core.ComputeClient, config)
+        network_client = create_oci_client(oci.core.VirtualNetworkClient, config)
+        identity_client = create_oci_client(oci.identity.IdentityClient, config)
+        block_client = create_oci_client(oci.core.BlockstorageClient, config)
 
         tenancy = config['tenancy']
         ads = identity_client.list_availability_domains(compartment_id=tenancy).data
@@ -337,6 +489,7 @@ def test_launch():
 
 @app.route('/api/list-vnics', methods=['POST'])
 @require_auth
+@limit_oci_requests
 def list_vnics():
     """List VNICs (network interfaces) for debugging network setup."""
     data = request.json or {}
@@ -344,9 +497,9 @@ def list_vnics():
     target_subnet_id = data.get('subnet_id', '').strip() or None
 
     try:
-        oci.config.validate_config(config)
-        compute_client = oci.core.ComputeClient(config)
-        network_client = oci.core.VirtualNetworkClient(config)
+        get_oci().config.validate_config(config)
+        compute_client = create_oci_client(oci.core.ComputeClient, config)
+        network_client = create_oci_client(oci.core.VirtualNetworkClient, config)
         tenancy = config['tenancy']
 
         # Pre-fetch all VCNs and subnets for name resolution
@@ -402,6 +555,7 @@ def list_vnics():
 
 @app.route('/api/open-firewall', methods=['POST'])
 @require_auth
+@limit_oci_requests
 def open_firewall():
     data = request.json or {}
     config = build_config(data)
@@ -414,8 +568,8 @@ def open_firewall():
         return jsonify({'success': False, 'error': 'subnet_id required'})
 
     try:
-        oci.config.validate_config(config)
-        network_client = oci.core.VirtualNetworkClient(config)
+        get_oci().config.validate_config(config)
+        network_client = create_oci_client(oci.core.VirtualNetworkClient, config)
 
         subnet = network_client.get_subnet(subnet_id=subnet_id).data
 
@@ -548,6 +702,7 @@ def open_firewall():
 
 @app.route('/api/scan-security-rules', methods=['POST'])
 @require_auth
+@limit_oci_requests
 def scan_security_rules():
     """Scan existing security rules on a subnet."""
     data = request.json or {}
@@ -558,8 +713,8 @@ def scan_security_rules():
         return jsonify({'success': False, 'error': 'subnet_id required'})
 
     try:
-        oci.config.validate_config(config)
-        network_client = oci.core.VirtualNetworkClient(config)
+        get_oci().config.validate_config(config)
+        network_client = create_oci_client(oci.core.VirtualNetworkClient, config)
 
         subnet = network_client.get_subnet(subnet_id=subnet_id).data
 
@@ -632,7 +787,10 @@ def scan_security_rules():
 def check_free_tier_limits(config, account_config, compute_client, block_client, identity_client):
     tenancy = config['tenancy']
     requested_shape = account_config.get('shape')
-    requested_boot_gb = int(account_config.get('boot_volume_gb', 50))
+    try:
+        requested_boot_gb = int(account_config.get('boot_volume_gb', 50))
+    except (TypeError, ValueError):
+        requested_boot_gb = 50
     if requested_boot_gb < 50:
         requested_boot_gb = 50
 
@@ -667,8 +825,16 @@ def check_free_tier_limits(config, account_config, compute_client, block_client,
         return True, ""
 
     if requested_shape == 'VM.Standard.A1.Flex':
-        requested_ocpus = int(account_config.get('ocpus', 4))
-        requested_memory = int(account_config.get('memory', 24))
+        # These defaults match the Always Free allocation and the UI. The old
+        # 4 OCPU / 24 GB defaults rejected valid requests when fields were absent.
+        try:
+            requested_ocpus = int(account_config.get('ocpus', 2))
+        except (TypeError, ValueError):
+            requested_ocpus = 2
+        try:
+            requested_memory = int(account_config.get('memory', 12))
+        except (TypeError, ValueError):
+            requested_memory = 12
 
         total_ocpus = 0
         total_memory = 0
@@ -785,14 +951,16 @@ def send_telegram_message(bot_token, chat_id, message):
         return False, str(e)
 
 
-def get_oci_username(config, identity_client):
+def get_oci_user_details(config, identity_client):
+    """Return display name and email without retaining the OCI private key."""
     try:
+        get_oci()
         user_ocid = config.get('user')
         if not user_ocid:
             add_log("Username detection skipped: no user OCID in config")
-            return None
+            return {'display_name': None, 'email': None}
 
-        add_log(f"Fetching user info from Identity API...")
+        add_log("Fetching user info from Identity API...")
         user = identity_client.get_user(user_id=user_ocid).data
 
         name = getattr(user, 'name', None)
@@ -811,34 +979,66 @@ def get_oci_username(config, identity_client):
             result = user_ocid
 
         add_log(f"Detected OCI user: {result}")
-        return result
+        return {'display_name': result, 'email': email}
 
-    except oci.exceptions.ServiceError as e:
-        add_log(f"Identity API error (status {e.status}): {e.message}")
-        return None
     except Exception as e:
-        add_log(f"Error fetching user info: {str(e)}")
-        return None
+        if oci is not None and isinstance(e, oci.exceptions.ServiceError):
+            add_log(f"Identity API error (status {e.status}): {e.message}")
+        else:
+            add_log(f"Error fetching user info: {str(e)}")
+        return {'display_name': None, 'email': None}
 
 
+def get_oci_username(config, identity_client):
+    """Compatibility helper used by callers that only need the display name."""
+    return get_oci_user_details(config, identity_client).get('display_name')
+
+
+def _telegram_value(value, fallback='N/A'):
+    value = fallback if value is None or value == '' else value
+    return html.escape(str(value))
+
+
+def send_telegram_attempt_update(bot_token, chat_id, attempt, email, region, ad, fingerprint):
+    """Send safe retry context; never send the OCI private key to Telegram."""
+    if not bot_token or not chat_id:
+        return
+    message = (
+        f"&#128260; <b>OCI Provisioning Attempt {attempt}</b>\n\n"
+        f"<b>OCI email:</b> {_telegram_value(email)}\n"
+        f"<b>Location:</b> {_telegram_value(region)} / AD {_telegram_value(ad)}\n"
+        f"<b>OCI key fingerprint:</b> {_telegram_value(fingerprint, 'not provided')}\n"
+        f"<b>Status:</b> Sending launch request"
+    )
+    ok, error = send_telegram_message(bot_token, chat_id, message)
+    if not ok:
+        add_log(f"Telegram attempt update failed: {error}")
+
+
+@hold_oci_slot
 def run_automated_creation(config, account_config, compute_client, network_client, identity_client,
                            retry_delay=60, randomize_delay=False, random_min=25, random_max=60,
-                           telegram_bot_token=None, telegram_chat_id=None):
+                           telegram_bot_token=None, telegram_chat_id=None,
+                           max_attempts=MAX_ATTEMPTS):
     global automation_running
 
     oci_username = None
+    oci_email = None
     target_region = config.get('region', 'unknown')
     target_name = account_config.get('display_name', 'AlwaysFree-Bot')
 
     try:
-        oci_username = get_oci_username(config, identity_client)
+        get_oci()
+        oci_user = get_oci_user_details(config, identity_client)
+        oci_username = oci_user.get('display_name')
+        oci_email = oci_user.get('email')
         if oci_username:
             add_log(f"OCI username detected: {oci_username}")
     except Exception as e:
         add_log(f"Could not detect OCI username: {str(e)}")
 
     try:
-        block_client = oci.core.BlockstorageClient(config)
+        block_client = create_oci_client(oci.core.BlockstorageClient, config)
         ok, err = check_free_tier_limits(
             config, account_config, compute_client, block_client, identity_client
         )
@@ -853,6 +1053,9 @@ def run_automated_creation(config, account_config, compute_client, network_clien
         ).data
         ad_list = [ad.name for ad in ads] if ads else []
         add_log(f"Availability domains found: {len(ad_list)} — {', '.join(ad_list)}")
+        if not ad_list:
+            add_log("Error: No availability domains found for this tenancy.")
+            return
 
         # Handle AD preference from user
         ad_preference = account_config.get('ad_preference', '')
@@ -941,6 +1144,8 @@ def run_automated_creation(config, account_config, compute_client, network_clien
         attempts = 0
         success = False
         ad_index = 0
+        max_attempts = max(1, min(int(max_attempts), 1000))
+        add_log(f"Retry limit: {max_attempts} attempts")
 
         # Shuffle AD list for random order (speeds up finding capacity)
         import random as _random
@@ -948,7 +1153,9 @@ def run_automated_creation(config, account_config, compute_client, network_clien
             _random.shuffle(ad_list)
             add_log(f"AD order randomized for faster discovery: {', '.join(ad_list)}")
 
-        while True:
+        # Never leave a daemon thread retrying forever. This is especially
+        # important on Railway/VPS instances with limited CPU and memory.
+        while attempts < max_attempts:
             attempts += 1
 
             if stop_event.is_set():
@@ -959,6 +1166,18 @@ def run_automated_creation(config, account_config, compute_client, network_clien
             current_ad = ad_list[ad_index % len(ad_list)] if ad_list else ''
             if len(ad_list) > 1:
                 add_log(f"Attempt {attempts}: trying AD '{current_ad}'...")
+
+            # Send one compact, structured Telegram update per launch attempt.
+            # The private key itself is never sent; only its OCI fingerprint is.
+            send_telegram_attempt_update(
+                telegram_bot_token,
+                telegram_chat_id,
+                attempts,
+                oci_email,
+                target_region,
+                current_ad,
+                config.get('fingerprint')
+            )
 
             # Update instance details with current AD
             instance_details.availability_domain = current_ad
@@ -973,14 +1192,15 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                     shape = account_config.get('shape', 'Unknown')
                     region = config.get('region', 'unknown')
                     pp_time = format_phnom_penh_time()
-                    user_line = f"<b>User:</b> {oci_username}\n" if oci_username else ""
                     tg_msg = (
                         f"&#9989; <b>OCI Provisioner Success!</b>\n\n"
-                        f"<b>Instance:</b> {instance_name}\n"
-                        f"<b>Shape:</b> {shape}\n"
-                        f"<b>Region:</b> {region}\n"
-                        f"{user_line}"
-                        f"<b>Time:</b> {pp_time} (Phnom Penh)\n"
+                        f"<b>Attempt:</b> {attempts}\n"
+                        f"<b>OCI email:</b> {_telegram_value(oci_email)}\n"
+                        f"<b>Instance:</b> {_telegram_value(instance_name)}\n"
+                        f"<b>Shape:</b> {_telegram_value(shape)}\n"
+                        f"<b>Location:</b> {_telegram_value(region)} / AD {_telegram_value(current_ad)}\n"
+                        f"<b>OCI key fingerprint:</b> {_telegram_value(config.get('fingerprint'), 'not provided')}\n"
+                        f"<b>Time:</b> {_telegram_value(pp_time)} (Phnom Penh)\n"
                         f"<b>Status:</b> Running\n\n"
                         f"Your Always Free instance has been successfully provisioned!"
                     )
@@ -1043,16 +1263,19 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                 break
 
         if not success:
+            if attempts >= max_attempts and not stop_event.is_set():
+                add_log(f"Retry limit reached ({max_attempts} attempts).")
             add_log("Provisioning loop ended without success.")
             if telegram_bot_token and telegram_chat_id:
-                user_line = f"<b>User:</b> {oci_username}\n" if oci_username else ""
                 pp_time = format_phnom_penh_time()
                 tg_msg = (
                     f"&#10060; <b>OCI Provisioner Stopped</b>\n\n"
-                    f"{user_line}"
-                    f"Loop stopped after {attempts} attempts without success.\n"
-                    f"<b>Region:</b> {config.get('region', 'unknown')}\n"
-                    f"<b>Time:</b> {pp_time} (Phnom Penh)"
+                    f"<b>Attempts:</b> {attempts}\n"
+                    f"<b>OCI email:</b> {_telegram_value(oci_email)}\n"
+                    f"<b>Location:</b> {_telegram_value(target_region)}\n"
+                    f"<b>OCI key fingerprint:</b> {_telegram_value(config.get('fingerprint'), 'not provided')}\n"
+                    f"Loop stopped without success.\n"
+                    f"<b>Time:</b> {_telegram_value(pp_time)} (Phnom Penh)"
                 )
                 send_telegram_message(telegram_bot_token, telegram_chat_id, tg_msg)
 
@@ -1063,13 +1286,15 @@ def run_automated_creation(config, account_config, compute_client, network_clien
         else:
             add_log(f"Automation engine failure: {msg}")
         if telegram_bot_token and telegram_chat_id:
-            user_line = f"<b>User:</b> {oci_username}\n" if oci_username else ""
             pp_time = format_phnom_penh_time()
             tg_msg = (
                 f"&#10060; <b>OCI Provisioner Error</b>\n\n"
-                f"{user_line}"
-                f"Automation engine failure:\n{msg[:200]}\n"
-                f"<b>Time:</b> {pp_time} (Phnom Penh)"
+                f"<b>Attempt:</b> {attempts if 'attempts' in locals() else 0}\n"
+                f"<b>OCI email:</b> {_telegram_value(oci_email)}\n"
+                f"<b>Location:</b> {_telegram_value(target_region)}\n"
+                f"<b>OCI key fingerprint:</b> {_telegram_value(config.get('fingerprint'), 'not provided')}\n"
+                f"Automation engine failure:\n{_telegram_value(msg[:200])}\n"
+                f"<b>Time:</b> {_telegram_value(pp_time)} (Phnom Penh)"
             )
             send_telegram_message(telegram_bot_token, telegram_chat_id, tg_msg)
 
@@ -1081,17 +1306,20 @@ def run_automated_creation(config, account_config, compute_client, network_clien
 
 @app.route('/api/free-tier-status', methods=['POST'])
 @require_auth
+@limit_oci_requests
 def free_tier_status():
     data = request.json or {}
     config = build_config(data)
 
     try:
-        oci.config.validate_config(config)
-        compute_client = oci.core.ComputeClient(config)
-        block_client = oci.core.BlockstorageClient(config)
-        identity_client = oci.identity.IdentityClient(config)
-
-        usage = get_free_tier_usage(config, compute_client, block_client, identity_client)
+        get_oci().config.validate_config(config)
+        usage = get_cached_usage(usage_cache_key(config))
+        if usage is None:
+            compute_client = create_oci_client(oci.core.ComputeClient, config)
+            block_client = create_oci_client(oci.core.BlockstorageClient, config)
+            identity_client = create_oci_client(oci.identity.IdentityClient, config)
+            usage = get_free_tier_usage(config, compute_client, block_client, identity_client)
+            cache_usage(usage_cache_key(config), usage)
 
         return jsonify({
             'success': True,
@@ -1115,13 +1343,14 @@ def get_status():
 
 @app.route('/api/auto-launch-loop', methods=['POST'])
 @require_auth
+@limit_oci_requests
 def auto_launch():
-    global automation_running, tg_live_enabled, tg_live_bot_token, tg_live_chat_id
+    global automation_running, tg_live_enabled, tg_live_bot_token, tg_live_chat_id, tg_live_last_sent
     data = request.json or {}
     config = build_config(data)
 
     try:
-        oci.config.validate_config(config)
+        get_oci().config.validate_config(config)
     except Exception as e:
         return jsonify({'success': False, 'error': f"Invalid OCI config: {e}"})
 
@@ -1157,23 +1386,32 @@ def auto_launch():
         stop_event.clear()
 
     try:
-        compute_client = oci.core.ComputeClient(config)
-        network_client = oci.core.VirtualNetworkClient(config)
-        identity_client = oci.identity.IdentityClient(config)
+        compute_client = create_oci_client(oci.core.ComputeClient, config)
+        network_client = create_oci_client(oci.core.VirtualNetworkClient, config)
+        identity_client = create_oci_client(oci.identity.IdentityClient, config)
 
-        retry_delay = int(data.get('retry_delay', 60))
-        if retry_delay < 10:
-            retry_delay = 10
+        retry_delay = env_int('RETRY_DELAY_DEFAULT', 60, 10, 3600)
+        try:
+            retry_delay = max(10, min(int(data.get('retry_delay', retry_delay)), 3600))
+        except (TypeError, ValueError):
+            pass
 
-        randomize_delay = data.get('randomize_delay', False)
-        random_min = int(data.get('random_min', 25))
-        random_max = int(data.get('random_max', 60))
+        randomize_delay = bool(data.get('randomize_delay', False))
+        try:
+            random_min = max(10, min(int(data.get('random_min', 25)), 3600))
+        except (TypeError, ValueError):
+            random_min = 25
+        try:
+            random_max = max(random_min, min(int(data.get('random_max', 60)), 3600))
+        except (TypeError, ValueError):
+            random_max = max(random_min, 60)
 
         thread = threading.Thread(
             target=run_automated_creation,
             args=(config, data, compute_client, network_client, identity_client,
                   retry_delay, randomize_delay, random_min, random_max,
-                  data.get('telegram_bot_token'), data.get('telegram_chat_id')),
+                  data.get('telegram_bot_token'), data.get('telegram_chat_id'),
+                  MAX_ATTEMPTS),
             daemon=True
         )
         thread.start()
@@ -1203,10 +1441,16 @@ def stop_loop():
 @app.route('/api/logs', methods=['GET'])
 @require_auth
 def fetch_live_logs():
-    offset = int(request.args.get('offset', 0))
+    try:
+        offset = max(0, int(request.args.get('offset', 0)))
+    except (TypeError, ValueError):
+        offset = 0
     with logs_lock:
-        batch = global_logs[offset:]
-        total = len(global_logs)
+        # Offsets are absolute, so the browser keeps working after the bounded
+        # in-memory log drops its oldest lines.
+        start = max(0, offset - global_log_base)
+        batch = global_logs[start:]
+        total = global_log_base + len(global_logs)
     return jsonify({'logs': batch, 'next_offset': total})
 
 
