@@ -563,12 +563,12 @@ keepalive_boot()
 
 
 # ---- Boot volume manager ----
-# Attach, detach, re-attach, replace and remove (delete) boot volumes. Every
-# mutating operation runs as a single process-local background job, mirroring
-# the provisioning loop: progress goes to the shared live log (and the
-# Telegram live stream when enabled), so the HTTP request itself returns
+# Create, attach, detach, re-attach, replace and remove (delete) boot volumes.
+# Every mutating operation runs as a single process-local background job,
+# mirroring the provisioning loop: progress goes to the shared live log (and
+# the Telegram live stream when enabled), so the HTTP request itself returns
 # immediately and never risks a Gunicorn timeout on slow OCI state changes.
-BV_JOB_OPERATIONS = ('detach', 'attach', 'delete', 'instance-action', 'replace')
+BV_JOB_OPERATIONS = ('create', 'detach', 'attach', 'delete', 'instance-action', 'replace')
 BV_POWER_ACTIONS = ('SOFTSTOP', 'STOP', 'START')
 BV_POLL_SECONDS = 4
 BV_WAIT_ATTACHMENT_SECONDS = 240
@@ -784,27 +784,54 @@ def _bv_delete_volume(compute_client, block_client, compartment_id, volume):
     _bv_log('%s deleted — its size no longer counts against the 200 GB free-tier storage.' % label)
 
 
-def _bv_create_from_backup(block_client, compartment_id, availability_domain, backup_id, display_name):
+def _bv_create_volume(
+    block_client, compartment_id, availability_domain, display_name,
+    size_in_gbs=None, backup_id=None,
+):
+    """Create an empty boot volume or restore one from a boot volume backup."""
     sdk = get_oci()
-    details = sdk.core.models.CreateBootVolumeDetails(
-        compartment_id=compartment_id,
-        availability_domain=availability_domain,
-        display_name=display_name[:64] if display_name else None,
-        source_details=sdk.core.models.BootVolumeSourceFromBootVolumeBackupDetails(
-            boot_volume_backup_id=backup_id
-        ),
-    )
-    _bv_log('Creating a fresh boot volume from backup %s ...' % _bv_ocid(backup_id))
+    details_args = {
+        'compartment_id': compartment_id,
+        'availability_domain': availability_domain,
+        'display_name': display_name[:64] if display_name else None,
+    }
+    if backup_id:
+        details_args['source_details'] = (
+            sdk.core.models.BootVolumeSourceFromBootVolumeBackupDetails(
+                id=backup_id
+            )
+        )
+    if size_in_gbs is not None:
+        details_args['size_in_gbs'] = size_in_gbs
+
+    details = sdk.core.models.CreateBootVolumeDetails(**details_args)
+    if backup_id:
+        _bv_log('Restoring a fresh boot volume from backup %s ...' % _bv_ocid(backup_id))
+        wait_label = 'restore of new boot volume'
+    else:
+        _bv_log(
+            'Creating an empty %s GB boot volume in %s ...'
+            % (size_in_gbs, availability_domain)
+        )
+        wait_label = 'creation of new boot volume'
+
     volume = block_client.create_boot_volume(create_boot_volume_details=details).data
     volume_id = getattr(volume, 'id', None)
     if volume_id:
         _bv_wait(
             lambda: _bv_volume_state(block_client, volume_id),
-            'AVAILABLE', BV_WAIT_ATTACHMENT_SECONDS, 'restore of new boot volume'
+            'AVAILABLE', BV_WAIT_ATTACHMENT_SECONDS, wait_label
         )
         volume = block_client.get_boot_volume(boot_volume_id=volume_id).data
     _bv_log('New boot volume ready: %s.' % _bv_volume_label(volume))
     return volume
+
+
+def _bv_create_from_backup(block_client, compartment_id, availability_domain, backup_id, display_name):
+    return _bv_create_volume(
+        block_client, compartment_id, availability_domain, display_name,
+        backup_id=backup_id,
+    )
 
 
 def _bv_get_volume(block_client, boot_volume_id):
@@ -997,7 +1024,17 @@ def run_boot_volume_job(operation, config, params, telegram_bot_token=None, tele
             # Stop was pressed before the first mutation: change nothing.
             raise _BvJobError('Stopped by user before any OCI change was made.')
 
-        if operation == 'detach':
+        if operation == 'create':
+            _bv_create_volume(
+                block_client,
+                tenancy,
+                params.get('availability_domain'),
+                params.get('display_name'),
+                size_in_gbs=params.get('size_gb'),
+                backup_id=params.get('backup_id'),
+            )
+
+        elif operation == 'detach':
             volume = _bv_get_volume(block_client, params.get('boot_volume_id'))
             _bv_detach_volume(compute_client, tenancy, volume)
 
@@ -1071,6 +1108,14 @@ def list_boot_volumes():
         tenancy = config['tenancy']
 
         ads = identity_client.list_availability_domains(compartment_id=tenancy).data
+        availability_domains = []
+        for ad in ads:
+            ad_name = getattr(ad, 'name', None)
+            if ad_name:
+                availability_domains.append({
+                    'name': ad_name,
+                    'ad_short': ad_name.split(':')[-1],
+                })
 
         instance_index = {}
         instances = []
@@ -1153,6 +1198,7 @@ def list_boot_volumes():
 
         return jsonify({
             'success': True,
+            'availability_domains': availability_domains,
             'instances': instances,
             'boot_volumes': volumes,
             'backups': backups,
@@ -1187,7 +1233,34 @@ def boot_volume_action():
     params = {}
     target = None
 
-    if operation in ('detach', 'delete'):
+    if operation == 'create':
+        availability_domain = str(data.get('availability_domain', '')).strip()
+        if not availability_domain:
+            return jsonify({'success': False, 'error': 'availability_domain is required'})
+
+        display_name = str(data.get('display_name', '') or '').strip() or None
+        backup_id = str(data.get('backup_id', '') or '').strip() or None
+        params.update({
+            'availability_domain': availability_domain,
+            'display_name': display_name,
+            'backup_id': backup_id,
+        })
+        if not backup_id:
+            raw_size = data.get('size_gb')
+            if raw_size is None or raw_size == '' or isinstance(raw_size, bool):
+                return jsonify({'success': False, 'error': 'size_gb is required when creating an empty volume'})
+            try:
+                if isinstance(raw_size, float) and not raw_size.is_integer():
+                    raise ValueError('size must be a whole number')
+                size_gb = int(raw_size)
+            except (TypeError, ValueError):
+                return jsonify({'success': False, 'error': 'size_gb must be a whole number between 50 and 32768'})
+            if size_gb < 50 or size_gb > 32768:
+                return jsonify({'success': False, 'error': 'size_gb must be between 50 and 32768'})
+            params['size_gb'] = size_gb
+        target = display_name or backup_id or availability_domain
+
+    elif operation in ('detach', 'delete'):
         boot_volume_id = str(data.get('boot_volume_id', '')).strip()
         if not boot_volume_id:
             return jsonify({'success': False, 'error': 'boot_volume_id is required'})
