@@ -562,6 +562,720 @@ def keepalive_public_status():
 keepalive_boot()
 
 
+# ---- Boot volume manager ----
+# Attach, detach, re-attach, replace and remove (delete) boot volumes. Every
+# mutating operation runs as a single process-local background job, mirroring
+# the provisioning loop: progress goes to the shared live log (and the
+# Telegram live stream when enabled), so the HTTP request itself returns
+# immediately and never risks a Gunicorn timeout on slow OCI state changes.
+BV_JOB_OPERATIONS = ('detach', 'attach', 'delete', 'instance-action', 'replace')
+BV_POWER_ACTIONS = ('SOFTSTOP', 'STOP', 'START')
+BV_POLL_SECONDS = 4
+BV_WAIT_ATTACHMENT_SECONDS = 240
+BV_WAIT_INSTANCE_SECONDS = 420
+BV_WAIT_DELETE_SECONDS = 180
+
+bv_job_lock = threading.Lock()
+bv_job_running = False
+bv_job_operation = None
+bv_job_target = None
+bv_stop_event = threading.Event()
+
+
+class _BvJobError(Exception):
+    """An operator-fixable job failure (wrong state, stop request, timeout)."""
+
+
+def _bv_log(message):
+    add_log('Boot volume: ' + message)
+
+
+def _bv_ocid(value):
+    value = str(value or '')
+    return (value[:24] + '...') if len(value) > 24 else value
+
+
+def _bv_error_text(exc):
+    text = getattr(exc, 'message', None) or str(exc)
+    return str(text)[:200]
+
+
+def _bv_volume_label(volume):
+    name = getattr(volume, 'display_name', None) or _bv_ocid(getattr(volume, 'id', '?'))
+    return '%s (%s GB)' % (name, getattr(volume, 'size_in_gbs', '?'))
+
+
+def _bv_instance_label(instance):
+    return getattr(instance, 'display_name', None) or _bv_ocid(getattr(instance, 'id', '?'))
+
+
+def _bv_wait(getter, target_states, timeout_seconds, label):
+    """Poll a lifecycle-state getter until a target state, stop, or timeout."""
+    if isinstance(target_states, str):
+        target_states = (target_states,)
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if bv_stop_event.is_set():
+            raise _BvJobError('Stopped by user.')
+        try:
+            state = getter()
+        except _BvJobError:
+            raise
+        except Exception as exc:
+            raise _BvJobError('Polling %s failed: %s' % (label, _bv_error_text(exc)))
+        if state in target_states:
+            return state
+        if time.monotonic() >= deadline:
+            raise _BvJobError(
+                'Timed out waiting for %s to reach %s (last state: %s).'
+                % (label, '/'.join(target_states), state or 'unknown')
+            )
+        time.sleep(BV_POLL_SECONDS)
+
+
+def _bv_instance_state(compute_client, instance_id):
+    return getattr(compute_client.get_instance(instance_id=instance_id).data, 'lifecycle_state', None)
+
+
+def _bv_volume_state(block_client, boot_volume_id):
+    return getattr(block_client.get_boot_volume(boot_volume_id=boot_volume_id).data, 'lifecycle_state', None)
+
+
+def _bv_attachment_state(compute_client, attachment_id):
+    return getattr(
+        compute_client.get_boot_volume_attachment(boot_volume_attachment_id=attachment_id).data,
+        'lifecycle_state', None
+    )
+
+
+def _bv_list_attachments(compute_client, compartment_id, availability_domain, instance_id=None):
+    kwargs = {'compartment_id': compartment_id, 'availability_domain': availability_domain}
+    if instance_id:
+        kwargs['instance_id'] = instance_id
+    return compute_client.list_boot_volume_attachments(**kwargs).data
+
+
+def _bv_volume_attachment(compute_client, compartment_id, volume):
+    """The live (non-DETACHED) attachment of a boot volume, if any."""
+    for att in _bv_list_attachments(
+        compute_client, compartment_id, getattr(volume, 'availability_domain', None)
+    ):
+        if att.boot_volume_id == volume.id and getattr(att, 'lifecycle_state', '') != 'DETACHED':
+            return att
+    return None
+
+
+def _bv_instance_attachment(compute_client, compartment_id, instance):
+    """The live (non-DETACHED) boot volume attachment of an instance, if any."""
+    for att in _bv_list_attachments(
+        compute_client, compartment_id, getattr(instance, 'availability_domain', None),
+        instance_id=instance.id
+    ):
+        if getattr(att, 'lifecycle_state', '') != 'DETACHED':
+            return att
+    return None
+
+
+def _bv_require_stopped(compute_client, instance_id, operation):
+    state = _bv_instance_state(compute_client, instance_id)
+    if state != 'STOPPED':
+        raise _BvJobError(
+            'Cannot %s while the instance is %s. Stop it first — the power '
+            'buttons are in this panel (Replace stops the instance for you).'
+            % (operation, state or 'unknown')
+        )
+
+
+def _bv_power(compute_client, instance, action):
+    label = _bv_instance_label(instance)
+    target = 'RUNNING' if action == 'START' else 'STOPPED'
+    current = getattr(instance, 'lifecycle_state', None)
+    if current == target:
+        _bv_log('Instance %s is already %s — nothing to do.' % (label, target))
+        return current
+    _bv_log('Power %s on instance %s ...' % (action, label))
+    compute_client.instance_action(instance_id=instance.id, action=action)
+    state = _bv_wait(
+        lambda: _bv_instance_state(compute_client, instance.id),
+        target, BV_WAIT_INSTANCE_SECONDS, 'instance power ' + action
+    )
+    _bv_log('Instance %s is now %s.' % (label, state))
+    return state
+
+
+def _bv_detach_volume(compute_client, compartment_id, volume):
+    label = _bv_volume_label(volume)
+    attachment = _bv_volume_attachment(compute_client, compartment_id, volume)
+    if not attachment:
+        _bv_log('%s has no active attachment — it is already detached.' % label)
+        return None
+    _bv_require_stopped(compute_client, attachment.instance_id, 'detach')
+    _bv_log('Detaching %s from instance %s ...' % (label, _bv_ocid(attachment.instance_id)))
+    compute_client.detach_boot_volume(boot_volume_attachment_id=attachment.id)
+    _bv_wait(
+        lambda: _bv_attachment_state(compute_client, attachment.id),
+        'DETACHED', BV_WAIT_ATTACHMENT_SECONDS, 'detach of ' + label
+    )
+    _bv_log('%s detached — now AVAILABLE for attach, replace or delete.' % label)
+    return attachment.instance_id
+
+
+def _bv_attach_volume(compute_client, compartment_id, volume, instance):
+    sdk = get_oci()
+    label = _bv_volume_label(volume)
+    inst_label = _bv_instance_label(instance)
+    state = getattr(volume, 'lifecycle_state', None)
+    if state != 'AVAILABLE':
+        raise _BvJobError(
+            '%s is %s — only AVAILABLE (fully detached) volumes can attach. '
+            'Detach it from its current instance first.' % (label, state or 'unknown')
+        )
+    if getattr(volume, 'availability_domain', None) != getattr(instance, 'availability_domain', None):
+        raise _BvJobError(
+            '%s lives in %s but instance %s is in %s. Boot volumes only attach '
+            'inside their own availability domain.' % (
+                label, getattr(volume, 'availability_domain', '?'),
+                inst_label, getattr(instance, 'availability_domain', '?')
+            )
+        )
+    existing = _bv_instance_attachment(compute_client, compartment_id, instance)
+    if existing:
+        raise _BvJobError(
+            'Instance %s already has a boot volume (%s). Detach that one first '
+            '— or use Replace, which swaps the disks safely in one job.'
+            % (inst_label, _bv_ocid(existing.boot_volume_id))
+        )
+    _bv_require_stopped(compute_client, instance.id, 'attach')
+    details = sdk.core.models.AttachBootVolumeDetails(
+        instance_id=instance.id, boot_volume_id=volume.id
+    )
+    _bv_log('Attaching %s to instance %s ...' % (label, inst_label))
+    attachment = compute_client.attach_boot_volume(attach_boot_volume_details=details).data
+    attachment_id = getattr(attachment, 'id', None)
+    if attachment_id:
+        _bv_wait(
+            lambda: _bv_attachment_state(compute_client, attachment_id),
+            'ATTACHED', BV_WAIT_ATTACHMENT_SECONDS, 'attach of ' + label
+        )
+    _bv_log('%s attached to %s.' % (label, inst_label))
+    return attachment
+
+
+def _bv_delete_volume(compute_client, block_client, compartment_id, volume):
+    label = _bv_volume_label(volume)
+    state = getattr(volume, 'lifecycle_state', None)
+    if state != 'AVAILABLE':
+        raise _BvJobError(
+            '%s is %s — detach it from its instance before deleting. Deleting '
+            'is permanent.' % (label, state or 'unknown')
+        )
+    _bv_log('Deleting %s (permanent) ...' % label)
+    block_client.delete_boot_volume(boot_volume_id=volume.id)
+
+    def _gone_state():
+        try:
+            return block_client.get_boot_volume(boot_volume_id=volume.id).data.lifecycle_state
+        except Exception as exc:
+            if getattr(exc, 'status', None) == 404 or 'not found' in str(exc).lower():
+                return 'TERMINATED'
+            raise
+
+    _bv_wait(_gone_state, 'TERMINATED', BV_WAIT_DELETE_SECONDS, 'deletion of ' + label)
+    _bv_log('%s deleted — its size no longer counts against the 200 GB free-tier storage.' % label)
+
+
+def _bv_create_from_backup(block_client, compartment_id, availability_domain, backup_id, display_name):
+    sdk = get_oci()
+    details = sdk.core.models.CreateBootVolumeDetails(
+        compartment_id=compartment_id,
+        availability_domain=availability_domain,
+        display_name=display_name[:64] if display_name else None,
+        source_details=sdk.core.models.BootVolumeSourceFromBootVolumeBackupDetails(
+            boot_volume_backup_id=backup_id
+        ),
+    )
+    _bv_log('Creating a fresh boot volume from backup %s ...' % _bv_ocid(backup_id))
+    volume = block_client.create_boot_volume(create_boot_volume_details=details).data
+    volume_id = getattr(volume, 'id', None)
+    if volume_id:
+        _bv_wait(
+            lambda: _bv_volume_state(block_client, volume_id),
+            'AVAILABLE', BV_WAIT_ATTACHMENT_SECONDS, 'restore of new boot volume'
+        )
+        volume = block_client.get_boot_volume(boot_volume_id=volume_id).data
+    _bv_log('New boot volume ready: %s.' % _bv_volume_label(volume))
+    return volume
+
+
+def _bv_get_volume(block_client, boot_volume_id):
+    try:
+        return block_client.get_boot_volume(boot_volume_id=boot_volume_id).data
+    except Exception as exc:
+        raise _BvJobError(
+            'Boot volume %s is not readable: %s' % (_bv_ocid(boot_volume_id), _bv_error_text(exc))
+        )
+
+
+def _bv_get_instance(compute_client, instance_id):
+    try:
+        return compute_client.get_instance(instance_id=instance_id).data
+    except Exception as exc:
+        raise _BvJobError(
+            'Instance %s is not readable: %s' % (_bv_ocid(instance_id), _bv_error_text(exc))
+        )
+
+
+def _bv_replace_flow(compute_client, block_client, tenancy, params):
+    """Stop -> detach old -> attach replacement -> start, with rollback.
+
+    The replacement source is either an existing AVAILABLE boot volume in the
+    same AD, or a boot volume backup (a fresh volume is restored from it first).
+    If attaching the replacement fails, the original disk is re-attached and
+    the instance started again — best effort — so the VM is not left naked.
+    """
+    instance = _bv_get_instance(compute_client, params.get('instance_id'))
+    inst_label = _bv_instance_label(instance)
+    ad_name = getattr(instance, 'availability_domain', None)
+    source_type = params.get('source_type')
+    source_id = params.get('source_id')
+    delete_old = bool(params.get('delete_old'))
+    power_action = params.get('power_action') or 'SOFTSTOP'
+    _bv_log('Replace on instance %s in %s.' % (inst_label, ad_name or 'unknown AD'))
+
+    # 1. The instance must be STOPPED before its boot disk can move.
+    state = getattr(instance, 'lifecycle_state', None)
+    if state != 'STOPPED':
+        _bv_power(compute_client, instance, power_action)
+    else:
+        _bv_log('Instance %s is already STOPPED.' % inst_label)
+
+    # 2. Find the disk currently booting the instance.
+    attachment = _bv_instance_attachment(compute_client, tenancy, instance)
+    if not attachment:
+        raise _BvJobError(
+            'Instance %s has no boot volume attached — use plain Attach instead.' % inst_label
+        )
+    old_volume = _bv_get_volume(block_client, attachment.boot_volume_id)
+    old_label = _bv_volume_label(old_volume)
+    _bv_log('Current disk: %s.' % old_label)
+
+    # 3. Resolve the replacement disk before touching the old one.
+    new_volume = None
+    if source_type == 'backup':
+        new_name = 'replace-%s-%s' % (inst_label, int(time.time()))
+        new_volume = _bv_create_from_backup(block_client, tenancy, ad_name, source_id, new_name)
+    elif source_type == 'boot_volume':
+        new_volume = _bv_get_volume(block_client, source_id)
+        if getattr(new_volume, 'availability_domain', None) != ad_name:
+            raise _BvJobError(
+                'Replacement %s is in %s but the instance is in %s. Boot volumes '
+                'never cross availability domains.' % (
+                    _bv_volume_label(new_volume),
+                    getattr(new_volume, 'availability_domain', '?'), ad_name
+                )
+            )
+        if getattr(new_volume, 'id', None) == getattr(old_volume, 'id', None):
+            raise _BvJobError('The selected replacement is the disk already attached. Pick another source.')
+        state = getattr(new_volume, 'lifecycle_state', None)
+        if state != 'AVAILABLE':
+            raise _BvJobError(
+                'Replacement %s is %s — it must be AVAILABLE (detached) first.'
+                % (_bv_volume_label(new_volume), state or 'unknown')
+            )
+    else:
+        raise _BvJobError("Replace needs a replacement source: an AVAILABLE boot volume or a backup.")
+
+    # 4. Detach the old disk, then attach the replacement with rollback.
+    _bv_detach_volume(compute_client, tenancy, old_volume)
+    try:
+        _bv_attach_volume(compute_client, tenancy, new_volume, instance)
+    except Exception as exc:
+        failure = _bv_error_text(exc)
+        _bv_log('Attach of the replacement failed (%s) — rolling back to %s.' % (failure, old_label))
+        try:
+            old_refreshed = _bv_get_volume(block_client, old_volume.id)
+            _bv_attach_volume(compute_client, tenancy, old_refreshed, instance)
+            _bv_log('Rollback attached the original disk again; starting the instance.')
+            compute_client.instance_action(instance_id=instance.id, action='START')
+            _bv_wait(
+                lambda: _bv_instance_state(compute_client, instance.id),
+                'RUNNING', BV_WAIT_INSTANCE_SECONDS, 'instance start after rollback'
+            )
+            _bv_log('Instance %s is RUNNING again on its original disk.' % inst_label)
+        except Exception as rollback_exc:
+            _bv_log(
+                'ROLLBACK FAILED: %s — re-attach %s manually in the OCI Console.'
+                % (_bv_error_text(rollback_exc), old_label)
+            )
+        raise _BvJobError('Replace aborted during attach: %s' % failure)
+
+    # 5. Boot the instance on the replacement disk.
+    compute_client.instance_action(instance_id=instance.id, action='START')
+    _bv_wait(
+        lambda: _bv_instance_state(compute_client, instance.id),
+        'RUNNING', BV_WAIT_INSTANCE_SECONDS, 'instance start'
+    )
+    _bv_log('Replace complete: %s now boots from %s.' % (inst_label, _bv_volume_label(new_volume)))
+
+    # 6. Optionally free the old disk afterwards (best effort).
+    if delete_old:
+        try:
+            old_refreshed = _bv_get_volume(block_client, old_volume.id)
+            _bv_delete_volume(compute_client, block_client, tenancy, old_refreshed)
+        except Exception as exc:
+            _bv_log(
+                'Old disk kept (delete failed: %s) — it is detached; delete it later from this panel.'
+                % _bv_error_text(exc)
+            )
+    else:
+        _bv_log(
+            'Old disk %s kept (detached). Verify the new disk, then delete the old '
+            'one from this panel to reclaim its storage.' % old_label
+        )
+    return {'instance': inst_label, 'new_disk': _bv_volume_label(new_volume), 'old_disk_deleted': delete_old}
+
+
+def _bv_send_telegram(bot_token, chat_id, message):
+    if not bot_token or not chat_id:
+        return
+    ok, err = send_telegram_message(bot_token, chat_id, message)
+    if not ok:
+        add_log('Boot volume Telegram alert failed: %s' % err)
+
+
+def _bv_job_begin(operation, target):
+    global bv_job_running, bv_job_operation, bv_job_target
+    with bv_job_lock:
+        if bv_job_running:
+            return "A boot volume job is already running ('%s'). Wait for it or stop it from the panel." % bv_job_operation
+        bv_job_running = True
+        bv_job_operation = operation
+        bv_job_target = target
+        bv_stop_event.clear()
+    return None
+
+
+def _bv_job_finish():
+    global bv_job_running, bv_job_operation, bv_job_target
+    with bv_job_lock:
+        bv_job_running = False
+        bv_job_operation = None
+        bv_job_target = None
+
+
+def boot_volume_job_status():
+    with bv_job_lock:
+        return {
+            'running': bv_job_running,
+            'operation': bv_job_operation,
+            'target': _bv_ocid(bv_job_target) if bv_job_target else None,
+        }
+
+
+def run_boot_volume_job(operation, config, params, telegram_bot_token=None, telegram_chat_id=None):
+    """Single background worker for every mutating boot volume operation.
+
+    Holds one OCI slot for the whole job, exactly like the provisioning loop,
+    so a long stop/detach/attach sequence cannot starve normal UI requests.
+    """
+    telegram_bot_token = (telegram_bot_token or '').strip() or None
+    telegram_chat_id = (telegram_chat_id or '').strip() or None
+
+    if not oci_api_slots.acquire(timeout=5):
+        add_log('Boot volume job could not start: OCI request limit is busy.')
+        _bv_job_finish()
+        return
+    try:
+        sdk = get_oci()
+        compute_client = create_oci_client(sdk.core.ComputeClient, config)
+        block_client = create_oci_client(sdk.core.BlockstorageClient, config)
+        tenancy = config['tenancy']
+        _bv_log("Job '%s' started." % operation)
+        replace_summary = None
+
+        if bv_stop_event.is_set():
+            # Stop was pressed before the first mutation: change nothing.
+            raise _BvJobError('Stopped by user before any OCI change was made.')
+
+        if operation == 'detach':
+            volume = _bv_get_volume(block_client, params.get('boot_volume_id'))
+            _bv_detach_volume(compute_client, tenancy, volume)
+
+        elif operation == 'attach':
+            volume = _bv_get_volume(block_client, params.get('boot_volume_id'))
+            instance = _bv_get_instance(compute_client, params.get('instance_id'))
+            _bv_attach_volume(compute_client, tenancy, volume, instance)
+
+        elif operation == 'delete':
+            volume = _bv_get_volume(block_client, params.get('boot_volume_id'))
+            _bv_delete_volume(compute_client, block_client, tenancy, volume)
+
+        elif operation == 'instance-action':
+            instance = _bv_get_instance(compute_client, params.get('instance_id'))
+            _bv_power(compute_client, instance, params.get('power_action'))
+
+        elif operation == 'replace':
+            replace_summary = _bv_replace_flow(compute_client, block_client, tenancy, params)
+
+        else:
+            raise _BvJobError("Unknown boot volume operation '%s'." % operation)
+
+        _bv_log("Job '%s' finished successfully." % operation)
+        if operation == 'replace' and replace_summary:
+            _bv_send_telegram(
+                telegram_bot_token, telegram_chat_id,
+                "&#128260; <b>Boot disk replaced</b>\n\n"
+                "<b>Instance:</b> %s\n"
+                "<b>Now boots from:</b> %s\n"
+                "<b>Old disk:</b> %s\n"
+                "<b>Time:</b> %s (Phnom Penh)" % (
+                    _telegram_value(replace_summary['instance']),
+                    _telegram_value(replace_summary['new_disk']),
+                    'deleted' if replace_summary['old_disk_deleted'] else 'kept (detached)',
+                    _telegram_value(format_phnom_penh_time()),
+                )
+            )
+    except _BvJobError as exc:
+        _bv_log("Job '%s' failed: %s" % (operation, exc))
+        if operation == 'replace':
+            _bv_send_telegram(
+                telegram_bot_token, telegram_chat_id,
+                "&#10060; <b>Boot disk replace failed</b>\n\n"
+                "<b>Reason:</b> %s\n"
+                "<b>Time:</b> %s (Phnom Penh)" % (
+                    _telegram_value(str(exc)[:200]),
+                    _telegram_value(format_phnom_penh_time()),
+                )
+            )
+    except Exception as exc:
+        _bv_log("Job '%s' crashed: %s" % (operation, _bv_error_text(exc)))
+    finally:
+        oci_api_slots.release()
+        _bv_job_finish()
+
+
+@app.route('/api/boot-volumes/list', methods=['POST'])
+@require_auth
+@limit_oci_requests
+def list_boot_volumes():
+    """Inventory for the boot volume manager: instances, volumes, backups."""
+    data = request.json or {}
+    config = build_config(data)
+
+    try:
+        sdk = get_oci()
+        sdk.config.validate_config(config)
+        compute_client = create_oci_client(sdk.core.ComputeClient, config)
+        block_client = create_oci_client(sdk.core.BlockstorageClient, config)
+        identity_client = create_oci_client(sdk.identity.IdentityClient, config)
+        tenancy = config['tenancy']
+
+        ads = identity_client.list_availability_domains(compartment_id=tenancy).data
+
+        instance_index = {}
+        instances = []
+        for inst in compute_client.list_instances(compartment_id=tenancy).data:
+            state = getattr(inst, 'lifecycle_state', '')
+            if state == 'TERMINATED':
+                continue
+            instance_index[inst.id] = inst
+            ad_name = getattr(inst, 'availability_domain', '') or ''
+            instances.append({
+                'id': inst.id,
+                'name': _bv_instance_label(inst),
+                'state': state,
+                'shape': getattr(inst, 'shape', ''),
+                'availability_domain': ad_name,
+                'ad_short': ad_name.split(':')[-1],
+                'boot_volume_id': None,
+            })
+        instance_by_id = {item['id']: item for item in instances}
+
+        volumes = []
+        total_storage_gb = 0
+        for ad in ads:
+            ad_name = getattr(ad, 'name', None)
+            attachments_by_volume = {}
+            for att in _bv_list_attachments(compute_client, tenancy, ad_name):
+                if getattr(att, 'lifecycle_state', '') != 'DETACHED':
+                    attachments_by_volume[att.boot_volume_id] = att
+                    inst_info = instance_by_id.get(att.instance_id)
+                    if inst_info:
+                        inst_info['boot_volume_id'] = att.boot_volume_id
+
+            boot_volumes = block_client.list_boot_volumes(
+                compartment_id=tenancy, availability_domain=ad_name
+            ).data
+            for vol in boot_volumes:
+                if getattr(vol, 'lifecycle_state', '') == 'TERMINATED':
+                    continue
+                size = int(getattr(vol, 'size_in_gbs', 0) or 0)
+                total_storage_gb += size
+                att = attachments_by_volume.get(vol.id)
+                attached_instance = instance_index.get(att.instance_id) if att else None
+                vol_ad = getattr(vol, 'availability_domain', '') or ad_name or ''
+                volumes.append({
+                    'id': vol.id,
+                    'name': _bv_volume_label(vol).rsplit(' (', 1)[0],
+                    'size_gb': size,
+                    'state': getattr(vol, 'lifecycle_state', ''),
+                    'availability_domain': vol_ad,
+                    'ad_short': vol_ad.split(':')[-1],
+                    'attached': att is not None,
+                    'instance_id': att.instance_id if att else None,
+                    'instance_name': (
+                        _bv_instance_label(attached_instance) if attached_instance
+                        else ('Unknown instance' if att else None)
+                    ),
+                })
+        volumes.sort(key=lambda item: (not item['attached'], item['name']))
+        instances.sort(key=lambda item: (item['state'] != 'RUNNING', item['name']))
+
+        # Backups are replacement sources for a brand-new disk. Listing them is
+        # best effort: some tenancies block backups even when volumes are fine.
+        backups = []
+        try:
+            volume_names = {item['id']: item['name'] for item in volumes}
+            for backup in block_client.list_boot_volume_backups(compartment_id=tenancy).data:
+                if getattr(backup, 'lifecycle_state', '') != 'AVAILABLE':
+                    continue
+                source_id = getattr(backup, 'boot_volume_id', None)
+                backups.append({
+                    'id': backup.id,
+                    'name': getattr(backup, 'display_name', None) or _bv_ocid(backup.id),
+                    'size_gb': int(getattr(backup, 'size_in_gbs', 0) or 0),
+                    'state': getattr(backup, 'lifecycle_state', ''),
+                    'source_boot_volume_id': source_id,
+                    'source_name': volume_names.get(source_id),
+                })
+        except Exception as exc:
+            _bv_log('Backup listing skipped (%s) — volumes still usable.' % _bv_error_text(exc))
+
+        return jsonify({
+            'success': True,
+            'instances': instances,
+            'boot_volumes': volumes,
+            'backups': backups,
+            'total_storage_gb': total_storage_gb,
+            'storage_limit_gb': 200,
+            'job': boot_volume_job_status(),
+        })
+
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/boot-volumes/action', methods=['POST'])
+@require_auth
+@limit_oci_requests
+def boot_volume_action():
+    """Validate and queue one boot volume operation as a background job."""
+    data = request.json or {}
+    operation = str(data.get('operation', '')).strip().lower()
+    if operation not in BV_JOB_OPERATIONS:
+        return jsonify({
+            'success': False,
+            'error': "operation must be one of: %s" % ', '.join(BV_JOB_OPERATIONS)
+        })
+
+    config = build_config(data)
+    try:
+        get_oci().config.validate_config(config)
+    except Exception as e:
+        return jsonify({'success': False, 'error': 'Invalid OCI config: %s' % e})
+
+    params = {}
+    target = None
+
+    if operation in ('detach', 'delete'):
+        boot_volume_id = str(data.get('boot_volume_id', '')).strip()
+        if not boot_volume_id:
+            return jsonify({'success': False, 'error': 'boot_volume_id is required'})
+        params['boot_volume_id'] = boot_volume_id
+        target = boot_volume_id
+
+    elif operation == 'attach':
+        boot_volume_id = str(data.get('boot_volume_id', '')).strip()
+        instance_id = str(data.get('instance_id', '')).strip()
+        if not boot_volume_id or not instance_id:
+            return jsonify({'success': False, 'error': 'boot_volume_id and instance_id are required'})
+        params['boot_volume_id'] = boot_volume_id
+        params['instance_id'] = instance_id
+        target = boot_volume_id
+
+    elif operation == 'instance-action':
+        instance_id = str(data.get('instance_id', '')).strip()
+        power_action = str(data.get('power_action', '')).strip().upper()
+        if not instance_id:
+            return jsonify({'success': False, 'error': 'instance_id is required'})
+        if power_action not in BV_POWER_ACTIONS:
+            return jsonify({
+                'success': False,
+                'error': "power_action must be one of: %s" % ', '.join(BV_POWER_ACTIONS)
+            })
+        params['instance_id'] = instance_id
+        params['power_action'] = power_action
+        target = instance_id
+
+    elif operation == 'replace':
+        instance_id = str(data.get('instance_id', '')).strip()
+        source_type = str(data.get('source_type', '')).strip().lower()
+        source_id = str(data.get('source_id', '')).strip()
+        if not instance_id:
+            return jsonify({'success': False, 'error': 'instance_id is required'})
+        if source_type not in ('boot_volume', 'backup'):
+            return jsonify({'success': False, 'error': "source_type must be 'boot_volume' or 'backup'"})
+        if not source_id:
+            return jsonify({'success': False, 'error': 'source_id (replacement volume or backup) is required'})
+        power_action = str(data.get('power_action', 'SOFTSTOP')).strip().upper() or 'SOFTSTOP'
+        if power_action not in ('SOFTSTOP', 'STOP'):
+            return jsonify({'success': False, 'error': "power_action for replace must be SOFTSTOP or STOP"})
+        params['instance_id'] = instance_id
+        params['source_type'] = source_type
+        params['source_id'] = source_id
+        params['delete_old'] = bool(data.get('delete_old', False))
+        params['power_action'] = power_action
+        target = instance_id
+
+    busy_error = _bv_job_begin(operation, target)
+    if busy_error:
+        return jsonify({'success': False, 'error': busy_error})
+
+    try:
+        thread = threading.Thread(
+            target=run_boot_volume_job,
+            args=(
+                operation, config, params,
+                data.get('telegram_bot_token'), data.get('telegram_chat_id'),
+            ),
+            daemon=True,
+        )
+        thread.start()
+    except Exception as e:
+        _bv_job_finish()
+        return jsonify({'success': False, 'error': str(e)})
+
+    return jsonify({
+        'success': True,
+        'message': "Boot volume job '%s' started — progress appears in Live output." % operation,
+        'job': boot_volume_job_status(),
+    })
+
+
+@app.route('/api/boot-volumes/status', methods=['GET'])
+@require_auth
+def boot_volume_status():
+    return jsonify({'success': True, 'job': boot_volume_job_status()})
+
+
+@app.route('/api/boot-volumes/stop', methods=['POST'])
+@require_auth
+def boot_volume_stop():
+    bv_stop_event.set()
+    _bv_log('Stop requested by user — the current step finishes, then the job aborts.')
+    return jsonify({'success': True, 'message': 'Stop signal sent to the boot volume job.'})
+
+
 @app.route('/healthz')
 def healthz():
     """Cheap unauthenticated health check for Railway, Docker and systemd."""
@@ -776,72 +1490,6 @@ def test_launch():
                 'free_tier_ok': ok,
                 'free_tier_error': err
             }
-        })
-
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
-
-
-@app.route('/api/list-vnics', methods=['POST'])
-@require_auth
-@limit_oci_requests
-def list_vnics():
-    """List VNICs (network interfaces) for debugging network setup."""
-    data = request.json or {}
-    config = build_config(data)
-    target_subnet_id = data.get('subnet_id', '').strip() or None
-
-    try:
-        get_oci().config.validate_config(config)
-        compute_client = create_oci_client(oci.core.ComputeClient, config)
-        network_client = create_oci_client(oci.core.VirtualNetworkClient, config)
-        tenancy = config['tenancy']
-
-        # Pre-fetch all VCNs and subnets for name resolution
-        vcns = {v.id: v for v in network_client.list_vcns(compartment_id=tenancy).data}
-        subnets = {s.id: s for s in network_client.list_subnets(compartment_id=tenancy).data}
-        instances = {i.id: i for i in compute_client.list_instances(compartment_id=tenancy).data}
-
-        # List all VNIC attachments in the tenancy
-        vnics = []
-        vnic_attachments = compute_client.list_vnic_attachments(compartment_id=tenancy).data
-        for att in vnic_attachments:
-            try:
-                vnic = network_client.get_vnic(vnic_id=att.vnic_id).data
-                subnet = subnets.get(vnic.subnet_id)
-                vcn = vcns.get(subnet.vcn_id) if subnet else None
-
-                # Filter by subnet if specified
-                if target_subnet_id and vnic.subnet_id != target_subnet_id:
-                    continue
-
-                instance = instances.get(att.instance_id)
-
-                vnics.append({
-                    'id': vnic.id,
-                    'display_name': vnic.display_name or 'Unnamed',
-                    'private_ip': vnic.private_ip,
-                    'public_ip': vnic.public_ip or 'None',
-                    'subnet_id': vnic.subnet_id,
-                    'subnet_name': subnet.display_name if subnet else 'Unknown',
-                    'vcn_id': vcn.id if vcn else 'Unknown',
-                    'vcn_name': vcn.display_name if vcn else 'Unknown',
-                    'lifecycle_state': vnic.lifecycle_state,
-                    'is_primary': getattr(att, 'is_primary', False),
-                    'instance_id': att.instance_id,
-                    'instance_name': instance.display_name if instance else 'Unknown'
-                })
-            except Exception:
-                pass
-
-        # Build VCN summary for the dropdown
-        vcn_list = [{'id': v.id, 'name': v.display_name or 'Unnamed'} for v in vcns.values()]
-
-        return jsonify({
-            'success': True,
-            'vnics': vnics,
-            'vcns': vcn_list,
-            'filtered_by_subnet': target_subnet_id
         })
 
     except Exception as e:
@@ -1633,7 +2281,8 @@ def get_status():
             'success': True,
             'running': automation_running,
             'shape': automation_shape,
-            'keepalive': keepalive_status()
+            'keepalive': keepalive_status(),
+            'boot_volume_job': boot_volume_job_status()
         })
 
 

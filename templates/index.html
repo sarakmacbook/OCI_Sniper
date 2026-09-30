@@ -385,16 +385,6 @@
                 </div>
                 <div class="form-group">
                     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
-                        <label class="form-label" style="margin-bottom:0;">Target VNIC</label>
-                        <button class="btn" id="scanVnicBtn" onclick="scanVnics()" style="padding:3px 10px;font-size:11px;flex:none;">Scan VNICs</button>
-                    </div>
-                    <select id="vnicSelect" class="form-select">
-                        <option value="">-- Scan VNICs first --</option>
-                    </select>
-                    <div id="vnicInfo" style="margin-top:6px;font-size:11px;color:var(--text-muted);display:none;"></div>
-                </div>
-                <div class="form-group">
-                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
                         <label class="form-label" style="margin-bottom:0;">Target subnet</label>
                         <button class="btn" id="scanSubnetBtn2" onclick="scanSubnets()" style="padding:3px 10px;font-size:11px;flex:none;">Scan subnets</button>
                     </div>
@@ -575,6 +565,66 @@
                 </div>
                 <button class="btn" id="kaSaveBtn" onclick="saveKeepalive()" style="width:100%;">Apply keep-alive settings</button>
                 <div id="kaResult" class="tg-result"></div>
+            </div>
+        </div>
+
+        <!-- Boot Volume Manager Panel -->
+        <div class="panel">
+            <button class="panel-header" onclick="togglePanel('bv')">
+                <span class="icon-group">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="12" x2="2" y2="12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><line x1="6" y1="16" x2="6.01" y2="16"/><line x1="10" y1="16" x2="10.01" y2="16"/></svg>
+                    5. Boot volume manager
+                </span>
+                <span class="icon-group" style="gap:12px;">
+                    <span id="bvBadge" class="status-badge stopped">
+                        <span id="bvBadgeDot" class="status-dot"></span>
+                        <span id="bvBadgeText">Idle</span>
+                    </span>
+                    <svg id="bvChevron" class="chevron collapsed" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+                </span>
+            </button>
+            <div id="bvBody" class="panel-body collapsed">
+                <div style="font-size:11px;color:var(--text-muted);margin-bottom:10px;line-height:1.5;">
+                    Attach, detach, re-attach, replace or delete boot disks. The instance must be <b>STOPPED</b> before its disk can move (use the power buttons, or let Replace stop it for you). Disks only attach inside their own availability domain. Every action runs server-side as one job &mdash; progress appears in <b>Live output</b>.
+                </div>
+                <button class="btn btn-danger" id="bvJobStopBtn" onclick="bvStopJob()" style="width:100%;display:none;margin-bottom:12px;">Stop running boot disk job</button>
+                <button class="btn" id="bvScanBtn" onclick="scanBootVolumes()" style="width:100%;margin-bottom:12px;">Scan instances &amp; boot volumes</button>
+                <div id="bvSummary" style="font-size:11px;color:var(--text-muted);margin-bottom:10px;display:none;line-height:1.5;"></div>
+                <div class="form-group">
+                    <label class="form-label">Instance</label>
+                    <select id="bvInstanceSelect" class="form-select" onchange="onBvInstanceChange()">
+                        <option value="">-- Scan first --</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Boot volume</label>
+                    <select id="bvVolumeSelect" class="form-select">
+                        <option value="">-- Scan first --</option>
+                    </select>
+                </div>
+                <div class="grid-2">
+                    <button class="btn" id="bvStopBtn" onclick="bvPowerInstance('SOFTSTOP')">Stop instance</button>
+                    <button class="btn" id="bvStartBtn" onclick="bvPowerInstance('START')">Start instance</button>
+                    <button class="btn" id="bvDetachBtn" onclick="bvDetachVolume()">Detach volume</button>
+                    <button class="btn" id="bvAttachBtn" onclick="bvAttachVolume()">Attach / re-attach</button>
+                </div>
+                <button class="btn btn-danger" id="bvDeleteBtn" onclick="bvDeleteVolume()" style="width:100%;">Delete boot volume</button>
+
+                <div style="margin:16px 0 10px;border-top:1px solid var(--border);padding-top:14px;">
+                    <label class="form-label" style="color:var(--text-secondary);">Replace boot disk of selected instance</label>
+                    <div class="form-group">
+                        <label class="form-label">Replacement source</label>
+                        <select id="bvSourceSelect" class="form-select">
+                            <option value="">-- Scan first --</option>
+                        </select>
+                    </div>
+                    <div class="checkbox-row" style="margin-bottom:12px;">
+                        <input type="checkbox" id="bvDeleteOld">
+                        <label for="bvDeleteOld">Delete the old disk after the new one boots</label>
+                    </div>
+                    <button class="btn btn-danger" id="bvReplaceBtn" onclick="bvReplaceVolume()" style="width:100%;">Replace boot disk</button>
+                </div>
+                <div id="bvResult" style="margin-top:10px;font-size:11px;display:none;line-height:1.5;"></div>
             </div>
         </div>
 
@@ -1001,78 +1051,6 @@
         btn.textContent = 'Scan subnets';
     }
 
-    async function scanVnics() {
-        parseConfig();
-        var btn = document.getElementById('scanVnicBtn');
-        var user = document.getElementById('cfgUser').value;
-        var key = document.getElementById('cfgKey').value;
-        var subnetId = document.getElementById('subnetSelect').value;
-        var vnicSelect = document.getElementById('vnicSelect');
-        var vnicInfo = document.getElementById('vnicInfo');
-
-        if (!user || !key) {
-            addLog('Error: Credentials required first', 'error');
-            return;
-        }
-        if (!btn) {
-            addLog('Error: VNIC button not found', 'error');
-            return;
-        }
-
-        btn.disabled = true;
-        btn.textContent = 'Scanning...';
-
-        try {
-            var payload = {
-                user: user,
-                tenancy: document.getElementById('cfgTenancy').value,
-                fingerprint: document.getElementById('cfgFingerprint').value,
-                region: document.getElementById('cfgRegion').value,
-                private_key: key
-            };
-            if (subnetId) payload.subnet_id = subnetId;
-
-            var res = await fetch('/api/list-vnics', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-            var data = await res.json();
-
-            if (data.success && data.vnics && data.vnics.length > 0) {
-                var filterLabel = data.filtered_by_subnet ? ' (target subnet)' : '';
-                addLog('Found ' + data.vnics.length + ' VNIC(s)' + filterLabel + ':', 'success');
-                vnicSelect.innerHTML = '<option value="">-- Select a VNIC --</option>';
-                data.vnics.forEach(function(v) {
-                    var primaryBadge = v.is_primary ? ' [PRIMARY]' : '';
-                    addLog('  ' + v.display_name + primaryBadge + ' | Instance: ' + v.instance_name + ' | IP: ' + v.private_ip + ' | Public: ' + (v.public_ip || 'None') + ' | VCN: ' + v.vcn_name + ' | Subnet: ' + v.subnet_name + ' | State: ' + v.lifecycle_state);
-                    var opt = document.createElement('option');
-                    opt.value = v.id;
-                    opt.textContent = v.display_name + primaryBadge + ' (' + v.private_ip + ', ' + v.instance_name + ')';
-                    vnicSelect.appendChild(opt);
-                });
-                vnicInfo.innerHTML = 'Found ' + data.vnics.length + ' VNIC(s). Select one to target.';
-                vnicInfo.style.display = 'block';
-            } else if (data.success) {
-                vnicSelect.innerHTML = '<option value="">-- No VNICs found --</option>';
-                vnicInfo.style.display = 'none';
-                var msg = 'No VNICs found' + (data.filtered_by_subnet ? ' in target subnet' : ' (no running instances)');
-                addLog(msg, 'warn');
-            } else {
-                vnicSelect.innerHTML = '<option value="">-- Error --</option>';
-                vnicInfo.style.display = 'none';
-                addLog('VNIC scan failed: ' + (data.error || 'Unknown error'), 'error');
-            }
-        } catch (err) {
-            vnicSelect.innerHTML = '<option value="">-- Error --</option>';
-            vnicInfo.style.display = 'none';
-            addLog('VNIC scan error: ' + err.message, 'error');
-        }
-
-        btn.disabled = false;
-        btn.textContent = 'Scan VNICs';
-    }
-
     async function openFirewallNow() {
         parseConfig();
         var btn = document.getElementById('openFirewallBtn');
@@ -1256,6 +1234,258 @@
         btn.textContent = 'Test connection';
     }
 
+    // ---- Boot volume manager ----
+    let bvData = { instances: [], boot_volumes: [], backups: [] };
+    let bvScannedOnce = false;
+    let bvJobWasRunning = false;
+
+    function bvCreds() {
+        parseConfig();
+        return {
+            user: document.getElementById('cfgUser').value,
+            tenancy: document.getElementById('cfgTenancy').value,
+            fingerprint: document.getElementById('cfgFingerprint').value,
+            region: document.getElementById('cfgRegion').value,
+            private_key: document.getElementById('cfgKey').value
+        };
+    }
+
+    function bvShowResult(html) {
+        const result = document.getElementById('bvResult');
+        result.style.display = 'block';
+        result.innerHTML = html;
+    }
+
+    function renderBvJob(job) {
+        if (!job) return;
+        const badge = document.getElementById('bvBadge');
+        const dot = document.getElementById('bvBadgeDot');
+        const text = document.getElementById('bvBadgeText');
+        const stopBtn = document.getElementById('bvJobStopBtn');
+        if (job.running) {
+            badge.className = 'status-badge running';
+            dot.className = 'status-dot running';
+            text.textContent = job.operation ? ('Busy: ' + job.operation) : 'Busy';
+            stopBtn.style.display = 'block';
+            bvJobWasRunning = true;
+        } else {
+            badge.className = 'status-badge stopped';
+            dot.className = 'status-dot';
+            text.textContent = 'Idle';
+            stopBtn.style.display = 'none';
+            if (bvJobWasRunning) {
+                // A job just finished: disk/instance states changed, refresh the lists.
+                bvJobWasRunning = false;
+                if (bvScannedOnce) scanBootVolumes();
+            }
+        }
+    }
+
+    function bvSelectedVolume() {
+        const id = document.getElementById('bvVolumeSelect').value;
+        return bvData.boot_volumes.find(v => v.id === id) || null;
+    }
+
+    function bvSelectedInstance() {
+        const id = document.getElementById('bvInstanceSelect').value;
+        return bvData.instances.find(i => i.id === id) || null;
+    }
+
+    function bvRefreshSourceOptions() {
+        const inst = bvSelectedInstance();
+        const instAd = inst ? inst.availability_domain : null;
+        const select = document.getElementById('bvSourceSelect');
+        select.innerHTML = '<option value="">-- Choose replacement --</option>';
+        bvData.boot_volumes.filter(v => v.state === 'AVAILABLE').forEach(function(v) {
+            const mismatch = instAd && v.availability_domain !== instAd;
+            const opt = document.createElement('option');
+            opt.value = 'bv:' + v.id;
+            opt.disabled = !!mismatch;
+            opt.textContent = 'Disk: ' + v.name + ' — ' + v.size_gb + ' GB (' + v.ad_short + ')' + (mismatch ? ' — different AD' : '');
+            select.appendChild(opt);
+        });
+        bvData.backups.forEach(function(b) {
+            const opt = document.createElement('option');
+            opt.value = 'backup:' + b.id;
+            opt.textContent = 'Backup: ' + b.name + ' — ' + b.size_gb + ' GB' + (b.source_name ? ' (of ' + b.source_name + ')' : '');
+            select.appendChild(opt);
+        });
+    }
+
+    function onBvInstanceChange() {
+        bvRefreshSourceOptions();
+    }
+
+    async function scanBootVolumes() {
+        const btn = document.getElementById('bvScanBtn');
+        const creds = bvCreds();
+        if (!creds.user || !creds.private_key) { addLog('Error: Credentials required first', 'error'); return; }
+        btn.disabled = true;
+        btn.textContent = 'Scanning...';
+        try {
+            const res = await fetch('/api/boot-volumes/list', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(creds)
+            });
+            const data = await res.json();
+            if (data.success) {
+                bvData = {
+                    instances: data.instances || [],
+                    boot_volumes: data.boot_volumes || [],
+                    backups: data.backups || []
+                };
+                const instSel = document.getElementById('bvInstanceSelect');
+                instSel.innerHTML = '<option value="">-- Select instance --</option>';
+                bvData.instances.forEach(function(i) {
+                    const opt = document.createElement('option');
+                    opt.value = i.id;
+                    opt.textContent = i.name + ' [' + i.state + '] — ' + (i.shape || '?') + ', ' + i.ad_short;
+                    instSel.appendChild(opt);
+                });
+                const volSel = document.getElementById('bvVolumeSelect');
+                volSel.innerHTML = '<option value="">-- Select boot volume --</option>';
+                bvData.boot_volumes.forEach(function(v) {
+                    const opt = document.createElement('option');
+                    opt.value = v.id;
+                    opt.textContent = v.name + ' — ' + v.size_gb + ' GB [' + (v.attached ? 'attached: ' + (v.instance_name || '?') : 'detached / AVAILABLE') + ', ' + v.ad_short + ']';
+                    volSel.appendChild(opt);
+                });
+                bvRefreshSourceOptions();
+                bvScannedOnce = true;
+                const summary = document.getElementById('bvSummary');
+                summary.style.display = 'block';
+                summary.innerHTML = 'Found <b>' + bvData.instances.length + '</b> instance(s), <b>' + bvData.boot_volumes.length + '</b> boot disk(s), <b>' + bvData.backups.length + '</b> backup(s). Storage in use: <b>' + data.total_storage_gb + ' / ' + data.storage_limit_gb + ' GB</b> — every boot disk counts; deleting detached disks frees space.';
+                addLog('Boot volume scan: ' + bvData.instances.length + ' instance(s), ' + bvData.boot_volumes.length + ' disk(s), ' + bvData.backups.length + ' backup(s)', 'success');
+                if (data.job) renderBvJob(data.job);
+            } else {
+                addLog('Boot volume scan failed: ' + (data.error || 'Unknown error'), 'error');
+            }
+        } catch (err) {
+            addLog('Boot volume scan error: ' + err.message, 'error');
+        }
+        btn.disabled = false;
+        btn.textContent = 'Scan instances & boot volumes';
+    }
+
+    async function bvRunAction(operation, extras, confirmText, description) {
+        const creds = bvCreds();
+        if (!creds.user || !creds.private_key) { addLog('Error: Credentials required first', 'error'); return; }
+        if (confirmText && !confirm(confirmText)) { addLog('Boot volume action cancelled', 'warn'); return; }
+        const payload = Object.assign({}, creds, extras, { operation: operation });
+        const tgToken = document.getElementById('tgToken').value.trim();
+        const tgChat = document.getElementById('tgChat').value.trim();
+        if (tgToken && tgChat) { payload.telegram_bot_token = tgToken; payload.telegram_chat_id = tgChat; }
+        try {
+            const res = await fetch('/api/boot-volumes/action', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const data = await res.json();
+            if (data.success) {
+                bvShowResult('<span style="color:var(--positive)">Started: ' + description + '. Watch Live output.</span>');
+                addLog('Boot volume job started: ' + description, 'success');
+                if (data.job) renderBvJob(data.job);
+                if (!pollInterval) startPolling();
+                return true;
+            }
+            bvShowResult('<span style="color:var(--danger)">Failed: ' + data.error + '</span>');
+            addLog('Boot volume job refused: ' + (data.error || 'Unknown error'), 'error');
+            return false;
+        } catch (err) {
+            bvShowResult('<span style="color:var(--danger)">Error: ' + err.message + '</span>');
+            addLog('Boot volume request error: ' + err.message, 'error');
+            return false;
+        }
+    }
+
+    async function bvStopJob() {
+        if (!confirm('Ask the running boot disk job to stop?\n\nThe current OCI call finishes, then the job aborts at the next state check.')) return;
+        try {
+            const res = await fetch('/api/boot-volumes/stop', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: '{}'
+            });
+            const data = await res.json();
+            if (data.success) {
+                addLog('Stop signal sent to the boot disk job', 'warn');
+            } else {
+                addLog('Stop failed: ' + (data.error || 'Unknown error'), 'error');
+            }
+        } catch (err) {
+            addLog('Stop request error: ' + err.message, 'error');
+        }
+    }
+
+    function bvPowerInstance(action) {
+        const inst = bvSelectedInstance();
+        if (!inst) { addLog('Error: Scan and select an instance first', 'error'); return; }
+        const label = action === 'START' ? 'Start' : 'Stop';
+        bvRunAction('instance-action',
+            { instance_id: inst.id, power_action: action },
+            label + ' instance "' + inst.name + '" currently ' + inst.state + '?',
+            label + ' ' + inst.name);
+    }
+
+    function bvDetachVolume() {
+        const vol = bvSelectedVolume();
+        if (!vol) { addLog('Error: Scan and select a boot volume first', 'error'); return; }
+        if (!vol.attached) { addLog('That volume is already detached (AVAILABLE)', 'warn'); return; }
+        bvRunAction('detach',
+            { boot_volume_id: vol.id },
+            'Detach "' + vol.name + '" from ' + (vol.instance_name || 'its instance') + '?\n\nThe instance must already be STOPPED.',
+            'detach ' + vol.name);
+    }
+
+    function bvAttachVolume() {
+        const vol = bvSelectedVolume();
+        const inst = bvSelectedInstance();
+        if (!vol) { addLog('Error: Scan and select a boot volume first', 'error'); return; }
+        if (!inst) { addLog('Error: Select a target instance first', 'error'); return; }
+        if (vol.attached) { addLog('That volume is still attached — detach it first (or use Replace to swap in one job)', 'warn'); return; }
+        if (vol.availability_domain !== inst.availability_domain) {
+            addLog('AD mismatch: the volume is in ' + vol.ad_short + ' but the instance is in ' + inst.ad_short, 'error');
+            return;
+        }
+        bvRunAction('attach',
+            { boot_volume_id: vol.id, instance_id: inst.id },
+            'Attach "' + vol.name + '" (' + vol.size_gb + ' GB) to "' + inst.name + '"?\n\nThe instance must already be STOPPED and must not have another boot disk.',
+            'attach ' + vol.name + ' to ' + inst.name);
+    }
+
+    function bvDeleteVolume() {
+        const vol = bvSelectedVolume();
+        if (!vol) { addLog('Error: Scan and select a boot volume first', 'error'); return; }
+        if (vol.attached) { addLog('That volume is attached — detach it before deleting', 'warn'); return; }
+        bvRunAction('delete',
+            { boot_volume_id: vol.id },
+            'PERMANENTLY DELETE "' + vol.name + '" (' + vol.size_gb + ' GB)?\n\nAll data on this disk is destroyed. This cannot be undone.',
+            'delete ' + vol.name);
+    }
+
+    function bvReplaceVolume() {
+        const inst = bvSelectedInstance();
+        const source = document.getElementById('bvSourceSelect').value;
+        if (!inst) { addLog('Error: Scan and select an instance first', 'error'); return; }
+        if (!source) { addLog('Error: Choose a replacement source (detached disk or backup)', 'error'); return; }
+        const sep = source.indexOf(':');
+        const sourceType = source.substring(0, sep) === 'backup' ? 'backup' : 'boot_volume';
+        const sourceId = source.substring(sep + 1);
+        const deleteOld = document.getElementById('bvDeleteOld').checked;
+        bvRunAction('replace',
+            {
+                instance_id: inst.id,
+                source_type: sourceType,
+                source_id: sourceId,
+                delete_old: deleteOld,
+                power_action: 'SOFTSTOP'
+            },
+            'Replace the boot disk of "' + inst.name + '"?\n\nThe instance will be STOPPED, its current disk detached, and the replacement attached, then it boots again.' + (deleteOld ? '\n\nThe OLD disk will be DELETED after a successful boot.' : ''),
+            'replace boot disk of ' + inst.name);
+    }
+
     async function startLoop() {
         const image = document.getElementById('imageSelect').value;
         const ssh = document.getElementById('sshKey').value.trim();
@@ -1347,8 +1577,9 @@
             if (data.success) {
                 updateStatus(data.running);
                 renderKeepalive(data.keepalive);
+                renderBvJob(data.boot_volume_job);
                 if (data.running && !pollInterval) startPolling();
-                if (!data.running && pollInterval) stopPolling();
+                if (!data.running && pollInterval && !(data.boot_volume_job && data.boot_volume_job.running)) stopPolling();
             }
         } catch (e) {}
     }
@@ -1389,8 +1620,6 @@
         document.getElementById('imageSelect').innerHTML = '<option value="">-- Scan images first --</option>';
         document.getElementById('subnetSelect').innerHTML = '<option value="">-- Auto-select first available --</option>';
         document.getElementById('subnetInfo').style.display = 'none';
-        document.getElementById('vnicSelect').innerHTML = '<option value="">-- Scan VNICs first --</option>';
-        document.getElementById('vnicInfo').style.display = 'none';
 
         document.getElementById('vmName').value = 'AlwaysFree-Bot';
         document.getElementById('ocpus').value = '2';
@@ -1408,12 +1637,21 @@
         document.getElementById('tgLiveLog').checked = false;
         document.getElementById('tgLiveWarning').style.display = 'none';
         document.getElementById('tgResult').innerHTML = '';
-        document.getElementById('vnicSelect').innerHTML = '<option value="">-- Scan VNICs first --</option>';
-        document.getElementById('vnicInfo').style.display = 'none';
         document.getElementById('vmName').value = 'Arm';
 
         document.getElementById('quotaPanel').style.display = 'none';
         document.getElementById('quotaPanel').innerHTML = '';
+
+        bvData = { instances: [], boot_volumes: [], backups: [] };
+        bvScannedOnce = false;
+        bvJobWasRunning = false;
+        document.getElementById('bvJobStopBtn').style.display = 'none';
+        document.getElementById('bvInstanceSelect').innerHTML = '<option value="">-- Scan first --</option>';
+        document.getElementById('bvVolumeSelect').innerHTML = '<option value="">-- Scan first --</option>';
+        document.getElementById('bvSourceSelect').innerHTML = '<option value="">-- Scan first --</option>';
+        document.getElementById('bvSummary').style.display = 'none';
+        document.getElementById('bvResult').style.display = 'none';
+        document.getElementById('bvDeleteOld').checked = false;
 
         clearLogs();
         addLog('All fields cleared', 'success');
