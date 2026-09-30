@@ -539,6 +539,45 @@
             </div>
         </div>
 
+        <!-- Keep-alive Panel -->
+        <div class="panel">
+            <button class="panel-header" onclick="togglePanel('ka')">
+                <span class="icon-group">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                    4. 24/7 keep-alive
+                </span>
+                <span class="icon-group" style="gap:12px;">
+                    <span id="kaBadge" class="status-badge stopped">
+                        <span id="kaBadgeDot" class="status-dot"></span>
+                        <span id="kaBadgeText">Off</span>
+                    </span>
+                    <svg id="kaChevron" class="chevron collapsed" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+                </span>
+            </button>
+            <div id="kaBody" class="panel-body collapsed">
+                <div style="font-size:11px;color:var(--text-muted);margin-bottom:10px;line-height:1.5;">
+                    Railway pauses a service ~5&ndash;10 minutes after its last <b>outbound</b> traffic when "Serverless" (App Sleeping) is on &mdash; inbound visits alone don't count. This pinger sends a tiny outbound request every few minutes (by default to this app's own /healthz) so the provisioning loop can keep hunting 24/7 without the service being put to sleep.
+                </div>
+                <div class="checkbox-row">
+                    <input type="checkbox" id="kaEnabled" onchange="onKeepaliveToggle(this.checked)">
+                    <label for="kaEnabled">Stay awake 24/7 (anti-sleep pings)</label>
+                </div>
+                <div id="kaStatus" style="font-size:11px;color:var(--text-muted);margin-top:8px;line-height:1.5;">Loading&hellip;</div>
+                <div class="grid-2" style="margin-top:12px;">
+                    <div class="form-group">
+                        <label class="form-label">Ping interval (30&ndash;295s)</label>
+                        <input type="number" id="kaInterval" class="form-input" value="240" min="30" max="295">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Target URLs (optional)</label>
+                        <input type="text" id="kaUrls" class="form-input" placeholder="auto &mdash; this app's /healthz">
+                    </div>
+                </div>
+                <button class="btn" id="kaSaveBtn" onclick="saveKeepalive()" style="width:100%;">Apply keep-alive settings</button>
+                <div id="kaResult" class="tg-result"></div>
+            </div>
+        </div>
+
         <!-- Action Bar -->
         <div class="action-bar">
             <button id="startBtn" class="btn btn-primary" onclick="startLoop()">Start provisioning loop</button>
@@ -1307,6 +1346,7 @@
             const data = await res.json();
             if (data.success) {
                 updateStatus(data.running);
+                renderKeepalive(data.keepalive);
                 if (data.running && !pollInterval) startPolling();
                 if (!data.running && pollInterval) stopPolling();
             }
@@ -1377,6 +1417,98 @@
 
         clearLogs();
         addLog('All fields cleared', 'success');
+    }
+
+
+    let kaInputsInit = false;
+
+    function renderKeepalive(ka) {
+        if (!ka) return;
+        const badge = document.getElementById('kaBadge');
+        const dot = document.getElementById('kaBadgeDot');
+        const text = document.getElementById('kaBadgeText');
+        const statusEl = document.getElementById('kaStatus');
+
+        document.getElementById('kaEnabled').checked = ka.enabled;
+        if (!kaInputsInit) {
+            document.getElementById('kaInterval').value = ka.interval_seconds || 240;
+            if (ka.targets && ka.targets.length) {
+                document.getElementById('kaUrls').value = ka.targets.join(', ');
+            }
+            kaInputsInit = true;
+        }
+
+        if (!ka.enabled) {
+            badge.className = 'status-badge stopped';
+            dot.className = 'status-dot';
+            text.textContent = 'Off';
+            statusEl.textContent = 'Disabled — the host may pause this service after idle time.';
+        } else if (!ka.running) {
+            badge.className = 'status-badge stopped';
+            dot.className = 'status-dot';
+            text.textContent = 'No target';
+            statusEl.textContent = 'No target URL yet. On Railway, give the service a public domain (it then sets RAILWAY_PUBLIC_DOMAIN automatically) or enter target URLs below.';
+        } else {
+            const failing = (ka.consecutive_failures || 0) > 0;
+            badge.className = failing ? 'status-badge stopped' : 'status-badge running';
+            dot.className = failing ? 'status-dot' : 'status-dot running';
+            text.textContent = failing ? 'Failing' : 'Active';
+            const last = ka.last_success_ago == null ? 'never' : Math.max(0, Math.round(ka.last_success_ago)) + 's ago';
+            let s = 'Pinging ' + ka.target_count + ' target(s) every ' + ka.interval_seconds + 's — last OK: ' + last +
+                ' · ' + ka.total_pings + ' pings sent' + (ka.total_failures ? ' (' + ka.total_failures + ' failed)' : '');
+            if (failing && ka.last_error) s += '\nLast error: ' + ka.last_error;
+            statusEl.style.whiteSpace = 'pre-line';
+            statusEl.textContent = s;
+        }
+    }
+
+    async function postKeepalive(body) {
+        const res = await fetch('/api/keepalive', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+        return await res.json();
+    }
+
+    async function onKeepaliveToggle(checked) {
+        try {
+            const data = await postKeepalive({ enabled: checked });
+            if (data.success) {
+                renderKeepalive(data.keepalive);
+                addLog(checked ? 'Keep-alive enabled — staying awake 24/7' : 'Keep-alive disabled', checked ? 'success' : 'warn');
+            } else {
+                addLog('Keep-alive toggle failed: ' + (data.error || 'unknown'), 'error');
+            }
+        } catch (e) {
+            addLog('Keep-alive toggle failed: ' + e.message, 'error');
+        }
+    }
+
+    async function saveKeepalive() {
+        const btn = document.getElementById('kaSaveBtn');
+        const resEl = document.getElementById('kaResult');
+        btn.disabled = true;
+        try {
+            const body = { enabled: document.getElementById('kaEnabled').checked };
+            const iv = parseInt(document.getElementById('kaInterval').value, 10);
+            if (!isNaN(iv)) body.interval_seconds = iv;
+            const urls = document.getElementById('kaUrls').value.trim();
+            if (urls) body.urls = urls.split(/[ ,\n]+/).map(s => s.trim()).filter(Boolean);
+            const data = await postKeepalive(body);
+            if (data.success) {
+                kaInputsInit = false;
+                renderKeepalive(data.keepalive);
+                resEl.innerHTML = '<span style="color:var(--positive);">Saved — keep-alive settings applied.</span>';
+                addLog('Keep-alive settings applied', 'success');
+            } else {
+                resEl.innerHTML = '<span style="color:var(--danger);">' + (data.error || 'Failed to save') + '</span>';
+            }
+        } catch (e) {
+            resEl.innerHTML = '<span style="color:var(--danger);">' + e.message + '</span>';
+        }
+        btn.disabled = false;
+        setTimeout(() => { resEl.innerHTML = ''; }, 5000);
     }
 
     window.addEventListener('load', () => {
