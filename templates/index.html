@@ -585,11 +585,44 @@
             </button>
             <div id="bvBody" class="panel-body collapsed">
                 <div style="font-size:11px;color:var(--text-muted);margin-bottom:10px;line-height:1.5;">
-                    Attach, detach, re-attach, replace or delete boot disks. The instance must be <b>STOPPED</b> before its disk can move (use the power buttons, or let Replace stop it for you). Disks only attach inside their own availability domain. Every action runs server-side as one job &mdash; progress appears in <b>Live output</b>.
+                    Create a blank boot volume or restore one from a backup; attach, detach, re-attach, replace or delete disks; and manage instance power. Empty volumes have no OS. An instance must be <b>STOPPED</b> before its disk can move (use the power buttons, or let Replace stop it for you). Disks only attach inside their own availability domain. Every action runs server-side as one job &mdash; progress appears in <b>Live output</b>.
                 </div>
                 <button class="btn btn-danger" id="bvJobStopBtn" onclick="bvStopJob()" style="width:100%;display:none;margin-bottom:12px;">Stop running boot disk job</button>
                 <button class="btn" id="bvScanBtn" onclick="scanBootVolumes()" style="width:100%;margin-bottom:12px;">Scan instances &amp; boot volumes</button>
                 <div id="bvSummary" style="font-size:11px;color:var(--text-muted);margin-bottom:10px;display:none;line-height:1.5;"></div>
+
+                <div style="margin:14px 0 16px;border:1px solid var(--border);border-radius:var(--radius-md);padding:12px;">
+                    <label class="form-label" style="color:var(--text-secondary);">Create a boot volume</label>
+                    <div class="grid-2">
+                        <div class="form-group">
+                            <label class="form-label">Availability domain</label>
+                            <select id="bvCreateAd" class="form-select">
+                                <option value="">-- Scan first --</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Display name</label>
+                            <input type="text" id="bvCreateName" class="form-input" value="new-boot-volume" maxlength="64">
+                        </div>
+                    </div>
+                    <div class="grid-2">
+                        <div class="form-group">
+                            <label class="form-label">Size (GB)</label>
+                            <input type="number" id="bvCreateSize" class="form-input" value="50" min="50" max="32768" step="1">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Restore from backup (optional)</label>
+                            <select id="bvCreateSource" class="form-select" onchange="onBvCreateSourceChange()">
+                                <option value="">Empty volume (no OS)</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div id="bvCreateHint" style="font-size:11px;color:var(--text-muted);margin:-4px 0 10px;line-height:1.5;">
+                        Empty volumes contain no operating system and cannot boot an instance by themselves. Choose a backup to restore a bootable copy.
+                    </div>
+                    <button class="btn" id="bvCreateBtn" onclick="bvCreateVolume()" style="width:100%;">Create boot volume</button>
+                </div>
+
                 <div class="form-group">
                     <label class="form-label">Instance</label>
                     <select id="bvInstanceSelect" class="form-select" onchange="onBvInstanceChange()">
@@ -1235,7 +1268,7 @@
     }
 
     // ---- Boot volume manager ----
-    let bvData = { instances: [], boot_volumes: [], backups: [] };
+    let bvData = { availability_domains: [], instances: [], boot_volumes: [], backups: [] };
     let bvScannedOnce = false;
     let bvJobWasRunning = false;
 
@@ -1312,6 +1345,34 @@
         });
     }
 
+    function bvRefreshCreateOptions() {
+        const select = document.getElementById('bvCreateSource');
+        select.innerHTML = '<option value="">Empty volume (no OS)</option>';
+        bvData.backups.forEach(function(b) {
+            const opt = document.createElement('option');
+            opt.value = b.id;
+            opt.textContent = b.name + ' — ' + b.size_gb + ' GB' + (b.source_name ? ' (of ' + b.source_name + ')' : '');
+            select.appendChild(opt);
+        });
+        onBvCreateSourceChange();
+    }
+
+    function onBvCreateSourceChange() {
+        const backupId = document.getElementById('bvCreateSource').value;
+        const sizeInput = document.getElementById('bvCreateSize');
+        const hint = document.getElementById('bvCreateHint');
+        const backup = bvData.backups.find(function(b) { return b.id === backupId; });
+        if (backup) {
+            sizeInput.value = backup.size_gb;
+            sizeInput.disabled = true;
+            hint.textContent = 'Restores this backup at its original size in the selected availability domain.';
+        } else {
+            sizeInput.disabled = false;
+            if (!sizeInput.value || Number(sizeInput.value) < 50) sizeInput.value = 50;
+            hint.textContent = 'Empty volumes contain no operating system and cannot boot an instance by themselves. Choose a backup to restore a bootable copy.';
+        }
+    }
+
     function onBvInstanceChange() {
         bvRefreshSourceOptions();
     }
@@ -1330,11 +1391,30 @@
             });
             const data = await res.json();
             if (data.success) {
+                const createAdSelect = document.getElementById('bvCreateAd');
+                const previousCreateAd = createAdSelect.value;
                 bvData = {
+                    availability_domains: data.availability_domains || [],
                     instances: data.instances || [],
                     boot_volumes: data.boot_volumes || [],
-                    backups: data.backups || []
+                    backups: data.backups || [],
+                    total_storage_gb: Number(data.total_storage_gb) || 0,
+                    storage_limit_gb: Number(data.storage_limit_gb) || 200
                 };
+                createAdSelect.innerHTML = '<option value="">-- Select availability domain --</option>';
+                bvData.availability_domains.forEach(function(ad) {
+                    const opt = document.createElement('option');
+                    opt.value = ad.name;
+                    opt.textContent = ad.ad_short || ad.name;
+                    createAdSelect.appendChild(opt);
+                });
+                const hasPreviousAd = bvData.availability_domains.some(function(ad) { return ad.name === previousCreateAd; });
+                if (hasPreviousAd) {
+                    createAdSelect.value = previousCreateAd;
+                } else if (bvData.availability_domains.length) {
+                    createAdSelect.value = bvData.availability_domains[0].name;
+                }
+
                 const instSel = document.getElementById('bvInstanceSelect');
                 instSel.innerHTML = '<option value="">-- Select instance --</option>';
                 bvData.instances.forEach(function(i) {
@@ -1352,6 +1432,7 @@
                     volSel.appendChild(opt);
                 });
                 bvRefreshSourceOptions();
+                bvRefreshCreateOptions();
                 bvScannedOnce = true;
                 const summary = document.getElementById('bvSummary');
                 summary.style.display = 'block';
@@ -1386,7 +1467,12 @@
             if (data.success) {
                 bvShowResult('<span style="color:var(--positive)">Started: ' + description + '. Watch Live output.</span>');
                 addLog('Boot volume job started: ' + description, 'success');
-                if (data.job) renderBvJob(data.job);
+                if (data.job) {
+                    // The worker can finish before this response reaches the browser.
+                    // Mark it so even that fast path triggers an inventory refresh.
+                    bvJobWasRunning = true;
+                    renderBvJob(data.job);
+                }
                 if (!pollInterval) startPolling();
                 return true;
             }
@@ -1463,6 +1549,48 @@
             { boot_volume_id: vol.id },
             'PERMANENTLY DELETE "' + vol.name + '" (' + vol.size_gb + ' GB)?\n\nAll data on this disk is destroyed. This cannot be undone.',
             'delete ' + vol.name);
+    }
+
+    function bvCreateVolume() {
+        const availabilityDomain = document.getElementById('bvCreateAd').value;
+        const displayName = document.getElementById('bvCreateName').value.trim();
+        const backupId = document.getElementById('bvCreateSource').value;
+        const backup = bvData.backups.find(function(b) { return b.id === backupId; });
+        const sizeInput = document.getElementById('bvCreateSize');
+        const sizeGb = backup ? null : Number(sizeInput.value);
+        if (!availabilityDomain) {
+            addLog('Error: Scan and select an availability domain first', 'error');
+            return;
+        }
+        if (!backup && (!Number.isInteger(sizeGb) || sizeGb < 50 || sizeGb > 32768)) {
+            addLog('Error: Empty boot volume size must be a whole number from 50 to 32768 GB', 'error');
+            return;
+        }
+
+        const volumeSize = backup ? Number(backup.size_gb || 0) : sizeGb;
+        const usedGb = Number(bvData.total_storage_gb || 0);
+        const limitGb = Number(bvData.storage_limit_gb || 200);
+        const estimatedGb = usedGb + volumeSize;
+        const storageWarning = estimatedGb > limitGb
+            ? '\n\nWarning: this would bring boot-volume storage to about ' + estimatedGb + ' / ' + limitGb + ' GB, above the displayed Always Free allowance. OCI charges may apply.'
+            : '';
+        const label = displayName || '(OCI-generated name)';
+        const sourceDescription = backup
+            ? 'restored from backup "' + backup.name + '" (' + volumeSize + ' GB)'
+            : 'created empty at ' + sizeGb + ' GB; it will have no operating system';
+        const extras = {
+            availability_domain: availabilityDomain,
+            display_name: displayName,
+            backup_id: backupId
+        };
+        if (!backup) extras.size_gb = sizeGb;
+
+        bvRunAction(
+            'create',
+            extras,
+            'Create boot volume "' + label + '" in ' + availabilityDomain + ', ' + sourceDescription + '?\n\nCurrent storage: ' + usedGb + ' / ' + limitGb + ' GB.' + storageWarning,
+            'create ' + label
+        );
     }
 
     function bvReplaceVolume() {
@@ -1642,13 +1770,18 @@
         document.getElementById('quotaPanel').style.display = 'none';
         document.getElementById('quotaPanel').innerHTML = '';
 
-        bvData = { instances: [], boot_volumes: [], backups: [] };
+        bvData = { availability_domains: [], instances: [], boot_volumes: [], backups: [], total_storage_gb: 0, storage_limit_gb: 200 };
         bvScannedOnce = false;
         bvJobWasRunning = false;
         document.getElementById('bvJobStopBtn').style.display = 'none';
         document.getElementById('bvInstanceSelect').innerHTML = '<option value="">-- Scan first --</option>';
         document.getElementById('bvVolumeSelect').innerHTML = '<option value="">-- Scan first --</option>';
         document.getElementById('bvSourceSelect').innerHTML = '<option value="">-- Scan first --</option>';
+        document.getElementById('bvCreateAd').innerHTML = '<option value="">-- Scan first --</option>';
+        document.getElementById('bvCreateSource').innerHTML = '<option value="">Empty volume (no OS)</option>';
+        document.getElementById('bvCreateName').value = 'new-boot-volume';
+        document.getElementById('bvCreateSize').value = '50';
+        onBvCreateSourceChange();
         document.getElementById('bvSummary').style.display = 'none';
         document.getElementById('bvResult').style.display = 'none';
         document.getElementById('bvDeleteOld').checked = false;

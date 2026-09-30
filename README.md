@@ -52,7 +52,8 @@ Notes and honest limits:
 
 Panel **5. Boot volume manager** manages the disks behind existing instances without touching the OCI Console:
 
-- **Scan** lists every instance, boot volume (with what it is attached to) and boot volume backup, plus storage used against the 200 GB free-tier total.
+- **Scan** lists every instance, boot volume (with what it is attached to), availability domain and boot volume backup, plus storage used against the 200 GB free-tier total.
+- **Create** a new empty boot volume (50–32,768 GB) in a selected availability domain, or restore a fresh volume from an available backup. Empty volumes contain no operating system; restore from a backup when you need a bootable copy. The panel warns when the added storage would exceed the displayed free-tier allowance.
 - **Stop / Start** the selected instance. OCI only lets a boot volume move while its instance is `STOPPED`.
 - **Detach** releases the selected disk from its instance (instance must be stopped). The disk becomes `AVAILABLE` and keeps its data.
 - **Attach / re-attach** puts an `AVAILABLE` disk onto a stopped instance that has no boot disk. Boot volumes never cross availability domains — the job refuses an AD mismatch instead of failing at OCI.
@@ -98,7 +99,7 @@ With the 24/7 keep-alive enabled (see below), the host no longer pauses the serv
 - OCI config parsing and private-key upload without server-side credential storage
 - Ubuntu image and subnet discovery
 - Free-tier storage, Micro, and Ampere A1 usage checks
-- Boot volume manager: attach, detach, re-attach, replace and delete boot disks, plus instance stop/start — all as one logged background job with rollback on a failed replace
+- Boot volume manager: create empty or backup-restored boot volumes, attach, detach, re-attach, replace and delete boot disks, plus instance stop/start — all as one logged background job with rollback on a failed replace
 - Bounded retry loop with fixed or randomized delays and availability-domain rotation
 - Telegram attempt updates with attempt number, OCI email, region/AD, and safe key fingerprint (never the private key)
 - Optional Telegram success/failure alerts and throttled live logs
@@ -121,8 +122,8 @@ With the 24/7 keep-alive enabled (see below), the host no longer pauses the serv
 | `/api/logs` | GET | Fetch bounded live logs |
 | `/api/status` | GET | Check loop status |
 | `/api/keepalive` | GET/POST | Inspect or toggle the 24/7 keep-alive pinger |
-| `/api/boot-volumes/list` | POST | Inventory instances, boot volumes and backups with attachment state and storage totals |
-| `/api/boot-volumes/action` | POST | Queue a boot disk job: `detach`, `attach` (also re-attach), `delete`, `instance-action` (start/stop) or `replace` |
+| `/api/boot-volumes/list` | POST | Inventory instances, boot volumes, backups and availability domains with attachment state and storage totals |
+| `/api/boot-volumes/action` | POST | Queue a boot disk job: `create` (empty or from `backup_id`), `detach`, `attach` (also re-attach), `delete`, `instance-action` (start/stop) or `replace` |
 | `/api/boot-volumes/status` | GET | Boot disk job state (also included in `/api/status`) |
 | `/api/boot-volumes/stop` | POST | Ask the running boot disk job to abort at its next state poll |
 | `/api/scan-security-rules` | POST | Inspect NSG/security-list rules |

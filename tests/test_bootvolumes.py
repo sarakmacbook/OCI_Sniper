@@ -133,6 +133,7 @@ class FakeBlock:
         self.backups = []
         self._vol_seq = 0
         self.created_from_backups = []
+        self.created_details = []
         self.deleted = []
 
     def get_boot_volume(self, boot_volume_id=None):
@@ -154,16 +155,17 @@ class FakeBlock:
 
     def create_boot_volume(self, create_boot_volume_details=None):
         details = create_boot_volume_details
+        self.created_details.append(details)
         self._vol_seq += 1
-        backup_id = getattr(getattr(details, 'source_details', None), 'boot_volume_backup_id', None)
-        size = 50
+        backup_id = getattr(getattr(details, 'source_details', None), 'id', None)
+        size = getattr(details, 'size_in_gbs', None) or 50
         for backup in self.backups:
             if backup.id == backup_id:
                 size = backup.size_in_gbs
                 break
         vol = types.SimpleNamespace(
             id='bv-created-%d' % self._vol_seq,
-            display_name=details.display_name or 'restored',
+            display_name=getattr(details, 'display_name', None) or 'restored',
             lifecycle_state='AVAILABLE',
             availability_domain=details.availability_domain,
             size_in_gbs=size,
@@ -275,6 +277,38 @@ class BootVolumeTestBase(unittest.TestCase):
 
 
 class BootVolumeJobTests(BootVolumeTestBase):
+    def test_create_empty_boot_volume(self):
+        self.run_job('create', {
+            'availability_domain': AD_2,
+            'display_name': 'fresh-disk',
+            'size_gb': 75,
+        })
+        volume = self.block.volumes['bv-created-1']
+        details = self.block.created_details[0]
+        self.assertEqual(volume.display_name, 'fresh-disk')
+        self.assertEqual(volume.availability_domain, AD_2)
+        self.assertEqual(volume.size_in_gbs, 75)
+        self.assertEqual(volume.lifecycle_state, 'AVAILABLE')
+        self.assertIsNone(getattr(details, 'source_details', None))
+        self.assertEqual(details.compartment_id, CRED_PAYLOAD['tenancy'])
+        self.assertIn('empty 75 GB boot volume', self.log_text())
+
+    def test_create_boot_volume_from_backup_without_attaching(self):
+        self.run_job('create', {
+            'availability_domain': AD_2,
+            'display_name': 'restored-disk',
+            'backup_id': 'bak-1',
+        })
+        volume = self.block.volumes['bv-created-1']
+        details = self.block.created_details[0]
+        self.assertEqual(self.block.created_from_backups, ['bak-1'])
+        self.assertEqual(volume.display_name, 'restored-disk')
+        self.assertEqual(volume.availability_domain, AD_2)
+        self.assertEqual(volume.size_in_gbs, 49)
+        self.assertIsNone(getattr(details, 'size_in_gbs', None))
+        self.assertEqual(volume.lifecycle_state, 'AVAILABLE')
+        self.assertIn('ready', self.log_text())
+
     def test_detach_stopped_instance_releases_disk(self):
         self.run_job('detach', {'boot_volume_id': 'bv-1'})
         self.assertEqual(self.block.volumes['bv-1'].lifecycle_state, 'AVAILABLE')
@@ -454,6 +488,10 @@ class BootVolumeApiTests(BootVolumeTestBase):
         self.assertTrue(body['success'])
         self.assertEqual(body['total_storage_gb'], 147)
         self.assertEqual(body['storage_limit_gb'], 200)
+        self.assertEqual(
+            [ad['name'] for ad in body['availability_domains']],
+            [AD_1, AD_2],
+        )
         attached = [v for v in body['boot_volumes'] if v['attached']]
         detached = [v for v in body['boot_volumes'] if not v['attached']]
         self.assertEqual(len(attached), 1)
@@ -481,6 +519,14 @@ class BootVolumeApiTests(BootVolumeTestBase):
                         dict(CRED_PAYLOAD, operation='replace', instance_id='i-1',
                              source_type='nope', source_id='x'))
         self.assertIn('source_type', res.get_json()['error'])
+        res = self.post('/api/boot-volumes/action', dict(CRED_PAYLOAD, operation='create', size_gb=50))
+        self.assertIn('availability_domain', res.get_json()['error'])
+        res = self.post('/api/boot-volumes/action',
+                        dict(CRED_PAYLOAD, operation='create', availability_domain=AD_1))
+        self.assertIn('size_gb', res.get_json()['error'])
+        res = self.post('/api/boot-volumes/action',
+                        dict(CRED_PAYLOAD, operation='create', availability_domain=AD_1, size_gb=49))
+        self.assertIn('between 50 and 32768', res.get_json()['error'])
 
     def test_action_runs_detach_job_to_completion(self):
         res = self.post('/api/boot-volumes/action',
@@ -493,6 +539,24 @@ class BootVolumeApiTests(BootVolumeTestBase):
         self.assertEqual(self.block.volumes['bv-1'].lifecycle_state, 'AVAILABLE')
         status = self.client.get('/api/boot-volumes/status', auth=self.auth).get_json()
         self.assertFalse(status['job']['running'])
+
+    def test_action_runs_create_job_to_completion(self):
+        res = self.post('/api/boot-volumes/action', dict(
+            CRED_PAYLOAD,
+            operation='create',
+            availability_domain=AD_2,
+            display_name='api-created',
+            size_gb=60,
+        ))
+        body = res.get_json()
+        self.assertTrue(body['success'])
+        self.assertTrue(self.wait_for_job())
+        created = self.block.volumes.get('bv-created-1')
+        self.assertIsNotNone(created)
+        self.assertEqual(created.display_name, 'api-created')
+        self.assertEqual(created.size_in_gbs, 60)
+        self.assertEqual(created.availability_domain, AD_2)
+        self.assertEqual(created.lifecycle_state, 'AVAILABLE')
 
     def test_action_refuses_second_concurrent_job(self):
         app._bv_job_begin('detach', 'bv-1')
