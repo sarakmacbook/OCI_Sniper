@@ -101,6 +101,7 @@ With the 24/7 keep-alive enabled (see below), the host no longer pauses the serv
 - Free-tier storage, Micro, and Ampere A1 usage checks
 - Boot volume manager: create empty or backup-restored boot volumes, attach, detach, re-attach, replace and delete boot disks, plus instance stop/start — all as one logged background job with rollback on a failed replace
 - Bounded retry loop with fixed or randomized delays and availability-domain rotation
+- Launch pre-flight check: before the first retry the loop resolves the image, subnet, ADs and shape against the configured region, so a guaranteed-fatal config is reported with an exact cause instead of silently burning attempts on an ambiguous OCI `404 NotAuthorizedOrNotFound` (e.g. a shape that is not offered in the selected region, or an image/subnet OCID copied from a different region)
 - Telegram attempt updates with attempt number, OCI email, region/AD, and safe key fingerprint (never the private key)
 - Optional Telegram success/failure alerts and throttled live logs
 - Firewall/security-list and NSG inspection helpers

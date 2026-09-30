@@ -2031,6 +2031,119 @@ def send_telegram_attempt_update(bot_token, chat_id, attempt, email, region, ad,
         add_log(f"Telegram attempt update failed: {error}")
 
 
+def _shape_offered_in_ad(compute_client, compartment_id, ad_name, shape):
+    """Is `shape` actually offered in this availability domain?
+
+    OCI's ``ListShapes`` for an availability domain is the authoritative list of
+    shapes that can be launched there. A shape that is absent from that list
+    cannot be created in the region at all — OCI rejects the launch with a
+    permanent ``404 NotAuthorizedOrNotFound`` ("Authorization failed or requested
+    resource not found"), which *looks* like an auth/OCID problem but is really
+    "this shape is not offered here" (e.g. ``VM.Standard.E2.1.Micro`` is not
+    available in every region).
+
+    Returns True/False when the answer is known, or None when the check is
+    inconclusive (the SDK call failed, or the list came back empty) so callers
+    never block a launch on an unknown.
+    """
+    try:
+        shapes = compute_client.list_shapes(
+            compartment_id=compartment_id,
+            availability_domain=ad_name
+        ).data
+    except Exception:
+        return None
+    names = {getattr(s, 'shape', None) for s in (shapes or [])}
+    if not names:
+        return None
+    return shape in names
+
+
+def preflight_launch_check(config, account_config, compute_client, network_client,
+                           identity_client, ad_list):
+    """Validate everything launch_instance needs *before* the retry loop runs.
+
+    The single most confusing OCI failure is a launch that fails with
+    ``404 NotAuthorizedOrNotFound``. OCI deliberately makes that one error mean
+    both "you lack permission" and "the resource does not exist / is not offered
+    here", so the loop's generic guesswork can never pinpoint the cause. This
+    check resolves each referenced resource against the configured region up
+    front and returns concrete, actionable problems so the user is told exactly
+    what to fix instead of watching attempts silently 404.
+
+    Returns a list of human-readable blocker strings. An empty list means the
+    launch inputs look valid for this region. Any blocker would make *every*
+    attempt fail, so the caller should not start the loop.
+    """
+    tenancy = config['tenancy']
+    region = config.get('region', 'unknown')
+    shape = account_config.get('shape')
+    image_id = account_config.get('image_id')
+    subnet_id = account_config.get('subnet_id')
+    problems = []
+
+    # 1. The image OCID must exist and be AVAILABLE in *this* region. Image
+    #    OCIDs are region-specific; a valid OCID from another region 404s here.
+    if image_id:
+        try:
+            img = compute_client.get_image(image_id=image_id).data
+            state = getattr(img, 'lifecycle_state', '')
+            if state != 'AVAILABLE':
+                problems.append(
+                    f"Image {image_id} is '{state or 'unknown'}', not AVAILABLE, "
+                    f"in region '{region}'."
+                )
+        except Exception as e:
+            problems.append(
+                f"Image {image_id} could not be read in region '{region}' "
+                f"({_bv_error_text(e)}). Image OCIDs are region-specific — this one is "
+                f"most likely from a different region. Re-pick it from the image "
+                f"list for '{region}'."
+            )
+
+    # 2. The subnet must exist and be AVAILABLE, also in this region.
+    if subnet_id:
+        try:
+            sn = network_client.get_subnet(subnet_id=subnet_id).data
+            state = getattr(sn, 'lifecycle_state', '')
+            if state != 'AVAILABLE':
+                problems.append(
+                    f"Subnet {subnet_id} is '{state or 'unknown'}', not AVAILABLE, "
+                    f"in region '{region}'."
+                )
+        except Exception as e:
+            problems.append(
+                f"Subnet {subnet_id} could not be read in region '{region}' "
+                f"({_bv_error_text(e)}). Subnet OCIDs are region-specific — re-pick "
+                f"it from the subnet list for '{region}'."
+            )
+
+    # 3. The shape must actually be offered in at least one AD of this region.
+    #    This is the check that catches the real-world "E2.1.Micro is not offered
+    #    here" case that otherwise surfaces only as an unexplained 404.
+    if shape and ad_list:
+        offered_any = False
+        checked_any = False
+        for ad in ad_list:
+            offered = _shape_offered_in_ad(compute_client, tenancy, ad, shape)
+            if offered is None:
+                continue
+            checked_any = True
+            if offered:
+                offered_any = True
+                break
+        if checked_any and not offered_any:
+            problems.append(
+                f"Shape '{shape}' is NOT offered in region '{region}' "
+                f"(checked ADs: {', '.join(ad_list)}). OCI rejects this with a permanent "
+                f"404 NotAuthorizedOrNotFound no matter how many times you retry, because "
+                f"the shape simply cannot be launched here. Pick a different shape, or a "
+                f"region that offers '{shape}'."
+            )
+
+    return problems
+
+
 @hold_oci_slot
 def run_automated_creation(config, account_config, compute_client, network_client, identity_client,
                            retry_delay=60, randomize_delay=False, random_min=25, random_max=60,
@@ -2169,6 +2282,25 @@ def run_automated_creation(config, account_config, compute_client, network_clien
             _random.shuffle(ad_list)
             add_log(f"AD order randomized for faster discovery: {', '.join(ad_list)}")
 
+        # Pre-flight: resolve every referenced resource against this region
+        # before spending attempts. A 404 NotAuthorizedOrNotFound is ambiguous
+        # by design (permission *or* missing/not-offered resource), so we pin
+        # the cause down here and refuse to start on a guaranteed-fatal config
+        # instead of silently 404-ing on the first attempt.
+        preflight_problems = preflight_launch_check(
+            config, account_config, compute_client, network_client,
+            identity_client, ad_list
+        )
+        if preflight_problems:
+            add_log("Pre-flight check failed — the launch cannot succeed as configured:")
+            for problem in preflight_problems:
+                add_log(f"  - {problem}")
+            add_log(
+                "Fix the item(s) above (region, image, subnet, shape) and start again. "
+                "Retrying will not clear a 404."
+            )
+            return
+
         # Never leave a daemon thread retrying forever. This is especially
         # important on Railway/VPS instances with limited CPU and memory.
         while attempts < max_attempts:
@@ -2240,15 +2372,38 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                         next_ad = ad_list[ad_index % len(ad_list)]
                         add_log(f"Switching to next AD: '{next_ad}'")
                 elif "NotAuthorizedOrNotFound" in msg or "Authorization failed" in msg or status == 404:
-                    add_log(f"Auth/NotFound error — possible causes:")
-                    add_log(f"  1. Image {image_id[:25]}... not found in AD {current_ad}")
-                    add_log(f"  2. Shape {account_config['shape']} not available in this AD")
-                    add_log(f"  3. Subnet {subnet_id[:25]}... missing permissions")
-                    add_log(f"  4. Check OCI Console > Instances > Create — test manually")
+                    # OCI makes one 404 mean both "no permission" and "resource
+                    # missing / not offered here". Pre-flight already confirmed
+                    # the image, subnet and shape resolve in this region, so a
+                    # 404 *here* is almost always per-AD free-tier quota: the
+                    # shape is offered in the region but has zero Always-Free
+                    # quota in THIS AD (OCI reports that as 404, not 429/500).
+                    add_log(
+                        f"404 NotAuthorizedOrNotFound in region '{target_region}' AD '{current_ad}'."
+                    )
+                    add_log(
+                        f"  Pre-flight already verified the image, subnet and shape exist in "
+                        f"'{target_region}', so this is most likely **zero Always-Free quota for "
+                        f"'{account_config['shape']}' in this specific AD** — OCI reports that as a 404."
+                    )
+                    add_log(
+                        f"  Other possibilities: a per-AD quota difference, or the API key's user "
+                        f"lacking 'manage instance-family' / 'manage volume-family' in the compartment."
+                    )
                     if len(ad_list) > 1:
                         ad_index += 1
-                        add_log(f"Trying next AD...")
+                        next_ad = ad_list[ad_index % len(ad_list)]
+                        add_log(
+                            f"Switching to AD '{next_ad}' — Always-Free quota is distributed per AD, "
+                            f"so another AD may have capacity."
+                        )
                         continue
+                    add_log(
+                        f"Only one availability domain exists in '{target_region}'. If this region's "
+                        f"AD has no Always-Free quota for '{account_config['shape']}', it cannot be "
+                        f"created here — switch the config's region to one that offers the shape with "
+                        f"free quota, or request a limit increase in OCI Console > Governance > Limits."
+                    )
                     break
                 else:
                     add_log(f"OCI API error: {e.message}")
