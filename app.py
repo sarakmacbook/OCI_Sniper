@@ -7,6 +7,7 @@ import random
 import re
 import threading
 import time
+import urllib.parse
 
 import requests
 from flask import Flask, Response, jsonify, render_template, request
@@ -94,7 +95,10 @@ def env_int(name, default, minimum, maximum):
     return max(minimum, min(value, maximum))
 
 
-MAX_ATTEMPTS = env_int('MAX_ATTEMPTS', 100, 1, 1000)
+# The high ceiling allows a genuine 24/7 hunt: at a 60s retry delay, 100000
+# attempts is roughly 69 days of continuous retrying. The default is still a
+# conservative 100 so an accidentally orphaned loop does not retry forever.
+MAX_ATTEMPTS = env_int('MAX_ATTEMPTS', 100, 1, 100000)
 OCI_API_SLOTS = env_int('OCI_API_SLOTS', 2, 1, 8)
 USAGE_CACHE_SECONDS = env_int('USAGE_CACHE_SECONDS', 20, 0, 300)
 
@@ -267,10 +271,301 @@ def cache_usage(key, usage):
         usage_cache[key] = (time.monotonic(), usage)
 
 
+# ---- 24/7 keep-alive (anti-sleep) ----
+# Railway's "Serverless" feature (formerly App Sleeping) stops a service
+# roughly 5-10 minutes after its last OUTBOUND network traffic. Inbound
+# requests alone do not keep it awake. The pinger below sends small periodic
+# outbound requests (by default to this app's own public /healthz endpoint)
+# so a deployment stays awake around the clock and the in-memory provisioning
+# loop keeps hunting for free-tier capacity. Pings are tiny HTTP GETs and the
+# feature can be disabled with KEEPALIVE_ENABLED=false or from the UI.
+def _env_bool(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+KEEPALIVE_ENABLED_DEFAULT = _env_bool('KEEPALIVE_ENABLED', True)
+# Railway sleeps a service at least 5 minutes after its last outbound packet,
+# sampled on an interval. Pinging every 240s (max 295s) stays comfortably
+# under that window while generating almost no traffic.
+KEEPALIVE_INTERVAL_DEFAULT = env_int('KEEPALIVE_INTERVAL_SECONDS', 240, 30, 295)
+KEEPALIVE_TIMEOUT_SECONDS = env_int('KEEPALIVE_TIMEOUT_SECONDS', 10, 2, 30)
+KEEPALIVE_MAX_URLS = 5
+KEEPALIVE_MIN_INTERVAL = 30
+KEEPALIVE_MAX_INTERVAL = 295
+KEEPALIVE_FAIL_LOG_SECONDS = 300
+
+# Railway injects RAILWAY_PUBLIC_DOMAIN once the service has a public domain;
+# older templates may expose RAILWAY_STATIC_URL instead.
+_KEEPALIVE_DOMAIN_VARS = ('RAILWAY_PUBLIC_DOMAIN', 'RAILWAY_STATIC_URL')
+
+
+def _parse_keepalive_urls(raw):
+    """Turn a comma/space separated string into validated ping targets."""
+    urls = []
+    for part in re.split(r'[,\s]+', raw or ''):
+        part = part.strip()
+        if not part or len(part) > 500 or len(urls) >= KEEPALIVE_MAX_URLS:
+            continue
+        parsed = urllib.parse.urlsplit(part)
+        if parsed.scheme in ('http', 'https') and parsed.netloc and part not in urls:
+            urls.append(part)
+    return urls
+
+
+def _default_keepalive_urls():
+    urls = _parse_keepalive_urls(os.environ.get('KEEPALIVE_URLS', ''))
+    if urls:
+        return urls
+    for var in _KEEPALIVE_DOMAIN_VARS:
+        domain = os.environ.get(var, '').strip()
+        if not domain:
+            continue
+        if '://' in domain:
+            candidate = domain.rstrip('/') + '/healthz'
+        else:
+            candidate = 'https://%s/healthz' % domain
+        parsed = _parse_keepalive_urls(candidate)
+        if parsed:
+            return parsed
+    return []
+
+
+_keepalive_lock = threading.Lock()
+_keepalive_cfg = {
+    'enabled': KEEPALIVE_ENABLED_DEFAULT,
+    'interval': KEEPALIVE_INTERVAL_DEFAULT,
+    'urls': _default_keepalive_urls(),
+}
+_keepalive_stats = {
+    'started_at': None,
+    'last_attempt': None,
+    'last_success': None,
+    'last_status_code': None,
+    'last_error': None,
+    'consecutive_failures': 0,
+    'total_pings': 0,
+    'total_failures': 0,
+    'last_fail_log': 0.0,
+}
+_keepalive_thread = None
+_keepalive_stop = threading.Event()
+
+
+def _keepalive_url_for_log(url):
+    """Strip query strings; some pinger URLs embed private tokens there."""
+    parts = urllib.parse.urlsplit(url)
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, '', ''))
+
+
+def _keepalive_log(message):
+    add_log('Keep-alive: ' + message)
+
+
+def _keepalive_ping_target(url):
+    """One outbound request. Any HTTP response keeps the host's sleep timer
+    reset; only transport-level errors (DNS, refused, timeout) count as
+    failures because those mean no request went out."""
+    try:
+        response = requests.get(
+            url,
+            timeout=KEEPALIVE_TIMEOUT_SECONDS,
+            headers={'User-Agent': 'oci-provisioner-keepalive/1.0'},
+        )
+        return True, response.status_code, None
+    except requests.RequestException as exc:
+        return False, None, str(exc)[:200]
+
+
+def keepalive_ping_once():
+    """Ping every configured target once and record the outcome."""
+    with _keepalive_lock:
+        targets = list(_keepalive_cfg['urls'])
+    if not targets:
+        return
+
+    now = time.time()
+    any_ok = False
+    first_error = None
+    primary_code = None
+    for index, url in enumerate(targets):
+        ok, status_code, error = _keepalive_ping_target(url)
+        if index == 0:
+            primary_code = status_code
+        any_ok = any_ok or ok
+        if not ok and first_error is None:
+            first_error = error or 'HTTP %s' % status_code
+
+    with _keepalive_lock:
+        stats = _keepalive_stats
+        stats['last_attempt'] = now
+        stats['total_pings'] += 1
+        if any_ok:
+            recovered = stats['consecutive_failures'] >= 3
+            stats['consecutive_failures'] = 0
+            stats['last_success'] = now
+            stats['last_status_code'] = primary_code
+            stats['last_error'] = None
+            if recovered:
+                _keepalive_log('ping recovered')
+        else:
+            stats['consecutive_failures'] += 1
+            stats['total_failures'] += 1
+            stats['last_error'] = first_error
+            if now - stats['last_fail_log'] >= KEEPALIVE_FAIL_LOG_SECONDS:
+                stats['last_fail_log'] = now
+                _keepalive_log(
+                    'ping failed (%s). On Railway, make sure the service has a '
+                    'public domain (it sets RAILWAY_PUBLIC_DOMAIN automatically) '
+                    'or set KEEPALIVE_URLS.' % first_error
+                )
+
+
+def _keepalive_loop():
+    while not _keepalive_stop.is_set():
+        with _keepalive_lock:
+            interval = _keepalive_cfg['interval']
+            has_targets = bool(_keepalive_cfg['urls'])
+        if not has_targets:
+            # No target configured yet; idle until the operator adds one.
+            if _keepalive_stop.wait(30):
+                break
+            continue
+        keepalive_ping_once()
+        if _keepalive_stop.wait(interval):
+            break
+
+
+def _keepalive_thread_running():
+    return _keepalive_thread is not None and _keepalive_thread.is_alive()
+
+
+def _keepalive_start_thread():
+    global _keepalive_thread
+    if _keepalive_thread_running():
+        return
+    _keepalive_stop.clear()
+    with _keepalive_lock:
+        _keepalive_stats['started_at'] = time.time()
+        interval = _keepalive_cfg['interval']
+        targets = [_keepalive_url_for_log(u) for u in _keepalive_cfg['urls']]
+    _keepalive_thread = threading.Thread(
+        target=_keepalive_loop, name='oci-keepalive', daemon=True
+    )
+    _keepalive_thread.start()
+    _keepalive_log(
+        'started — staying awake 24/7 by pinging %d target(s) every %ds: %s'
+        % (len(targets), interval, ', '.join(targets) if targets else '(none yet)')
+    )
+
+
+def _keepalive_stop_thread():
+    global _keepalive_thread
+    was_running = _keepalive_thread_running()
+    _keepalive_stop.set()
+    _keepalive_thread = None
+    if was_running:
+        _keepalive_log('stopped — the host may sleep this service when idle')
+
+
+def keepalive_apply(enabled=None, interval=None, urls=None):
+    """Validate and apply keep-alive settings, starting/stopping the pinger.
+
+    Runtime changes live in memory only: after a restart or redeploy the
+    environment variables apply again. Returns (ok, error).
+    """
+    with _keepalive_lock:
+        new_cfg = dict(_keepalive_cfg)
+
+    if enabled is not None:
+        new_cfg['enabled'] = bool(enabled)
+
+    if interval is not None:
+        try:
+            interval = int(interval)
+        except (TypeError, ValueError):
+            return False, 'interval_seconds must be an integer'
+        new_cfg['interval'] = max(KEEPALIVE_MIN_INTERVAL, min(interval, KEEPALIVE_MAX_INTERVAL))
+
+    if urls is not None:
+        if isinstance(urls, str):
+            raw_text = urls
+        elif isinstance(urls, (list, tuple)):
+            raw_text = ' '.join(str(item) for item in urls)
+        else:
+            return False, 'urls must be a list of http(s) URLs or a string'
+        raw_count = len([p for p in re.split(r'[,\s]+', raw_text) if p.strip()])
+        parsed = _parse_keepalive_urls(raw_text)
+        if raw_count and not parsed:
+            return False, 'No valid http(s) URLs found (max %d, 500 chars each)' % KEEPALIVE_MAX_URLS
+        new_cfg['urls'] = parsed
+
+    with _keepalive_lock:
+        _keepalive_cfg.clear()
+        _keepalive_cfg.update(new_cfg)
+        should_run = new_cfg['enabled']
+
+    if should_run:
+        _keepalive_start_thread()
+    else:
+        _keepalive_stop_thread()
+    return True, ''
+
+
+def keepalive_boot():
+    ok, error = keepalive_apply(
+        enabled=KEEPALIVE_ENABLED_DEFAULT,
+        interval=KEEPALIVE_INTERVAL_DEFAULT,
+    )
+    if not ok:
+        print('Keep-alive: configuration error: %s' % error)
+    elif KEEPALIVE_ENABLED_DEFAULT and not _keepalive_cfg['urls']:
+        print(
+            'Keep-alive: enabled but no target URL is known yet. On Railway, '
+            'generate a public domain (it provides RAILWAY_PUBLIC_DOMAIN) or '
+            'set KEEPALIVE_URLS. You can also configure targets from the UI.'
+        )
+
+
+def keepalive_status():
+    """Full keep-alive state for the authenticated API/UI (URLs redacted)."""
+    with _keepalive_lock:
+        cfg = dict(_keepalive_cfg)
+        stats = dict(_keepalive_stats)
+    now = time.time()
+    return {
+        'enabled': cfg['enabled'],
+        'running': bool(cfg['enabled'] and _keepalive_thread_running()),
+        'interval_seconds': cfg['interval'],
+        'targets': [_keepalive_url_for_log(u) for u in cfg['urls']],
+        'target_count': len(cfg['urls']),
+        'started_at': stats['started_at'],
+        'last_attempt_ago': (now - stats['last_attempt']) if stats['last_attempt'] else None,
+        'last_success_ago': (now - stats['last_success']) if stats['last_success'] else None,
+        'last_status_code': stats['last_status_code'],
+        'last_error': stats['last_error'],
+        'consecutive_failures': stats['consecutive_failures'],
+        'total_pings': stats['total_pings'],
+        'total_failures': stats['total_failures'],
+    }
+
+
+def keepalive_public_status():
+    """Two cheap booleans for the unauthenticated /healthz endpoint."""
+    with _keepalive_lock:
+        enabled = _keepalive_cfg['enabled']
+    return {'enabled': enabled, 'running': bool(enabled and _keepalive_thread_running())}
+
+
+keepalive_boot()
+
+
 @app.route('/healthz')
 def healthz():
     """Cheap unauthenticated health check for Railway, Docker and systemd."""
-    return jsonify({'status': 'ok'})
+    return jsonify({'status': 'ok', 'keepalive': keepalive_public_status()})
 
 
 @app.route('/')
@@ -1144,7 +1439,7 @@ def run_automated_creation(config, account_config, compute_client, network_clien
         attempts = 0
         success = False
         ad_index = 0
-        max_attempts = max(1, min(int(max_attempts), 1000))
+        max_attempts = max(1, min(int(max_attempts), 100000))
         add_log(f"Retry limit: {max_attempts} attempts")
 
         # Shuffle AD list for random order (speeds up finding capacity)
@@ -1337,8 +1632,25 @@ def get_status():
         return jsonify({
             'success': True,
             'running': automation_running,
-            'shape': automation_shape
+            'shape': automation_shape,
+            'keepalive': keepalive_status()
         })
+
+
+@app.route('/api/keepalive', methods=['GET', 'POST'])
+@require_auth
+def keepalive_endpoint():
+    """Inspect or change the 24/7 keep-alive pinger at runtime."""
+    if request.method == 'POST':
+        data = request.json or {}
+        ok, error = keepalive_apply(
+            enabled=data.get('enabled') if 'enabled' in data else None,
+            interval=data.get('interval_seconds') if 'interval_seconds' in data else None,
+            urls=data.get('urls') if 'urls' in data else None,
+        )
+        if not ok:
+            return jsonify({'success': False, 'error': error})
+    return jsonify({'success': True, 'keepalive': keepalive_status()})
 
 
 @app.route('/api/auto-launch-loop', methods=['POST'])
