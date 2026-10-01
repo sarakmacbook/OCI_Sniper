@@ -22,6 +22,10 @@ Behaviour worth knowing while clicking around:
 * Panels that would need write access to a real account (firewall rules, boot
   volume jobs) fail with a clear ``501 Demo mode`` service error instead of
   pretending to succeed.
+* Images are per-chipset exactly as Oracle publishes them: ``aarch64`` (ARM)
+  images are only returned for Ampere A1 shapes and x86_64 images only for
+  E-series/Micro shapes, so switching shape and re-scanning can be exercised
+  end to end — including what happens if the two are mixed.
 """
 import datetime
 import os
@@ -126,10 +130,18 @@ def _availability_domains(region):
 
 
 def _images(region):
+    """Fake platform images — two per chipset, like Oracle's real image list.
+
+    OCI publishes a separate image OCID per CPU architecture (the ``aarch64``
+    ones are ARM-only), so the demo does the same: ``list_images`` filters by
+    the requested shape's chipset and a shape/image mismatch can be reproduced
+    exactly as it happens in a real tenancy.
+    """
     now = datetime.datetime.now(datetime.timezone.utc)
     specs = [
         ('Canonical Ubuntu', '24.04', 'Canonical-Ubuntu-24.04-aarch64-2025.09.15-0'),
         ('Canonical Ubuntu', '22.04', 'Canonical-Ubuntu-22.04-aarch64-2025.09.15-0'),
+        ('Canonical Ubuntu', '24.04', 'Canonical-Ubuntu-24.04-2025.09.15-0'),
         ('Canonical Ubuntu', '22.04', 'Canonical-Ubuntu-22.04-2025.09.15-0'),
         ('Oracle Linux', '9', 'Oracle-Linux-9.5-aarch64-2025.08.30-0'),
     ]
@@ -198,6 +210,22 @@ SHAPES = (
     'VM.Standard.E5.Flex',
 )
 
+# Ampere (A-series) shapes are ARM64; everything else in the demo is x86_64.
+# Mirrors ``app.shape_architecture`` — kept local so the double never imports
+# the application module it is standing in for.
+ARM_SHAPE_FAMILIES = ('A1', 'A2', 'A3', 'A4')
+
+
+def _shape_architecture(shape):
+    parts = str(shape or '').split('.')
+    family = parts[2] if len(parts) > 2 else str(shape)
+    return 'arm' if family.upper() in ARM_SHAPE_FAMILIES else 'x86'
+
+
+def _image_architecture(display_name):
+    name = str(display_name or '').lower()
+    return 'arm' if 'aarch64' in name or 'arm64' in name else 'x86'
+
 
 # ---- Fake clients -----------------------------------------------------------
 class _BaseClient:
@@ -224,9 +252,15 @@ class FakeIdentityClient(_BaseClient):
 class FakeComputeClient(_BaseClient):
     def list_images(self, **kwargs):
         wanted_os = (kwargs.get('operating_system') or '').lower()
+        shape = kwargs.get('shape')
         images = _images(self.region)
         if wanted_os:
             images = [i for i in images if wanted_os in i.operating_system.lower()]
+        if shape:
+            # Images are per-chipset: an ARM image is never offered for an x86
+            # shape, and vice versa.
+            arch = _shape_architecture(shape)
+            images = [i for i in images if _image_architecture(i.display_name) == arch]
         return _resp(images)
 
     def get_image(self, image_id=None, **kwargs):
@@ -243,7 +277,15 @@ class FakeComputeClient(_BaseClient):
         return _resp([_obj(shape=name) for name in SHAPES])
 
     def list_image_shape_compatibility_entries(self, image_id=None, **kwargs):
-        return _resp([_obj(shape=name) for name in SHAPES])
+        image = next((i for i in _images(self.region) if i.id == image_id), None)
+        if image is None:
+            # Unknown image: OCI would 404. An empty list keeps the caller's
+            # chipset check inconclusive rather than fatal — the missing image
+            # itself is already reported by the pre-flight check.
+            return _resp([])
+        arch = _image_architecture(image.display_name)
+        return _resp([_obj(shape=name) for name in SHAPES
+                      if _shape_architecture(name) == arch])
 
     def list_instances(self, **kwargs):
         with _state.lock:

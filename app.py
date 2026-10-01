@@ -1613,10 +1613,21 @@ def list_available_images():
                 'name': img.display_name or f"{getattr(img, 'operating_system', 'Unknown')} {version}",
                 'version': version,
                 'os': getattr(img, 'operating_system', 'Unknown'),
-                'os_version': version
+                'os_version': version,
+                # Chipset the image is built for. OCI already filtered the list
+                # by the requested shape when one was sent, so a name without a
+                # platform falls back to that shape's architecture.
+                'arch': image_architecture(img) or shape_architecture(shape)
             })
 
-        return jsonify({'success': True, 'images': valid[:50]})
+        # Echo back what the list was scanned for: the UI stamps it on the
+        # dropdown and refuses to start a loop whose shape no longer matches.
+        return jsonify({
+            'success': True,
+            'images': valid[:50],
+            'shape': shape,
+            'arch': shape_architecture(shape),
+        })
 
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
@@ -2221,6 +2232,52 @@ def send_telegram_attempt_update(bot_token, chat_id, attempt, email, region, ad,
         add_log(f"Telegram attempt update failed: {error}")
 
 
+# OCI images are built for exactly one CPU architecture and a launch pairs an
+# image with a shape: Ampere shapes (``VM.Standard.A1.Flex`` and friends) are
+# ARM64/aarch64, while the standard E-series and Micro free-tier shapes are
+# AMD/Intel x86_64. The two never mix — an aarch64 image on an E2.1.Micro (or an
+# x86_64 image on A1) always fails — so the UI asks for a fresh image scan when
+# the selected shape changes chipset, and the pre-flight check verifies the
+# pairing against OCI itself before any attempt is spent.
+ARM_SHAPE_FAMILIES = ('A1', 'A2', 'A3', 'A4')
+CHIPSET_LABELS = {'arm': 'ARM (aarch64)', 'x86': 'AMD/Intel (x86_64)'}
+
+
+def shape_architecture(shape):
+    """Return ``'arm'``, ``'x86'`` or ``None`` for an OCI shape name.
+
+    ``VM.Standard.A1.Flex`` -> ``'arm'`` (Ampere); ``VM.Standard.E2.1.Micro``
+    -> ``'x86'`` (AMD). Anything unrecognised is treated as x86, matching OCI's
+    default platform; GPU shapes such as ``VM.GPU.A10.1`` are x86 despite the
+    'A' in their family name.
+    """
+    if not shape:
+        return None
+    parts = str(shape).split('.')
+    family = parts[2] if len(parts) > 2 else str(shape)
+    return 'arm' if family.upper() in ARM_SHAPE_FAMILIES else 'x86'
+
+
+def chipset_label(arch):
+    """Human-readable name for a :func:`shape_architecture` value."""
+    return CHIPSET_LABELS.get(arch, 'unknown chipset')
+
+
+def image_architecture(image):
+    """Best-effort architecture of an OCI image, read from its display name.
+
+    OCI publishes separate image OCIDs per chipset and Canonical/Oracle put the
+    platform in the name (``Canonical-Ubuntu-24.04-aarch64-...``). Only the
+    unambiguous direction is reported: ``'arm'`` when the name says aarch64,
+    else ``None``, so a custom image whose name carries no platform is never
+    misclassified — OCI itself is asked instead (see ``preflight_launch_check``).
+    """
+    name = str(getattr(image, 'display_name', '') or '').lower()
+    if 'aarch64' in name or 'arm64' in name:
+        return 'arm'
+    return None
+
+
 def _shape_offered_in_ad(compute_client, compartment_id, ad_name, shape):
     """Is `shape` actually offered in this availability domain?
 
@@ -2264,7 +2321,8 @@ def preflight_launch_check(config, account_config, compute_client, network_clien
     Returns ``(problems, shape_available)``:
 
     * ``problems`` — fatal blockers for *this* region (a bad image or subnet
-      OCID, e.g. one copied from another region). Retrying or waiting cannot fix
+      OCID, e.g. one copied from another region, or an image built for the other
+      CPU architecture than the selected shape). Retrying or waiting cannot fix
       these, so the caller should abort.
     * ``shape_available`` — ``True`` if the shape is offered in at least one AD,
       ``False`` if it is definitively not offered anywhere, or ``None`` if the
@@ -2281,9 +2339,11 @@ def preflight_launch_check(config, account_config, compute_client, network_clien
 
     # 1. The image OCID must exist and be AVAILABLE in *this* region. Image
     #    OCIDs are region-specific; a valid OCID from another region 404s here.
+    image = None
     if image_id:
         try:
             img = compute_client.get_image(image_id=image_id).data
+            image = img
             state = getattr(img, 'lifecycle_state', '')
             if state != 'AVAILABLE':
                 problems.append(
@@ -2315,7 +2375,42 @@ def preflight_launch_check(config, account_config, compute_client, network_clien
                 f"it from the subnet list for '{region}'."
             )
 
-    # 3. Is the shape actually offered in this region yet? Not fatal — reported
+    # 3. Chipset pairing: the image must be built for the shape's CPU
+    #    architecture. This is exactly the failure a shape switch introduces —
+    #    e.g. an aarch64 Ubuntu image left over from an Ampere A1 hunt paired
+    #    with an AMD ``VM.Standard.E2.1.Micro`` shape — and no amount of
+    #    retrying fixes it, only re-scanning images for the new shape does.
+    if shape and image_id:
+        shape_arch = shape_architecture(shape)
+        image_arch = image_architecture(image)
+        incompat = None
+        if image_arch and shape_arch and image_arch != shape_arch:
+            incompat = (f"it is built for {chipset_label(image_arch)} while the "
+                        f"shape is {chipset_label(shape_arch)}")
+        elif image_arch is None:
+            # The name carried no platform, so ask OCI (authoritative for custom
+            # images too). An empty list or a failed call means "unknown" —
+            # never block a launch on that.
+            try:
+                entries = compute_client.list_image_shape_compatibility_entries(
+                    image_id=image_id
+                ).data
+            except Exception:
+                entries = None
+            names = {getattr(e, 'shape', None) for e in (entries or [])}
+            if names and shape not in names:
+                incompat = ("OCI reports it is not compatible with this shape — it "
+                            "was built for a different chipset or platform")
+        if incompat:
+            label = getattr(image, 'display_name', None) or image_id
+            problems.append(
+                f"Image '{label}' cannot run on shape '{shape}': {incompat}. "
+                f"OCI images are per-chipset, so re-scan OS images with "
+                f"'{shape}' selected and pick one from that fresh list — "
+                f"retrying the current pairing can never succeed."
+            )
+
+    # 4. Is the shape actually offered in this region yet? Not fatal — reported
     #    back to the caller so it can wait for Oracle Cloud to add the shape.
     shape_available = None
     if shape and ad_list:
@@ -2445,7 +2540,10 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                 f"OCPUs: {account_config.get('ocpus', 'N/A')} | RAM: {account_config.get('memory', 'N/A')}GB")
         add_log(f"Debug -> Subnet details: assign_public_ip=True")
 
-        is_arm = account_config.get('shape') == "VM.Standard.A1.Flex"
+        # Ampere shapes (A1 and later) take an explicit OCPU/memory shape
+        # config; the mapping lives in shape_architecture() so a new ARM family
+        # cannot be missed by a hardcoded name compare.
+        is_arm = shape_architecture(account_config.get('shape')) == 'arm'
         shape_config = None
         if is_arm:
             ocpus = int(account_config.get('ocpus', 2))

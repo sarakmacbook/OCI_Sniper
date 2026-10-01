@@ -115,6 +115,11 @@ is `OutOfHostCapacity` for two attempts, then succeeds) → start again from a s
 different OCI key while it hunts and watch the refusal appear in the live log, header badge and
 response → **Stop** and read the `Provisioning loop exited (stopped by user).` line.
 
+The demo also mirrors Oracle's per-chipset images: scanning returns `aarch64` images for the Ampere
+A1 shape and x86_64 images for the AMD E2 Micro shape, so switching Shape reproduces the real
+"re-scan OS images for the new chipset" prompt (and refusing to start with a stale pairing) without
+touching OCI.
+
 Demo mode is honest about its limits: every log line is prefixed `[demo]`, a banner is shown in the
 UI, `/healthz` reports `"demo_mode": true`, read-only panels (images, subnets, quota, boot volume
 inventory, firewall scan) return the in-memory state, and write panels that are not simulated
@@ -166,6 +171,7 @@ With the 24/7 keep-alive enabled (see below), the host no longer pauses the serv
 - Optional demo mode (`DEMO_MODE=1`) that runs the whole UI against an in-memory OCI double for previews and screenshots
 - Single-loop guarantee: one provisioning loop per service, refused start requests logged live (UI + Telegram) with the OCI key/region that already holds the slot, and an exit line with a reason for every stop
 - Launch pre-flight check: before the first attempt the loop resolves the image, subnet and ADs against the configured region, so a truly fatal config (e.g. an image/subnet OCID copied from a different region) is reported with an exact cause instead of silently burning attempts on an ambiguous OCI `404 NotAuthorizedOrNotFound`
+- Chipset-aware image scanning: Ampere A1/A2 shapes are ARM (`aarch64`) and the standard E-series/Micro shapes are AMD/Intel (`x86_64`), and OCI image OCIDs are built for exactly one of the two. Switching the shape across chipsets clears the scanned image list and asks for a fresh scan (`/api/list-images` filters by the shape's chipset and echoes `shape`/`arch` back), starting is blocked while the image and shape disagree, and the pre-flight check rejects a mismatched pairing with the image and shape chipsets named instead of letting it 404 forever
 - Shape-availability gate: if Oracle has not yet offered the selected shape in the region, the loop logs it live and **waits** — re-checking each attempt and launching automatically the moment the shape appears — instead of exiting or hammering a guaranteed 404
 - Telegram attempt updates with attempt number, OCI email, region/AD, and safe key fingerprint (never the private key)
 - Optional Telegram success/failure alerts and throttled live logs
