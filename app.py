@@ -5,6 +5,7 @@ import importlib
 import os
 import random
 import re
+import sys
 import threading
 import time
 import urllib.parse
@@ -69,10 +70,23 @@ except (TypeError, ValueError):
     _max_content_length = 64 * 1024
 app.config['MAX_CONTENT_LENGTH'] = max(4096, min(_max_content_length, 1024 * 1024))
 
+# ---- Optional demo mode ------------------------------------------------------
+# DEMO_MODE swaps the OCI SDK for demo_sdk's in-memory double so the UI can be
+# clicked through (Arena preview, screenshots, trying the loop guard) without
+# credentials and without touching Oracle Cloud. Never enable it in production.
+DEMO_MODE = os.environ.get('DEMO_MODE', '').strip().lower() in ('1', 'true', 'yes', 'on')
+# ALLOW_IFRAME_PREVIEW drops X-Frame-Options so the app can run inside a hosted
+# preview iframe (Arena). Off by default: production keeps DENY.
+ALLOW_IFRAME_PREVIEW = os.environ.get(
+    'ALLOW_IFRAME_PREVIEW', ''
+).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
 # ---- Security headers ----
 @app.after_request
 def add_security_headers(response):
-    response.headers['X-Frame-Options'] = 'DENY'
+    if not ALLOW_IFRAME_PREVIEW:
+        response.headers['X-Frame-Options'] = 'DENY'
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-XSS-Protection'] = '1; mode=block'
     response.headers['Referrer-Policy'] = 'no-referrer'
@@ -111,9 +125,20 @@ logs_lock = threading.Lock()
 
 # Keep the single-process state intentional: the deployment commands below use
 # one Gunicorn worker. Multiple workers would each run their own loop.
+#
+# There is exactly ONE provisioning-loop slot per process. `automation_run_id`
+# identifies the run that owns that slot, so a stale thread can never clear the
+# state of a newer run, and `automation_info` carries the non-secret details
+# (shape, region, key fingerprint, attempts) shown in the UI and live log.
 automation_lock = threading.Lock()
 automation_running = False
 automation_shape = None
+automation_run_id = 0
+automation_run_seq = 0
+automation_info = {}
+automation_stop_reason = None
+# The stop event of the current run. A fresh Event is created for every accepted
+# loop, so a Stop click can only ever affect the loop that is running now.
 stop_event = threading.Event()
 oci_api_slots = threading.BoundedSemaphore(OCI_API_SLOTS)
 
@@ -133,6 +158,8 @@ tg_live_min_interval = 3  # seconds between live log sends
 
 def add_log(message):
     global global_log_base
+    if DEMO_MODE:
+        message = f"[demo] {message}"
     timestamp = format_phnom_penh_time()
     line = f"[{timestamp}] {message}"
     print(line)
@@ -224,16 +251,175 @@ def hold_oci_slot(f):
     def decorated(*args, **kwargs):
         if not oci_api_slots.acquire(timeout=5):
             add_log('Provisioning could not start: OCI request limit is busy.')
-            with automation_lock:
-                global automation_running, automation_shape
-                automation_running = False
-                automation_shape = None
+            _automation_finish(kwargs.get('run_id'), 'could not start (OCI request slots busy)')
             return
         try:
             return f(*args, **kwargs)
+        except BaseException:
+            # Safety net: an exception escaping the job must never leave the
+            # single-loop slot locked ("Running" forever with no loop behind
+            # it). _automation_finish is idempotent, so the normal exit path
+            # does not produce a second exit line.
+            _automation_finish(kwargs.get('run_id'), 'crashed with an unexpected error')
+            raise
         finally:
             oci_api_slots.release()
     return decorated
+
+
+# ---- Single-loop guard -------------------------------------------------------
+# Only one provisioning loop may run at a time in this process. A second start
+# request is refused even when it arrives with a *different* OCI key/region, and
+# the refusal is written to the live log (UI terminal and Telegram) so it is
+# obvious what is running in the background and why nothing new started.
+
+def _key_label(fingerprint=None, user=None):
+    """Non-secret label for the OCI API key behind a loop (fingerprint + user)."""
+    parts = []
+    if fingerprint:
+        parts.append(f"key {fingerprint}")
+    if user:
+        user_text = str(user)
+        parts.append(f"user {user_text[:22] + '...' if len(user_text) > 25 else user_text}")
+    return ', '.join(parts)
+
+
+def _loop_ref(info):
+    """One-line, non-secret reference to a loop instance, for live logs."""
+    info = info or {}
+    run_id = info.get('run_id')
+    prefix = f"run #{run_id}" if run_id else 'loop'
+    bits = []
+    if info.get('shape'):
+        bits.append(f"shape {info['shape']}")
+    if info.get('region'):
+        bits.append(f"region {info['region']}")
+    key = _key_label(info.get('fingerprint'), info.get('user'))
+    if key:
+        bits.append(key)
+    return prefix + (': ' + ' · '.join(bits) if bits else '')
+
+
+def automation_snapshot():
+    """Copy of the provisioning-loop state for /api/status and log messages."""
+    with automation_lock:
+        info = dict(automation_info)
+        info['running'] = automation_running
+        info['run_id'] = automation_run_id or info.get('run_id') or 0
+        info['stop_reason'] = automation_stop_reason
+        if automation_shape and not info.get('shape'):
+            info['shape'] = automation_shape
+        return info
+
+
+def _automation_begin(shape, region, fingerprint, user, name):
+    """Reserve the one and only provisioning-loop slot.
+
+    Returns ``(run_id, stop_event, None)`` when the slot was free, or
+    ``(None, None, snapshot_of_the_running_loop)`` when a loop is already
+    running in the background — the caller must not start a second one.
+    """
+    global automation_running, automation_shape, automation_run_id, automation_run_seq
+    global automation_info, automation_stop_reason, stop_event
+
+    with automation_lock:
+        if automation_running:
+            # Build the snapshot inline: automation_snapshot() takes this same
+            # non-reentrant lock.
+            busy = dict(automation_info)
+            busy['running'] = True
+            busy['run_id'] = automation_run_id or busy.get('run_id') or 0
+            busy['stop_reason'] = automation_stop_reason
+            if automation_shape and not busy.get('shape'):
+                busy['shape'] = automation_shape
+            return None, None, busy
+        automation_run_seq += 1
+        automation_run_id = automation_run_seq
+        automation_running = True
+        automation_shape = shape
+        automation_stop_reason = None
+        stop_event = threading.Event()
+        automation_info.clear()
+        automation_info.update({
+            'run_id': automation_run_id,
+            'shape': shape,
+            'region': region,
+            'fingerprint': fingerprint,
+            'user': user,
+            'name': name,
+            'started_at': time.time(),
+            'started_at_local': format_phnom_penh_time(),
+            'attempts': 0,
+            'current_ad': None,
+            'last_activity': time.time(),
+            'finished_at': None,
+            'finished_at_local': None,
+        })
+        return automation_run_id, stop_event, None
+
+
+def _automation_end(run_id, reason=None):
+    """Release the loop slot if it still belongs to `run_id`.
+
+    Returns True when this call released the slot. A stale thread (its run was
+    superseded) gets False and cannot clear a newer run's state.
+    """
+    global automation_running, automation_shape, automation_run_id
+    global automation_info, automation_stop_reason
+
+    with automation_lock:
+        if run_id is not None and automation_run_id not in (0, run_id):
+            # A newer run owns the slot: never clear its state from a stale thread.
+            return False
+        if run_id is not None and not automation_running:
+            # This run already ended: keep the exit log line to exactly one.
+            return False
+        if reason:
+            automation_stop_reason = reason
+        automation_running = False
+        automation_shape = None
+        if run_id is None:
+            # Direct/legacy call that never reserved a run id.
+            automation_info.clear()
+            automation_run_id = 0
+        else:
+            automation_info['finished_at'] = time.time()
+            automation_info['finished_at_local'] = format_phnom_penh_time()
+        return True
+
+
+def _automation_finish(run_id, reason):
+    """End the run and say so in the live log. Idempotent for stale runs."""
+    if _automation_end(run_id, reason):
+        add_log(f"Provisioning loop exited ({reason}).")
+        return True
+    return False
+
+
+def _automation_note_attempt(attempts, ad=None):
+    """Cheap heartbeat so /api/status shows a live background loop."""
+    with automation_lock:
+        if automation_info:
+            automation_info['attempts'] = attempts
+            automation_info['last_activity'] = time.time()
+            if ad:
+                automation_info['current_ad'] = ad
+
+
+def _automation_busy_error(requested_shape, requested_region, requested_fingerprint):
+    """Explain, in one line, why a second loop was refused (for live log + UI)."""
+    running = automation_snapshot()
+    requested = _loop_ref({
+        'shape': requested_shape,
+        'region': requested_region,
+        'fingerprint': requested_fingerprint,
+    })
+    return (
+        f"A provisioning loop is already running in the background "
+        f"({_loop_ref(running)}). Refused this start request ({requested}) — "
+        f"only one provisioning loop runs at a time, even with a different OCI "
+        f"key, region or browser. Stop the running loop first."
+    )
 
 
 def usage_cache_key(config):
@@ -1352,13 +1538,17 @@ def boot_volume_stop():
 @app.route('/healthz')
 def healthz():
     """Cheap unauthenticated health check for Railway, Docker and systemd."""
-    return jsonify({'status': 'ok', 'keepalive': keepalive_public_status()})
+    return jsonify({
+        'status': 'ok',
+        'demo_mode': DEMO_MODE,
+        'keepalive': keepalive_public_status(),
+    })
 
 
 @app.route('/')
 def home():
     try:
-        return render_template('index.html')
+        return render_template('index.html', demo_mode=DEMO_MODE)
     except Exception as e:
         return f"Flask Template Error: {str(e)}", 500
 
@@ -2149,9 +2339,15 @@ def preflight_launch_check(config, account_config, compute_client, network_clien
 def run_automated_creation(config, account_config, compute_client, network_client, identity_client,
                            retry_delay=60, randomize_delay=False, random_min=25, random_max=60,
                            telegram_bot_token=None, telegram_chat_id=None,
-                           max_attempts=MAX_ATTEMPTS):
-    global automation_running
+                           max_attempts=MAX_ATTEMPTS, run_id=None, stop_evt=None):
+    global tg_live_enabled
 
+    if stop_evt is None:
+        # Direct call (tests/legacy): use the module-level event.
+        stop_evt = stop_event
+    # Human-readable reason recorded in the live log and /api/status when the
+    # loop ends. Set as precisely as possible at every exit point.
+    exit_reason = 'ended without success'
     oci_username = None
     oci_email = None
     target_region = config.get('region', 'unknown')
@@ -2174,6 +2370,7 @@ def run_automated_creation(config, account_config, compute_client, network_clien
         )
         if not ok:
             add_log(f"Free tier limit check failed: {err}")
+            exit_reason = 'free tier limit check failed'
             return
 
         add_log(f"Initializing infrastructure scan inside: {target_region}...")
@@ -2185,6 +2382,7 @@ def run_automated_creation(config, account_config, compute_client, network_clien
         add_log(f"Availability domains found: {len(ad_list)} — {', '.join(ad_list)}")
         if not ad_list:
             add_log("Error: No availability domains found for this tenancy.")
+            exit_reason = 'no availability domains found'
             return
 
         # Handle AD preference from user
@@ -2202,6 +2400,7 @@ def run_automated_creation(config, account_config, compute_client, network_clien
             vcns = network_client.list_vcns(compartment_id=config['tenancy']).data
             if not vcns:
                 add_log("Error: No VCN found.")
+                exit_reason = 'no VCN found'
                 return
             subnets = network_client.list_subnets(
                 compartment_id=config['tenancy'],
@@ -2209,6 +2408,7 @@ def run_automated_creation(config, account_config, compute_client, network_clien
             ).data
             if not subnets:
                 add_log("Error: No subnet found.")
+                exit_reason = 'no subnet found'
                 return
             subnet_id = subnets[0].id
             add_log("Auto-selected subnet: " + subnet_id[:20] + "...")
@@ -2218,17 +2418,20 @@ def run_automated_creation(config, account_config, compute_client, network_clien
         image_id = account_config.get('image_id')
         if not image_id:
             add_log("Error: No OS image selected.")
+            exit_reason = 'no OS image selected'
             return
 
         ssh_key = account_config.get('ssh_key', '').strip()
         if not ssh_key:
             add_log("Error: SSH public key is required.")
+            exit_reason = 'SSH public key missing'
             return
 
         valid_prefixes = ('ssh-rsa', 'ssh-ed25519', 'ssh-dss', 'ecdsa-sha2-nistp256',
                           'ecdsa-sha2-nistp384', 'ecdsa-sha2-nistp521', 'sk-ssh-ed25519')
         if not any(ssh_key.startswith(p) for p in valid_prefixes):
             add_log("Error: SSH key does not appear to be a valid public key.")
+            exit_reason = 'invalid SSH public key'
             return
 
         boot_gb = int(account_config.get('boot_volume_gb', 50))
@@ -2301,6 +2504,7 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                 "Fix the item(s) above (region, image, subnet) and start again. "
                 "Retrying will not clear a wrong OCID."
             )
+            exit_reason = 'pre-flight check failed'
             return
 
         # A shape Oracle has not offered in this region yet is NOT fatal — OCI
@@ -2324,12 +2528,14 @@ def run_automated_creation(config, account_config, compute_client, network_clien
         while attempts < max_attempts:
             attempts += 1
 
-            if stop_event.is_set():
+            if stop_evt.is_set():
                 add_log("Provisioning loop stopped by user.")
+                exit_reason = 'stopped by user'
                 break
 
             # Rotate through availability domains (randomized order)
             current_ad = ad_list[ad_index % len(ad_list)] if ad_list else ''
+            _automation_note_attempt(attempts, current_ad)
 
             actual_delay = retry_delay
             if randomize_delay:
@@ -2360,8 +2566,9 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                         )
                     if len(ad_list) > 1:
                         ad_index += 1
-                    if stop_event.wait(actual_delay):
+                    if stop_evt.wait(actual_delay):
                         add_log("Provisioning loop stopped while waiting.")
+                        exit_reason = 'stopped by user'
                         break
                     continue
                 # offered is None (inconclusive): fall through and try to launch.
@@ -2389,6 +2596,7 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                 compute_client.launch_instance(instance_details)
                 add_log("SUCCESS! Instance created and running.")
                 success = True
+                exit_reason = f'success — instance created on attempt {attempts}'
                 if telegram_bot_token and telegram_chat_id:
                     instance_name = account_config.get('display_name', 'AlwaysFree-Bot')
                     shape = account_config.get('shape', 'Unknown')
@@ -2480,12 +2688,17 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                     add_log(f"Automation engine failure: {msg}")
                     break
 
-            if stop_event.wait(actual_delay):
+            if stop_evt.wait(actual_delay):
                 add_log("Provisioning loop stopped while waiting.")
+                exit_reason = 'stopped by user'
                 break
 
         if not success:
-            if attempts >= max_attempts and not stop_event.is_set():
+            if stop_evt.is_set():
+                exit_reason = 'stopped by user'
+            elif attempts >= max_attempts:
+                exit_reason = f'retry limit reached ({max_attempts} attempts)'
+            if attempts >= max_attempts and not stop_evt.is_set():
                 add_log(f"Retry limit reached ({max_attempts} attempts).")
             add_log("Provisioning loop ended without success.")
             if telegram_bot_token and telegram_chat_id:
@@ -2503,6 +2716,9 @@ def run_automated_creation(config, account_config, compute_client, network_clien
 
     except Exception as e:
         msg = str(e)
+        exit_reason = 'network connection lost' if (
+            "Remote end closed connection" in msg or "Connection aborted" in msg
+        ) else f'engine failure: {msg[:120]}'
         if "Remote end closed connection" in msg or "Connection aborted" in msg:
             add_log(f"Network connection lost. Loop ended.")
         else:
@@ -2521,9 +2737,17 @@ def run_automated_creation(config, account_config, compute_client, network_clien
             send_telegram_message(telegram_bot_token, telegram_chat_id, tg_msg)
 
     finally:
-        with automation_lock:
-            automation_running = False
-            automation_shape = None
+        # Release the single-loop slot and say in the live log that the loop is
+        # gone. `_automation_finish` refuses to touch a newer run's state, so a
+        # slow/stale thread can never unlock a loop that started after it.
+        if _automation_finish(run_id, exit_reason):
+            if stop_evt.is_set():
+                # The stop was explicit: keep Telegram live logging on just
+                # long enough to deliver the exit line above, then turn it off
+                # (the same end state the old /api/stop-loop produced).
+                with tg_live_lock:
+                    tg_live_enabled = False
+                add_log("Telegram live log disabled (provisioning loop stopped).")
 
 
 @app.route('/api/free-tier-status', methods=['POST'])
@@ -2555,14 +2779,17 @@ def free_tier_status():
 @app.route('/api/status', methods=['GET'])
 @require_auth
 def get_status():
-    with automation_lock:
-        return jsonify({
-            'success': True,
-            'running': automation_running,
-            'shape': automation_shape,
-            'keepalive': keepalive_status(),
-            'boot_volume_job': boot_volume_job_status()
-        })
+    loop = automation_snapshot()
+    return jsonify({
+        'success': True,
+        'running': loop['running'],
+        'shape': loop.get('shape'),
+        # Who is running in the background (run id, shape, region, key
+        # fingerprint, attempts). Never includes the private key.
+        'loop': loop,
+        'keepalive': keepalive_status(),
+        'boot_volume_job': boot_volume_job_status()
+    })
 
 
 @app.route('/api/keepalive', methods=['GET', 'POST'])
@@ -2585,7 +2812,7 @@ def keepalive_endpoint():
 @require_auth
 @limit_oci_requests
 def auto_launch():
-    global automation_running, tg_live_enabled, tg_live_bot_token, tg_live_chat_id, tg_live_last_sent
+    global tg_live_enabled, tg_live_bot_token, tg_live_chat_id, tg_live_last_sent
     data = request.json or {}
     config = build_config(data)
 
@@ -2595,35 +2822,49 @@ def auto_launch():
         return jsonify({'success': False, 'error': f"Invalid OCI config: {e}"})
 
     requested_shape = data.get('shape', '')
+    requested_region = config.get('region') or 'unknown'
+    requested_fingerprint = config.get('fingerprint')
 
-    # Configure Telegram live logging
-    bot_token = data.get('telegram_bot_token', '').strip()
-    chat_id = data.get('telegram_chat_id', '').strip()
-    enable_live = data.get('telegram_live_log', False)
+    # Validate the Telegram live-log inputs before touching any shared state.
+    bot_token = (data.get('telegram_bot_token') or '').strip()
+    chat_id = (data.get('telegram_chat_id') or '').strip()
+    enable_live = bool(data.get('telegram_live_log', False))
+    if enable_live and (not bot_token or not chat_id):
+        return jsonify({
+            'success': False,
+            'error': 'Telegram live log enabled but bot token or chat ID is missing'
+        })
 
+    # Single-loop guard. It runs before the Telegram settings are applied, so a
+    # second start (even one carrying a different OCI key) can no longer silence
+    # or reconfigure the loop that is already running in the background. The
+    # refusal is written to the live log (UI terminal + Telegram) as well as
+    # returned to the caller.
+    run_id, run_stop_event, _busy = _automation_begin(
+        requested_shape,
+        requested_region,
+        requested_fingerprint,
+        config.get('user'),
+        data.get('display_name', 'AlwaysFree-Bot'),
+    )
+    if run_id is None:
+        message = _automation_busy_error(
+            requested_shape, requested_region, requested_fingerprint
+        )
+        add_log(message)
+        return jsonify({
+            'success': False,
+            'running': True,
+            'error': message,
+            'loop': automation_snapshot(),
+        })
+
+    # Configure Telegram live logging for this run.
     with tg_live_lock:
         tg_live_enabled = bool(enable_live and bot_token and chat_id)
-        tg_live_bot_token = bot_token if enable_live else None
-        tg_live_chat_id = chat_id if enable_live else None
+        tg_live_bot_token = bot_token if tg_live_enabled else None
+        tg_live_chat_id = chat_id if tg_live_enabled else None
         tg_live_last_sent = 0
-
-    if enable_live and (not bot_token or not chat_id):
-        return jsonify({'success': False, 'error': 'Telegram live log enabled but bot token or chat ID is missing'})
-
-    with automation_lock:
-        if automation_running:
-            if automation_shape and automation_shape != requested_shape:
-                return jsonify({
-                    'success': False,
-                    'error': f"A provisioning loop is already running for shape '{automation_shape}'. Stop it first before starting '{requested_shape}'."
-                })
-            return jsonify({
-                'success': False,
-                'error': 'A provisioning loop is already running.'
-            })
-        automation_running = True
-        automation_shape = requested_shape
-        stop_event.clear()
 
     try:
         compute_client = create_oci_client(oci.core.ComputeClient, config)
@@ -2650,32 +2891,76 @@ def auto_launch():
             target=run_automated_creation,
             args=(config, data, compute_client, network_client, identity_client,
                   retry_delay, randomize_delay, random_min, random_max,
-                  data.get('telegram_bot_token'), data.get('telegram_chat_id'),
+                  bot_token or None, chat_id or None,
                   MAX_ATTEMPTS),
+            kwargs={'run_id': run_id, 'stop_evt': run_stop_event},
             daemon=True
         )
         thread.start()
 
+        add_log(
+            f"Provisioning loop started — {_loop_ref(automation_snapshot())} · "
+            f"retry {retry_delay}s"
+            + (f" (random {random_min}-{random_max}s)" if randomize_delay else "")
+            + f" · max {MAX_ATTEMPTS} attempts · Telegram live log "
+            + ("on" if tg_live_enabled else "off")
+            + ". Only this one loop can run until it exits."
+        )
+
         return jsonify({
             'success': True,
+            'running': True,
+            'loop': automation_snapshot(),
             'message': 'Provisioning loop started.' + (' Live Telegram logging enabled.' if tg_live_enabled else '')
         })
 
     except Exception as e:
-        with automation_lock:
-            automation_running = False
-            automation_shape = None
-        return jsonify({'success': False, 'error': str(e)})
+        # Starting the loop failed: release the slot we reserved and log it.
+        add_log(f"Provisioning loop could not start: {e}")
+        _automation_finish(run_id, f'start failed: {str(e)[:120]}')
+        return jsonify({'success': False, 'error': str(e), 'loop': automation_snapshot()})
 
 
 @app.route('/api/stop-loop', methods=['POST'])
 @require_auth
 def stop_loop():
+    """Ask the one running loop to exit. Always answered in the live log.
+
+    Telegram live logging is deliberately left on here: the loop's own exit line
+    ("Provisioning loop exited (stopped by user).") should reach Telegram before
+    the loop turns live logging off in its finally block.
+    """
     global tg_live_enabled
-    stop_event.set()
-    with tg_live_lock:
-        tg_live_enabled = False
-    return jsonify({'success': True, 'message': 'Stop signal sent.'})
+    with automation_lock:
+        running = automation_running
+        current = dict(automation_info)
+        current['run_id'] = automation_run_id or current.get('run_id') or 0
+        event = stop_event
+
+    if not running:
+        with tg_live_lock:
+            tg_live_enabled = False
+        message = 'No provisioning loop is running — nothing to stop.'
+        add_log(f"Stop requested, but {message.lower()}")
+        return jsonify({
+            'success': True,
+            'running': False,
+            'loop': automation_snapshot(),
+            'message': message,
+        })
+
+    event.set()
+    message = 'Stop signal sent — the loop exits at its next check.'
+    add_log(
+        f"Stop requested for {_loop_ref(current)} — waiting for it to exit; "
+        f"the live log will confirm the exit."
+    )
+    return jsonify({
+        'success': True,
+        'running': True,
+        'loop': automation_snapshot(),
+        'message': message,
+    })
 
 
 @app.route('/api/logs', methods=['GET'])
@@ -2723,6 +3008,15 @@ def send_telegram():
         data.get('bot_token'), data.get('chat_id'), data.get('message', '')
     )
     return jsonify({'success': ok, 'error': err})
+
+
+# Demo mode replaces the OCI SDK binding *after* all definitions above, so both
+# ``python app.py`` and ``gunicorn app:app`` run entirely against the in-memory
+# double. Without DEMO_MODE this module is never imported.
+if DEMO_MODE:
+    import demo_sdk
+
+    demo_sdk.install(sys.modules[__name__])
 
 
 if __name__ == '__main__':

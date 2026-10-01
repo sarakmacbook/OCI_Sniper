@@ -11,6 +11,8 @@ A small Flask web UI for launching OCI Always Free instances with optional Teleg
 
 The container uses one worker and two threads. This is deliberate: the provisioning loop is process-local, and multiple workers would create separate status/log stores and could make the UI misleading. The OCI SDK is imported only when an OCI API operation is first used.
 
+There is **exactly one provisioning-loop slot per service**. A second start request is refused while a loop is running in the background — even when it arrives from another browser with a *different* OCI key, region or shape — and the refusal is written to the live log so the reason is visible in the UI terminal and on Telegram. See [One loop at a time](#one-loop-at-a-time).
+
 ## Staying awake 24/7 (Railway sleeping)
 
 Railway's **Serverless** feature (formerly *App Sleeping*) pauses a service when it stops
@@ -48,6 +50,45 @@ Notes and honest limits:
 - Ping targets are redacted of query strings in logs/status responses so private
   ping-token URLs (e.g. healthchecks.io style UUIDs) are not quoted in full.
 
+## One loop at a time
+
+The provisioning loop runs in one background thread with one owner: the service.
+Every start request has to reserve that single slot before any OCI client is
+created, and the slot is released only when the loop actually exits (success,
+retry limit, stop request, or a fatal setup/pre-flight error).
+
+What that means in practice:
+
+- Starting a second loop while one is running is refused, no matter what the
+  request carries. A different OCI key, tenancy, region or shape does not open a
+  second loop — OCI keys are not loop owners, the service is.
+- Each refusal is answered with the loop that already owns the slot
+  (`run #2: shape VM.Standard.A1.Flex · region ap-kulai-1 · key aa:bb`) **and**
+  written to the live log, so the UI terminal and the Telegram live log both say
+  what is running and why nothing new started.
+- A refused request cannot change the running loop's settings. (Before, a second
+  start with "live log" unticked silently switched off the running loop's
+  Telegram live log.)
+- **Stop** is confirmed in the live log twice: `Stop requested for run #N …`
+  when the button is pressed, then `Provisioning loop exited (stopped by user).`
+  once the in-flight OCI call returns and the thread leaves the loop. The exit
+  line still reaches Telegram; the live log is switched off right after it.
+- Every exit is recorded with a reason (`success — instance created on attempt 3`,
+  `stopped by user`, `retry limit reached (100 attempts)`, `pre-flight check failed`,
+  …) and is visible in `/api/status` under `loop.stop_reason`.
+- Each run gets a fresh stop event and a run id. A slow/stale thread can never
+  clear the state of a newer run, and a Stop click can only ever affect the loop
+  that is running now.
+- `/api/status` reports the loop that owns the slot — `run_id`, `shape`,
+  `region`, `fingerprint`, `attempts`, `current_ad`, `started_at_local`,
+  `finished_at_local`, `stop_reason` — never the private key. The header badge in
+  the UI shows the same summary while a loop is hunting.
+
+This is still process-local: running more than one Gunicorn worker or more than
+one replica means more than one loop slot. Keep the deployment at one worker
+(the shipped `gunicorn.conf.py` and Docker command do) unless process state is
+moved to a shared store.
+
 ## Boot volume manager
 
 Panel **5. Boot volume manager** manages the disks behind existing instances without touching the OCI Console:
@@ -61,6 +102,24 @@ Panel **5. Boot volume manager** manages the disks behind existing instances wit
 - **Replace** swaps an instance's boot disk in one job: it stops the instance if needed, detaches the old disk, attaches the replacement (an existing detached disk, or a fresh volume restored from a backup), and boots the instance again. If the attach step fails, it rolls back: the original disk is re-attached and the instance started. Optionally it deletes the old disk after a successful boot.
 
 Every mutating action runs as one background job (like the provisioning loop): the request returns immediately, progress streams into **Live output** and the Telegram live log when enabled, and a replace result can be sent as a Telegram alert. Only one boot-disk job runs at a time; the panel shows its state, offers a **Stop running boot disk job** button that aborts it at the next state poll without issuing further OCI changes, and re-scans the inventory automatically when the job ends.
+
+## Demo mode (try the UI without credentials)
+
+```bash
+DEMO_MODE=1 APP_PASSWORD='' PORT=8000 gunicorn -c gunicorn.conf.py app:app
+```
+
+Open `http://localhost:8000` and the form arrives prefilled with fake credentials. Everything the
+loop guard does can be exercised in a minute: scan images → pick a subnet → **Start** (the demo cloud
+is `OutOfHostCapacity` for two attempts, then succeeds) → start again from a second tab with a
+different OCI key while it hunts and watch the refusal appear in the live log, header badge and
+response → **Stop** and read the `Provisioning loop exited (stopped by user).` line.
+
+Demo mode is honest about its limits: every log line is prefixed `[demo]`, a banner is shown in the
+UI, `/healthz` reports `"demo_mode": true`, read-only panels (images, subnets, quota, boot volume
+inventory, firewall scan) return the in-memory state, and write panels that are not simulated
+(firewall changes, boot-volume jobs) fail with `501 Demo mode: … is not simulated` instead of
+pretending to have changed a real account. Without `DEMO_MODE`, `demo_sdk.py` is never imported.
 
 ## Run on a small VPS
 
@@ -89,6 +148,9 @@ For a systemd or reverse-proxy setup, point the proxy at `127.0.0.1:5000`. The a
 | `USAGE_CACHE_SECONDS` | `20` | Short in-memory cache for the quota screen. Set to `0` to disable. No private key is cached. |
 | `MAX_CONTENT_LENGTH` | `65536` | Maximum JSON request body in bytes. |
 | `LOG_LEVEL` | `info` | Gunicorn log level. |
+| `DEMO_MODE` | `false` | Serve the UI against an in-memory OCI double (`demo_sdk.py`): no credentials, no Oracle Cloud calls, no instance created, every log line prefixed `[demo]`. For previews and screenshots only — never enable in production. |
+| `ALLOW_IFRAME_PREVIEW` | `false` | Drop the `X-Frame-Options: DENY` header so the UI can run inside a hosted preview iframe. Off by default: production keeps `DENY`. |
+| `DEMO_CAPACITY_AFTER_ATTEMPTS` | `3` | Demo mode only: attempt number that finally succeeds; earlier attempts fail with `OutOfHostCapacity`. |
 
 The provisioning loop is intentionally in memory. A Railway restart, redeploy, or VPS process restart stops it; start it again from the UI.
 With the 24/7 keep-alive enabled (see below), the host no longer pauses the service, so a running loop keeps going around the clock. This avoids a database/queue dependency and keeps the service lightweight.
@@ -101,6 +163,8 @@ With the 24/7 keep-alive enabled (see below), the host no longer pauses the serv
 - Free-tier storage, Micro, and Ampere A1 usage checks
 - Boot volume manager: create empty or backup-restored boot volumes, attach, detach, re-attach, replace and delete boot disks, plus instance stop/start — all as one logged background job with rollback on a failed replace
 - Bounded retry loop with fixed or randomized delays and availability-domain rotation
+- Optional demo mode (`DEMO_MODE=1`) that runs the whole UI against an in-memory OCI double for previews and screenshots
+- Single-loop guarantee: one provisioning loop per service, refused start requests logged live (UI + Telegram) with the OCI key/region that already holds the slot, and an exit line with a reason for every stop
 - Launch pre-flight check: before the first attempt the loop resolves the image, subnet and ADs against the configured region, so a truly fatal config (e.g. an image/subnet OCID copied from a different region) is reported with an exact cause instead of silently burning attempts on an ambiguous OCI `404 NotAuthorizedOrNotFound`
 - Shape-availability gate: if Oracle has not yet offered the selected shape in the region, the loop logs it live and **waits** — re-checking each attempt and launching automatically the moment the shape appears — instead of exiting or hammering a guaranteed 404
 - Telegram attempt updates with attempt number, OCI email, region/AD, and safe key fingerprint (never the private key)
@@ -119,10 +183,10 @@ With the 24/7 keep-alive enabled (see below), the host no longer pauses the serv
 | `/api/list-subnets` | POST | List available subnets |
 | `/api/free-tier-status` | POST | Check quota usage |
 | `/api/test-launch` | POST | Validate launch inputs without creating an instance |
-| `/api/auto-launch-loop` | POST | Start the bounded provisioning loop |
-| `/api/stop-loop` | POST | Stop the loop |
+| `/api/auto-launch-loop` | POST | Start the bounded provisioning loop; refused (with a live-log line) while another loop owns the single slot |
+| `/api/stop-loop` | POST | Ask the one running loop to exit; logs `Stop requested …` and returns `running` so the UI can wait for the exit line |
 | `/api/logs` | GET | Fetch bounded live logs |
-| `/api/status` | GET | Check loop status |
+| `/api/status` | GET | Check loop status; `loop` carries run id, shape, region, key fingerprint, attempts, AD and exit reason |
 | `/api/keepalive` | GET/POST | Inspect or toggle the 24/7 keep-alive pinger |
 | `/api/boot-volumes/list` | POST | Inventory instances, boot volumes, backups and availability domains with attachment state and storage totals |
 | `/api/boot-volumes/action` | POST | Queue a boot disk job: `create` (empty or from `backup_id`), `detach`, `attach` (also re-attach), `delete`, `instance-action` (start/stop) or `replace` |
