@@ -402,6 +402,7 @@
                     <select id="imageSelect" class="form-select">
                         <option value="">-- Scan images first --</option>
                     </select>
+                    <div id="imageScanHint" style="margin-top:6px;font-size:11px;color:var(--text-muted);"></div>
                 </div>
                 <div class="form-group">
                     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
@@ -440,6 +441,7 @@
                             <option value="VM.Standard.A1.Flex">Ampere A1 Flex (ARM)</option>
                             <option value="VM.Standard.E2.1.Micro">AMD E2 Micro</option>
                         </select>
+                        <div id="shapeArchHint" style="margin-top:6px;font-size:11px;color:var(--text-muted);"></div>
                     </div>
                     <div class="form-group">
                         <label class="form-label">VM name</label>
@@ -753,6 +755,7 @@
         addLog('DEMO MODE ready — fake credentials are prefilled, nothing to type.', 'success');
         addLog('Try it: (1) Scan OS images, (2) pick a subnet, (3) Start provisioning loop.', 'warn');
         addLog('The demo cloud is out of capacity for 2 attempts, then succeeds — watch the retries in this terminal.', 'warn');
+        addLog('Switch Shape to "AMD E2 Micro": images are chipset-specific, so the app asks you to re-scan OS images.', 'warn');
         addLog('While it hunts, press Start again or open a second tab: the new loop is refused, and the refusal appears here.', 'warn');
         addLog('Then press Stop: the exit line ("Provisioning loop exited (stopped by user).") is the confirmation.', 'warn');
     }
@@ -830,6 +833,66 @@
         addLog('SSH key cleared — upload a new one', 'warn');
     });
 
+    // ---- Chipset (CPU architecture) awareness ---------------------------
+    // OCI images are built for exactly one chipset: Ampere A1/A2 shapes are
+    // ARM (aarch64) and the standard E-series/Micro free-tier shapes are
+    // AMD/Intel (x86_64). An image for one never boots on the other, so
+    // switching the shape across chipsets clears the scanned image list and
+    // asks for a fresh scan instead of letting a stale pairing start a hunt
+    // that can only ever 404.
+    const ARM_SHAPE_FAMILIES = ['A1', 'A2', 'A3', 'A4'];
+    const ARCH_LABEL = { arm: 'ARM (aarch64)', x86: 'AMD/Intel (x86_64)' };
+    let scannedShape = null;   // shape the current image list was scanned for
+    let lastShapeArch = null;  // chipset of the shape select before this change
+
+    function shapeArch(shape) {
+        const parts = String(shape || '').split('.');
+        const family = parts.length > 2 ? parts[2] : String(shape || '');
+        return ARM_SHAPE_FAMILIES.indexOf(family.toUpperCase()) >= 0 ? 'arm' : 'x86';
+    }
+
+    function archLabel(arch) { return ARCH_LABEL[arch] || 'unknown chipset'; }
+
+    function renderShapeArchHint() {
+        const arch = shapeArch(document.getElementById('shapeSelect').value);
+        const el = document.getElementById('shapeArchHint');
+        if (el) el.innerHTML = 'Chipset: <b>' + archLabel(arch) + '</b> — OS images are built per chipset.';
+    }
+
+    function renderImageScanHint() {
+        const el = document.getElementById('imageScanHint');
+        if (!el) return;
+        const shape = document.getElementById('shapeSelect').value;
+        const arch = shapeArch(shape);
+        if (!scannedShape) {
+            el.style.color = 'var(--text-muted)';
+            el.textContent = 'Not scanned yet — scan OS images for ' + archLabel(arch) + ' before starting.';
+        } else if (shapeArch(scannedShape) !== arch) {
+            el.style.color = 'var(--danger)';
+            el.textContent = 'Stale list: scanned for ' + scannedShape + ' (' + archLabel(shapeArch(scannedShape)) +
+                ') — re-scan for ' + archLabel(arch) + '.';
+        } else {
+            el.style.color = 'var(--text-muted)';
+            el.textContent = 'Scanned for ' + scannedShape + ' · ' + archLabel(arch);
+        }
+    }
+
+    function onChipsetSwitch(oldArch, newArch) {
+        const select = document.getElementById('imageSelect');
+        const hadImages = select.options.length > 1 || !!select.value;
+        scannedShape = null;
+        select.innerHTML = '<option value="">-- Re-scan for ' + archLabel(newArch) + ' --</option>';
+        addLog('Shape switched: ' + archLabel(oldArch) + ' → ' + archLabel(newArch) +
+            ' — image OCIDs are chipset-specific, so the previous scan was cleared.', 'warn');
+        if (!hadImages) return;   // nothing scanned yet: no stale image to repair
+        addLog('Re-scan OS images for the new shape before starting.', 'warn');
+        if (confirm('Chipset switched: ' + archLabel(oldArch) + ' → ' + archLabel(newArch) +
+                '.\n\nOCI images are built per chipset, so the scanned list cannot boot on the new shape.' +
+                '\n\nRe-scan OS images now?')) {
+            scanImages();
+        }
+    }
+
     function onShapeChange() {
         const shape = document.getElementById('shapeSelect').value;
         const cpu = document.getElementById('ocpus');
@@ -844,6 +907,12 @@
             ram.value = 12; ram.disabled = false;
             vmName.value = getUniqueVmName('Arm');
         }
+        const arch = shapeArch(shape);
+        renderShapeArchHint();
+        // Only a chipset change invalidates the image list (ARM ⇄ AMD/x86).
+        if (lastShapeArch && arch !== lastShapeArch) onChipsetSwitch(lastShapeArch, arch);
+        lastShapeArch = arch;
+        renderImageScanHint();
     }
 
     function getUniqueVmName(base) {
@@ -1066,6 +1135,7 @@
         btn.disabled = true;
         btn.textContent = 'Scanning...';
         select.innerHTML = '<option>Scanning...</option>';
+        scannedShape = null;   // the list is invalid until this scan returns
 
         try {
             const res = await fetch('/api/list-images', {
@@ -1084,6 +1154,9 @@
             const data = await res.json();
 
             if (data.success && data.images.length > 0) {
+                // Trust the shape the server echoes back: that is the one OCI
+                // filtered the list for.
+                scannedShape = data.shape || document.getElementById('shapeSelect').value;
                 select.innerHTML = '';
                 data.images.forEach(img => {
                     const opt = document.createElement('option');
@@ -1091,16 +1164,22 @@
                     opt.textContent = document.getElementById('allOS').checked ? '[' + img.os + '] ' + img.name : img.name;
                     select.appendChild(opt);
                 });
-                addLog('Found ' + data.images.length + ' compatible images', 'success');
+                addLog('Found ' + data.images.length + ' compatible images for ' + scannedShape +
+                    ' (' + archLabel(shapeArch(scannedShape)) + ')', 'success');
             } else {
                 select.innerHTML = '<option value="">-- No images found --</option>';
-                addLog('No images found: ' + (data.error || 'None available'), 'warn');
+                scannedShape = null;
+                addLog('No images found: ' + (data.error || 'None available') +
+                    ' — check that the shape (' + archLabel(shapeArch(document.getElementById('shapeSelect').value)) +
+                    ') is offered in this region.', 'warn');
             }
         } catch (err) {
             select.innerHTML = '<option value="">-- Error --</option>';
+            scannedShape = null;
             addLog('Image scan error: ' + err.message, 'error');
         }
 
+        renderImageScanHint();
         btn.disabled = false;
         btn.textContent = 'Scan OS images';
     }
@@ -1307,6 +1386,8 @@
 
     function onAllOSChange() {
         document.getElementById('imageSelect').innerHTML = '<option value="">-- Scan images --</option>';
+        scannedShape = null;
+        renderImageScanHint();
     }
 
     async function testTelegram() {
@@ -1698,9 +1779,24 @@
         const user = document.getElementById('cfgUser').value;
         const key = document.getElementById('cfgKey').value;
 
+        const shape = document.getElementById('shapeSelect').value;
+
         if (!user || !key) { addLog('Error: Credentials required', 'error'); return; }
-        if (!image) { addLog('Error: Select an OS image first', 'error'); return; }
+        if (!image) { addLog('Error: Select an OS image first (scan for the current shape)', 'error'); return; }
         if (!ssh) { addLog('Error: SSH public key required', 'error'); return; }
+
+        // Chipset guard: an image scanned for one CPU architecture can never
+        // launch on the other, so refuse to start with a stale pairing and ask
+        // for the re-scan the shape switch should have triggered. Same-chipset
+        // shapes stay interchangeable (an aarch64 image runs on any Ampere
+        // shape), so the comparison is by architecture, not by exact shape name.
+        if (!scannedShape || shapeArch(scannedShape) !== shapeArch(shape)) {
+            addLog('Error: OS image list was scanned for ' + (scannedShape || 'no shape') +
+                ', but the selected shape is ' + shape + ' (' + archLabel(shapeArch(shape)) +
+                '). Re-scan OS images so the image matches the chipset.', 'error');
+            renderImageScanHint();
+            return;
+        }
 
         const payload = {
             user: user,
@@ -1708,7 +1804,7 @@
             fingerprint: document.getElementById('cfgFingerprint').value,
             region: document.getElementById('cfgRegion').value,
             private_key: key,
-            shape: document.getElementById('shapeSelect').value,
+            shape: shape,
             image_id: image,
             subnet_id: document.getElementById('subnetSelect').value,
             ad_preference: document.getElementById('adSelect').value,
@@ -1832,6 +1928,8 @@
             '<div style="font-size:12px;color:var(--text-muted);">Drop .pem, .txt, or .key file</div>';
 
         document.getElementById('imageSelect').innerHTML = '<option value="">-- Scan images first --</option>';
+        scannedShape = null;
+        renderImageScanHint();
         document.getElementById('subnetSelect').innerHTML = '<option value="">-- Auto-select first available --</option>';
         document.getElementById('subnetInfo').style.display = 'none';
 
@@ -1970,6 +2068,12 @@
 
     window.addEventListener('load', () => {
         if (DEMO) prefillDemo();
+        // Prime the chipset hints for the initial shape. onShapeChange() is not
+        // called here on purpose: it would overwrite fields prefillDemo() just
+        // filled in.
+        lastShapeArch = shapeArch(document.getElementById('shapeSelect').value);
+        renderShapeArchHint();
+        renderImageScanHint();
         fetchLogs();
         checkStatus();
         // Status is useful while stopped too, but does not need a request every

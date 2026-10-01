@@ -65,6 +65,15 @@ class FakeCompute:
         self.shapes_offered = list(shapes_offered)
         self.images = images if images is not None else {}
         self.instances = instances if instances is not None else []
+        # Shapes OCI says each image is compatible with. ``None`` means "not
+        # modelled": the lookup reports every shape as compatible, so only tests
+        # that opt in (by setting a list) exercise the chipset check.
+        self.image_shape_compat = None
+        self.shape_compat_raises = False
+        self.compat_calls = []
+        # Display names by image id; the default is an x86 image (no platform
+        # marker in the name), so only tests that set this hit the ARM branch.
+        self.image_names = {}
         self.launch_calls = []
         self.launch_error = None
         self.shape_lookup_ads = []
@@ -84,7 +93,9 @@ class FakeCompute:
                 message='Authorization failed or requested resource not found.'
             )
         return _resp(types.SimpleNamespace(
-            id=image_id, display_name='img', lifecycle_state=state,
+            id=image_id,
+            display_name=self.image_names.get(image_id, 'Canonical-Ubuntu-24.04-2025.09.15-0'),
+            lifecycle_state=state,
         ))
 
     def list_shapes(self, compartment_id=None, availability_domain=None):
@@ -100,6 +111,16 @@ class FakeCompute:
                 and self.target_shape and self.target_shape not in offered):
             offered = offered + [self.target_shape]
         return _resp([types.SimpleNamespace(shape=s) for s in offered])
+
+    def list_image_shape_compatibility_entries(self, image_id=None):
+        self.compat_calls.append(image_id)
+        if self.shape_compat_raises:
+            raise FakeServiceError(code='InternalError', status=500, message='boom')
+        compatible = self.image_shape_compat
+        if compatible is None:
+            compatible = ['VM.Standard.E2.1.Micro', 'VM.Standard.A1.Flex',
+                          'VM.Standard.E4.Flex', 'VM.Standard.E5.Flex']
+        return _resp([types.SimpleNamespace(shape=s) for s in compatible])
 
     def list_instances(self, compartment_id=None):
         return _resp(self.instances)
@@ -228,6 +249,35 @@ class PreflightTestBase(unittest.TestCase):
             return '\n'.join(app.global_logs[start:])
 
 
+class ShapeArchitectureTests(unittest.TestCase):
+    """The shape -> chipset mapping the UI prompt and the pre-flight share."""
+
+    def test_ampere_shapes_are_arm(self):
+        self.assertEqual(app.shape_architecture('VM.Standard.A1.Flex'), 'arm')
+        self.assertEqual(app.shape_architecture('VM.Standard.A2.Flex'), 'arm')
+        self.assertEqual(app.shape_architecture('BM.Standard.A1.160'), 'arm')
+
+    def test_amd_and_intel_shapes_are_x86(self):
+        self.assertEqual(app.shape_architecture('VM.Standard.E2.1.Micro'), 'x86')
+        self.assertEqual(app.shape_architecture('VM.Standard.E4.Flex'), 'x86')
+        self.assertEqual(app.shape_architecture('VM.Standard3.Flex'), 'x86')
+        self.assertEqual(app.shape_architecture('VM.Optimized3.Flex'), 'x86')
+        # A GPU shape's 'A10' family is not an Ampere A-series.
+        self.assertEqual(app.shape_architecture('VM.GPU.A10.1'), 'x86')
+
+    def test_empty_shape_has_no_architecture(self):
+        self.assertIsNone(app.shape_architecture(''))
+        self.assertIsNone(app.shape_architecture(None))
+
+    def test_image_architecture_reads_the_display_name(self):
+        self.assertEqual(app.image_architecture(
+            types.SimpleNamespace(display_name='Canonical-Ubuntu-24.04-aarch64-2025.09.15-0')),
+            'arm')
+        # An x86 name has no marker: OCI is asked instead of guessing.
+        self.assertIsNone(app.image_architecture(
+            types.SimpleNamespace(display_name='Canonical-Ubuntu-24.04-2025.09.15-0')))
+
+
 class ShapeOfferedInAdTests(PreflightTestBase):
     def test_true_when_shape_listed(self):
         self.assertTrue(app._shape_offered_in_ad(self.compute, 't', AD, 'VM.Standard.E2.1.Micro'))
@@ -289,6 +339,54 @@ class PreflightCheckTests(PreflightTestBase):
         self.assertTrue(any('Subnet' in p and 'region-specific' in p for p in problems))
 
 
+class ChipsetMismatchTests(PreflightTestBase):
+    """An image built for the other CPU architecture is fatal, not a retry."""
+
+    def test_flags_arm_image_on_an_amd_shape(self):
+        # The shape switch this feature exists for: an aarch64 Ubuntu image left
+        # over from an Ampere A1 hunt against an E2.1.Micro (AMD) shape.
+        self.compute.image_names = {
+            'ocid1.image.apkulai': 'Canonical-Ubuntu-24.04-aarch64-2025.09.15-0',
+        }
+        problems, _ = app.preflight_launch_check(
+            self.config, make_account(shape='VM.Standard.E2.1.Micro'),
+            self.compute, self.network, self.identity, [AD],
+        )
+        self.assertEqual(len(problems), 1)
+        self.assertIn('built for ARM (aarch64)', problems[0])
+        self.assertIn('AMD/Intel (x86_64)', problems[0])
+        self.assertIn('re-scan OS images', problems[0])
+
+    def test_flags_x86_image_on_an_arm_shape_via_oci_compatibility(self):
+        # An x86 display name carries no marker, so OCI's compatibility list is
+        # the authority — and it lists only x86 shapes for this image.
+        self.compute.image_shape_compat = ['VM.Standard.E2.1.Micro', 'VM.Standard.E4.Flex']
+        problems, _ = app.preflight_launch_check(
+            self.config, make_account(shape='VM.Standard.A1.Flex'), self.compute,
+            self.network, self.identity, [AD],
+        )
+        self.assertEqual(len(problems), 1)
+        self.assertIn("shape 'VM.Standard.A1.Flex'", problems[0])
+        self.assertIn('not compatible with this shape', problems[0])
+
+    def test_matching_chipset_passes(self):
+        self.compute.image_shape_compat = ['VM.Standard.E2.1.Micro']
+        problems, _ = app.preflight_launch_check(
+            self.config, make_account(), self.compute, self.network,
+            self.identity, [AD],
+        )
+        self.assertEqual(problems, [])
+
+    def test_compatibility_lookup_failure_is_not_fatal(self):
+        # If OCI cannot answer, the launch is not blocked on a guess.
+        self.compute.shape_compat_raises = True
+        problems, _ = app.preflight_launch_check(
+            self.config, make_account(), self.compute, self.network,
+            self.identity, [AD],
+        )
+        self.assertEqual(problems, [])
+
+
 class LoopPreflightIntegrationTests(PreflightTestBase):
     def test_loop_aborts_on_fatal_image_problem(self):
         # A wrong-region image OCID is fatal: waiting cannot fix it.
@@ -301,6 +399,24 @@ class LoopPreflightIntegrationTests(PreflightTestBase):
         logs = self.log_text()
         self.assertIn('Pre-flight check failed', logs)
         self.assertIn('region-specific', logs)
+        self.assertFalse(app.automation_running)
+
+    def test_loop_aborts_when_image_chipset_does_not_match_the_shape(self):
+        # Waiting cannot fix an ARM image on an AMD shape: the loop must stop
+        # with the re-scan instruction instead of spending attempts on 404s.
+        self.compute.image_names = {
+            'ocid1.image.apkulai': 'Canonical-Ubuntu-24.04-aarch64-2025.09.15-0',
+        }
+        app.run_automated_creation(
+            self.config, make_account(), self.compute, self.network,
+            self.identity, retry_delay=0, max_attempts=5,
+        )
+        self.assertEqual(self.compute.launch_calls, [])
+        logs = self.log_text()
+        self.assertIn('Pre-flight check failed', logs)
+        self.assertIn('built for ARM (aarch64)', logs)
+        self.assertIn('re-scan OS images', logs)
+        self.assertIn('pre-flight check failed', logs)  # exit reason
         self.assertFalse(app.automation_running)
 
     def test_loop_waits_when_shape_not_offered(self):

@@ -31,9 +31,15 @@ CRED = {
     'private_key': 'demo-private-key',
 }
 
+# The demo publishes both chipsets: demo0/demo1/demo4 are aarch64 (ARM) images
+# for the Ampere shapes, demo2/demo3 are x86_64 images for the AMD/Micro shape.
+# This account is the AMD one, so it must pair with an x86_64 image.
+AMD_IMAGE_ID = 'ocid1.image.oc1.ap-kulai-1.demo2'
+ARM_IMAGE_ID = 'ocid1.image.oc1.ap-kulai-1.demo0'
+
 ACCOUNT = {
     'shape': 'VM.Standard.E2.1.Micro',
-    'image_id': 'ocid1.image.oc1.ap-kulai-1.demo0',
+    'image_id': AMD_IMAGE_ID,
     'subnet_id': 'ocid1.subnet.oc1.ap-kulai-1.public',
     'ssh_key': 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQAB demo@example.com',
     'boot_volume_gb': 50,
@@ -109,6 +115,27 @@ class DemoScansTests(DemoModeTestBase):
         self.assertEqual([s['name'] for s in subnets['subnets']],
                          ['public-subnet', 'private-subnet'])
         self.assertTrue(subnets['subnets'][0]['public'])
+
+    def test_image_scan_is_per_chipset_like_oracle(self):
+        # Ampere A1 = ARM: only aarch64 images come back, and the response says
+        # which shape/chipset the list was scanned for.
+        arm = self.post('/api/list-images', dict(CRED, shape='VM.Standard.A1.Flex'))
+        self.assertTrue(arm['success'])
+        self.assertEqual(arm['shape'], 'VM.Standard.A1.Flex')
+        self.assertEqual(arm['arch'], 'arm')
+        self.assertTrue(arm['images'])
+        self.assertTrue(all('aarch64' in i['name'] for i in arm['images']))
+        self.assertTrue(all(i['arch'] == 'arm' for i in arm['images']))
+        self.assertTrue(any(i['id'] == ARM_IMAGE_ID for i in arm['images']))
+
+        # AMD E2.1.Micro = x86_64: the aarch64 images must not appear at all.
+        amd = self.post('/api/list-images', dict(CRED, shape='VM.Standard.E2.1.Micro'))
+        self.assertTrue(amd['success'])
+        self.assertEqual(amd['arch'], 'x86')
+        self.assertTrue(amd['images'])
+        self.assertTrue(all('aarch64' not in i['name'] for i in amd['images']))
+        self.assertTrue(all(i['arch'] == 'x86' for i in amd['images']))
+        self.assertTrue(any(i['id'] == AMD_IMAGE_ID for i in amd['images']))
 
     def test_quota_and_boot_volume_inventory_start_empty_and_work(self):
         usage = self.post('/api/free-tier-status', CRED)['usage']
@@ -190,6 +217,32 @@ class DemoLoopTests(DemoModeTestBase):
         self.assertIn('Provisioning loop exited (stopped by user).', logs)
         # Demo runs are unmistakable: every line carries [demo].
         self.assertIn('[demo]', logs)
+
+    def test_mixing_chipsets_is_refused_before_any_launch(self):
+        # The exact mistake a shape switch used to allow: an aarch64 (ARM) image
+        # left over from an A1 hunt paired with an AMD Micro shape. The loop must
+        # refuse it up front and say "re-scan", not burn attempts on a 404.
+        import threading
+
+        config = {'user': CRED['user'], 'tenancy': CRED['tenancy'],
+                  'fingerprint': CRED['fingerprint'], 'region': CRED['region'],
+                  'key_content': CRED['private_key']}
+        compute = app.create_oci_client(app.oci.core.ComputeClient, config)
+        network = app.create_oci_client(app.oci.core.VirtualNetworkClient, config)
+        identity = app.create_oci_client(app.oci.identity.IdentityClient, config)
+        app.run_automated_creation(
+            config, dict(ACCOUNT, image_id=ARM_IMAGE_ID), compute, network, identity,
+            retry_delay=0, max_attempts=3, stop_evt=threading.Event(),
+        )
+
+        logs = self.log_text()
+        self.assertIn('Pre-flight check failed', logs)
+        self.assertIn('is built for ARM (aarch64)', logs)                 # the image
+        self.assertIn('the shape is AMD/Intel (x86_64)', logs)            # the shape
+        self.assertIn('re-scan OS images', logs)
+        self.assertNotIn('SUCCESS! Instance created', logs)
+        usage = self.post('/api/free-tier-status', CRED)['usage']
+        self.assertEqual(usage['micro']['used'], 0)
 
     def test_firewall_reads_work_and_writes_say_not_simulated(self):
         subnet_id = 'ocid1.subnet.oc1.ap-kulai-1.public'
