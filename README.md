@@ -2,6 +2,8 @@
 
 A small Flask web UI for launching OCI Always Free instances with optional Telegram alerts. It is designed to run as **one Gunicorn worker** on Railway or a low-spec VPS.
 
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new?utm_medium=integration&utm_source=button&utm_campaign=generic)
+
 ## Deploy on Railway
 
 1. Create a Railway service from this repository.
