@@ -195,6 +195,23 @@ function x86Images() {
           !!launch && launch.body.image_id === 'x8624' && launch.body.shape === 'VM.Standard.E2.1.Micro',
           JSON.stringify(launch && launch.body));
 
+    console.log('6. render unavailable-shape logs as a prominent warning');
+    responses['/api/logs?offset=0'] = () => ({
+        logs: [
+            "[2026-10-01 08:23:56] [demo] WARNING: No shape availability — Currently, shape 'VM.Standard.E2.1.Micro' is not available in your Oracle Cloud region 'ap-kulai-1'. Please wait for Oracle Cloud to offer it there."
+        ],
+        next_offset: 1,
+    });
+    await ctx.fetchLogs();
+    const warning = el('terminalBody').options.find(child => child.className === 'log-line log-shape-warning');
+    check('shape warning gets its large callout style', !!warning, JSON.stringify(el('terminalBody').options));
+    check('WARNING is rendered as a separate bold headline',
+          !!warning && warning.options[1].textContent === 'WARNING',
+          warning && warning.options[1] && warning.options[1].textContent);
+    check('callout shows the requested region-availability guidance',
+          !!warning && /Currently, shape.*not available.*Please wait for Oracle Cloud to offer it there/.test(warning.options[2].textContent),
+          warning && warning.options[2] && warning.options[2].textContent);
+
     console.log(failures ? '\n' + failures + ' FAILURE(S)' : '\nALL UI CHECKS PASSED');
     process.exit(failures ? 1 : 0);
 })();
