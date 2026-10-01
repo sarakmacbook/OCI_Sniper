@@ -2031,6 +2031,120 @@ def send_telegram_attempt_update(bot_token, chat_id, attempt, email, region, ad,
         add_log(f"Telegram attempt update failed: {error}")
 
 
+def _shape_offered_in_ad(compute_client, compartment_id, ad_name, shape):
+    """Is `shape` actually offered in this availability domain?
+
+    OCI's ``ListShapes`` for an availability domain is the authoritative list of
+    shapes that can be launched there. A shape that is absent from that list
+    cannot be created in the region at all — OCI rejects the launch with a
+    permanent ``404 NotAuthorizedOrNotFound`` ("Authorization failed or requested
+    resource not found"), which *looks* like an auth/OCID problem but is really
+    "this shape is not offered here" (e.g. ``VM.Standard.E2.1.Micro`` is not
+    available in every region).
+
+    Returns True/False when the answer is known, or None when the check is
+    inconclusive (the SDK call failed, or the list came back empty) so callers
+    never block a launch on an unknown.
+    """
+    try:
+        shapes = compute_client.list_shapes(
+            compartment_id=compartment_id,
+            availability_domain=ad_name
+        ).data
+    except Exception:
+        return None
+    names = {getattr(s, 'shape', None) for s in (shapes or [])}
+    if not names:
+        return None
+    return shape in names
+
+
+def preflight_launch_check(config, account_config, compute_client, network_client,
+                           identity_client, ad_list):
+    """Validate launch inputs against the configured region before the loop runs.
+
+    The single most confusing OCI failure is a launch that fails with
+    ``404 NotAuthorizedOrNotFound``. OCI deliberately makes that one error mean
+    both "you lack permission" and "the resource does not exist / is not offered
+    here", so the loop's generic guesswork can never pinpoint the cause. This
+    check resolves each referenced resource against the configured region up
+    front so the user is told exactly what is wrong instead of watching attempts
+    silently 404.
+
+    Returns ``(problems, shape_available)``:
+
+    * ``problems`` — fatal blockers for *this* region (a bad image or subnet
+      OCID, e.g. one copied from another region). Retrying or waiting cannot fix
+      these, so the caller should abort.
+    * ``shape_available`` — ``True`` if the shape is offered in at least one AD,
+      ``False`` if it is definitively not offered anywhere, or ``None`` if the
+      check was inconclusive. ``False`` is **not** fatal: regions gain shapes
+      over time, so the caller should wait for Oracle Cloud to offer it rather
+      than exit.
+    """
+    tenancy = config['tenancy']
+    region = config.get('region', 'unknown')
+    shape = account_config.get('shape')
+    image_id = account_config.get('image_id')
+    subnet_id = account_config.get('subnet_id')
+    problems = []
+
+    # 1. The image OCID must exist and be AVAILABLE in *this* region. Image
+    #    OCIDs are region-specific; a valid OCID from another region 404s here.
+    if image_id:
+        try:
+            img = compute_client.get_image(image_id=image_id).data
+            state = getattr(img, 'lifecycle_state', '')
+            if state != 'AVAILABLE':
+                problems.append(
+                    f"Image {image_id} is '{state or 'unknown'}', not AVAILABLE, "
+                    f"in region '{region}'."
+                )
+        except Exception as e:
+            problems.append(
+                f"Image {image_id} could not be read in region '{region}' "
+                f"({_bv_error_text(e)}). Image OCIDs are region-specific — this one is "
+                f"most likely from a different region. Re-pick it from the image "
+                f"list for '{region}'."
+            )
+
+    # 2. The subnet must exist and be AVAILABLE, also in this region.
+    if subnet_id:
+        try:
+            sn = network_client.get_subnet(subnet_id=subnet_id).data
+            state = getattr(sn, 'lifecycle_state', '')
+            if state != 'AVAILABLE':
+                problems.append(
+                    f"Subnet {subnet_id} is '{state or 'unknown'}', not AVAILABLE, "
+                    f"in region '{region}'."
+                )
+        except Exception as e:
+            problems.append(
+                f"Subnet {subnet_id} could not be read in region '{region}' "
+                f"({_bv_error_text(e)}). Subnet OCIDs are region-specific — re-pick "
+                f"it from the subnet list for '{region}'."
+            )
+
+    # 3. Is the shape actually offered in this region yet? Not fatal — reported
+    #    back to the caller so it can wait for Oracle Cloud to add the shape.
+    shape_available = None
+    if shape and ad_list:
+        checked_any = False
+        offered_any = False
+        for ad in ad_list:
+            offered = _shape_offered_in_ad(compute_client, tenancy, ad, shape)
+            if offered is None:
+                continue
+            checked_any = True
+            if offered:
+                offered_any = True
+                break
+        if checked_any:
+            shape_available = offered_any
+
+    return problems, shape_available
+
+
 @hold_oci_slot
 def run_automated_creation(config, account_config, compute_client, network_client, identity_client,
                            retry_delay=60, randomize_delay=False, random_min=25, random_max=60,
@@ -2169,6 +2283,42 @@ def run_automated_creation(config, account_config, compute_client, network_clien
             _random.shuffle(ad_list)
             add_log(f"AD order randomized for faster discovery: {', '.join(ad_list)}")
 
+        # Pre-flight: resolve every referenced resource against this region
+        # before spending attempts. A 404 NotAuthorizedOrNotFound is ambiguous
+        # by design (permission *or* missing/not-offered resource), so we pin
+        # the cause down here.
+        preflight_problems, shape_available = preflight_launch_check(
+            config, account_config, compute_client, network_client,
+            identity_client, ad_list
+        )
+        if preflight_problems:
+            # Only truly fatal config errors land here (bad image/subnet OCID
+            # for this region). Retrying or waiting cannot clear these.
+            add_log("Pre-flight check failed — the launch cannot succeed as configured:")
+            for problem in preflight_problems:
+                add_log(f"  - {problem}")
+            add_log(
+                "Fix the item(s) above (region, image, subnet) and start again. "
+                "Retrying will not clear a wrong OCID."
+            )
+            return
+
+        # A shape Oracle has not offered in this region yet is NOT fatal — OCI
+        # regions gain shapes over time. Do not exit: wait and re-check, and
+        # launch automatically the moment the shape appears. `shape_confirmed`
+        # gates launch_instance so we don't hammer a guaranteed 404 meanwhile.
+        shape_confirmed = shape_available is not False
+        if shape_available is False:
+            add_log(
+                f"No shape availability: '{account_config['shape']}' is not offered in "
+                f"region '{target_region}' yet (ADs: {', '.join(ad_list)})."
+            )
+            add_log(
+                f"Waiting for Oracle Cloud to add '{account_config['shape']}' to this region — "
+                f"re-checking every attempt and launching as soon as it appears. "
+                f"Stop the loop anytime to cancel."
+            )
+
         # Never leave a daemon thread retrying forever. This is especially
         # important on Railway/VPS instances with limited CPU and memory.
         while attempts < max_attempts:
@@ -2180,6 +2330,42 @@ def run_automated_creation(config, account_config, compute_client, network_clien
 
             # Rotate through availability domains (randomized order)
             current_ad = ad_list[ad_index % len(ad_list)] if ad_list else ''
+
+            actual_delay = retry_delay
+            if randomize_delay:
+                actual_delay = random.randint(random_min, random_max)
+                add_log(f"Dynamic retry: waiting {actual_delay}s (randomized {random_min}-{random_max}s)")
+
+            # Shape-availability gate. Until Oracle offers the shape in this
+            # region, every launch is a permanent 404, so wait instead of
+            # hammering — and resume the instant the shape shows up.
+            if not shape_confirmed:
+                offered = _shape_offered_in_ad(
+                    compute_client, config['tenancy'], current_ad, account_config['shape']
+                )
+                if offered is True:
+                    shape_confirmed = True
+                    add_log(
+                        f"Shape '{account_config['shape']}' is now offered in '{current_ad}' — "
+                        f"resuming launch attempts."
+                    )
+                elif offered is False:
+                    if len(ad_list) > 1:
+                        add_log(f"Attempt {attempts}: no shape availability — trying AD '{current_ad}'...")
+                    else:
+                        add_log(
+                            f"Attempt {attempts}: no shape availability — "
+                            f"'{account_config['shape']}' still not offered in '{current_ad}'. "
+                            f"Waiting for Oracle Cloud to add it..."
+                        )
+                    if len(ad_list) > 1:
+                        ad_index += 1
+                    if stop_event.wait(actual_delay):
+                        add_log("Provisioning loop stopped while waiting.")
+                        break
+                    continue
+                # offered is None (inconclusive): fall through and try to launch.
+
             if len(ad_list) > 1:
                 add_log(f"Attempt {attempts}: trying AD '{current_ad}'...")
 
@@ -2240,16 +2426,41 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                         next_ad = ad_list[ad_index % len(ad_list)]
                         add_log(f"Switching to next AD: '{next_ad}'")
                 elif "NotAuthorizedOrNotFound" in msg or "Authorization failed" in msg or status == 404:
-                    add_log(f"Auth/NotFound error — possible causes:")
-                    add_log(f"  1. Image {image_id[:25]}... not found in AD {current_ad}")
-                    add_log(f"  2. Shape {account_config['shape']} not available in this AD")
-                    add_log(f"  3. Subnet {subnet_id[:25]}... missing permissions")
-                    add_log(f"  4. Check OCI Console > Instances > Create — test manually")
+                    # OCI makes one 404 mean both "no permission" and "resource
+                    # missing / not offered here". The image and subnet were
+                    # already validated for this region and the shape gate only
+                    # lets us launch once the shape is offered, so a 404 *here*
+                    # is almost always no free quota for the shape in THIS AD
+                    # (OCI reports that as a 404, not 429/500) or the shape has
+                    # not fully rolled out to this AD yet. Both clear up over
+                    # time, so wait and retry rather than exiting.
+                    add_log(
+                        f"404 NotAuthorizedOrNotFound in region '{target_region}' AD '{current_ad}'."
+                    )
+                    add_log(
+                        f"  Image, subnet and shape were validated for '{target_region}', so this "
+                        f"is most likely **no free quota for '{account_config['shape']}' in this AD** "
+                        f"(OCI reports that as a 404) — or Oracle has not fully rolled the shape out "
+                        f"to this AD yet. Waiting rather than exiting."
+                    )
+                    add_log(
+                        f"  If it never clears: the API key's user may lack 'manage instance-family' "
+                        f"/ 'manage volume-family', or the region may have no free quota at all."
+                    )
                     if len(ad_list) > 1:
                         ad_index += 1
-                        add_log(f"Trying next AD...")
-                        continue
-                    break
+                        next_ad = ad_list[ad_index % len(ad_list)]
+                        add_log(
+                            f"Switching to AD '{next_ad}' — Always-Free quota is distributed per AD, "
+                            f"so another AD may have capacity."
+                        )
+                    else:
+                        add_log(
+                            f"Only one availability domain in '{target_region}'. Waiting for quota to "
+                            f"free up or for Oracle to roll out '{account_config['shape']}' here. Stop "
+                            f"anytime; raise MAX_ATTEMPTS to keep hunting longer."
+                        )
+                    # Fall through to the wait below and retry — never exit here.
                 else:
                     add_log(f"OCI API error: {e.message}")
                     if len(ad_list) > 1:
@@ -2268,11 +2479,6 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                 else:
                     add_log(f"Automation engine failure: {msg}")
                     break
-
-            actual_delay = retry_delay
-            if randomize_delay:
-                actual_delay = random.randint(random_min, random_max)
-                add_log(f"Dynamic retry: waiting {actual_delay}s (randomized {random_min}-{random_max}s)")
 
             if stop_event.wait(actual_delay):
                 add_log("Provisioning loop stopped while waiting.")
