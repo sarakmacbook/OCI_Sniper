@@ -103,6 +103,24 @@ Panel **5. Boot volume manager** manages the disks behind existing instances wit
 
 Every mutating action runs as one background job (like the provisioning loop): the request returns immediately, progress streams into **Live output** and the Telegram live log when enabled, and a replace result can be sent as a Telegram alert. Only one boot-disk job runs at a time; the panel shows its state, offers a **Stop running boot disk job** button that aborts it at the next state poll without issuing further OCI changes, and re-scans the inventory automatically when the job ends.
 
+## Demo mode (try the UI without credentials)
+
+```bash
+DEMO_MODE=1 APP_PASSWORD='' PORT=8000 gunicorn -c gunicorn.conf.py app:app
+```
+
+Open `http://localhost:8000` and the form arrives prefilled with fake credentials. Everything the
+loop guard does can be exercised in a minute: scan images → pick a subnet → **Start** (the demo cloud
+is `OutOfHostCapacity` for two attempts, then succeeds) → start again from a second tab with a
+different OCI key while it hunts and watch the refusal appear in the live log, header badge and
+response → **Stop** and read the `Provisioning loop exited (stopped by user).` line.
+
+Demo mode is honest about its limits: every log line is prefixed `[demo]`, a banner is shown in the
+UI, `/healthz` reports `"demo_mode": true`, read-only panels (images, subnets, quota, boot volume
+inventory, firewall scan) return the in-memory state, and write panels that are not simulated
+(firewall changes, boot-volume jobs) fail with `501 Demo mode: … is not simulated` instead of
+pretending to have changed a real account. Without `DEMO_MODE`, `demo_sdk.py` is never imported.
+
 ## Run on a small VPS
 
 ```bash
@@ -130,6 +148,9 @@ For a systemd or reverse-proxy setup, point the proxy at `127.0.0.1:5000`. The a
 | `USAGE_CACHE_SECONDS` | `20` | Short in-memory cache for the quota screen. Set to `0` to disable. No private key is cached. |
 | `MAX_CONTENT_LENGTH` | `65536` | Maximum JSON request body in bytes. |
 | `LOG_LEVEL` | `info` | Gunicorn log level. |
+| `DEMO_MODE` | `false` | Serve the UI against an in-memory OCI double (`demo_sdk.py`): no credentials, no Oracle Cloud calls, no instance created, every log line prefixed `[demo]`. For previews and screenshots only — never enable in production. |
+| `ALLOW_IFRAME_PREVIEW` | `false` | Drop the `X-Frame-Options: DENY` header so the UI can run inside a hosted preview iframe. Off by default: production keeps `DENY`. |
+| `DEMO_CAPACITY_AFTER_ATTEMPTS` | `3` | Demo mode only: attempt number that finally succeeds; earlier attempts fail with `OutOfHostCapacity`. |
 
 The provisioning loop is intentionally in memory. A Railway restart, redeploy, or VPS process restart stops it; start it again from the UI.
 With the 24/7 keep-alive enabled (see below), the host no longer pauses the service, so a running loop keeps going around the clock. This avoids a database/queue dependency and keeps the service lightweight.
@@ -142,6 +163,7 @@ With the 24/7 keep-alive enabled (see below), the host no longer pauses the serv
 - Free-tier storage, Micro, and Ampere A1 usage checks
 - Boot volume manager: create empty or backup-restored boot volumes, attach, detach, re-attach, replace and delete boot disks, plus instance stop/start — all as one logged background job with rollback on a failed replace
 - Bounded retry loop with fixed or randomized delays and availability-domain rotation
+- Optional demo mode (`DEMO_MODE=1`) that runs the whole UI against an in-memory OCI double for previews and screenshots
 - Single-loop guarantee: one provisioning loop per service, refused start requests logged live (UI + Telegram) with the OCI key/region that already holds the slot, and an exit line with a reason for every stop
 - Launch pre-flight check: before the first attempt the loop resolves the image, subnet and ADs against the configured region, so a truly fatal config (e.g. an image/subnet OCID copied from a different region) is reported with an exact cause instead of silently burning attempts on an ambiguous OCI `404 NotAuthorizedOrNotFound`
 - Shape-availability gate: if Oracle has not yet offered the selected shape in the region, the loop logs it live and **waits** — re-checking each attempt and launching automatically the moment the shape appears — instead of exiting or hammering a guaranteed 404

@@ -5,6 +5,7 @@ import importlib
 import os
 import random
 import re
+import sys
 import threading
 import time
 import urllib.parse
@@ -69,10 +70,23 @@ except (TypeError, ValueError):
     _max_content_length = 64 * 1024
 app.config['MAX_CONTENT_LENGTH'] = max(4096, min(_max_content_length, 1024 * 1024))
 
+# ---- Optional demo mode ------------------------------------------------------
+# DEMO_MODE swaps the OCI SDK for demo_sdk's in-memory double so the UI can be
+# clicked through (Arena preview, screenshots, trying the loop guard) without
+# credentials and without touching Oracle Cloud. Never enable it in production.
+DEMO_MODE = os.environ.get('DEMO_MODE', '').strip().lower() in ('1', 'true', 'yes', 'on')
+# ALLOW_IFRAME_PREVIEW drops X-Frame-Options so the app can run inside a hosted
+# preview iframe (Arena). Off by default: production keeps DENY.
+ALLOW_IFRAME_PREVIEW = os.environ.get(
+    'ALLOW_IFRAME_PREVIEW', ''
+).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
 # ---- Security headers ----
 @app.after_request
 def add_security_headers(response):
-    response.headers['X-Frame-Options'] = 'DENY'
+    if not ALLOW_IFRAME_PREVIEW:
+        response.headers['X-Frame-Options'] = 'DENY'
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-XSS-Protection'] = '1; mode=block'
     response.headers['Referrer-Policy'] = 'no-referrer'
@@ -144,6 +158,8 @@ tg_live_min_interval = 3  # seconds between live log sends
 
 def add_log(message):
     global global_log_base
+    if DEMO_MODE:
+        message = f"[demo] {message}"
     timestamp = format_phnom_penh_time()
     line = f"[{timestamp}] {message}"
     print(line)
@@ -1522,13 +1538,17 @@ def boot_volume_stop():
 @app.route('/healthz')
 def healthz():
     """Cheap unauthenticated health check for Railway, Docker and systemd."""
-    return jsonify({'status': 'ok', 'keepalive': keepalive_public_status()})
+    return jsonify({
+        'status': 'ok',
+        'demo_mode': DEMO_MODE,
+        'keepalive': keepalive_public_status(),
+    })
 
 
 @app.route('/')
 def home():
     try:
-        return render_template('index.html')
+        return render_template('index.html', demo_mode=DEMO_MODE)
     except Exception as e:
         return f"Flask Template Error: {str(e)}", 500
 
@@ -2988,6 +3008,15 @@ def send_telegram():
         data.get('bot_token'), data.get('chat_id'), data.get('message', '')
     )
     return jsonify({'success': ok, 'error': err})
+
+
+# Demo mode replaces the OCI SDK binding *after* all definitions above, so both
+# ``python app.py`` and ``gunicorn app:app`` run entirely against the in-memory
+# double. Without DEMO_MODE this module is never imported.
+if DEMO_MODE:
+    import demo_sdk
+
+    demo_sdk.install(sys.modules[__name__])
 
 
 if __name__ == '__main__':
