@@ -328,9 +328,12 @@
             </div>
             <div style="display:flex;align-items:center;gap:8px;">
                 <button onclick="clearAll()" style="padding:5px 12px;border:1px solid var(--border);border-radius:20px;background:var(--surface-raised);color:var(--text-muted);font-size:11px;font-weight:500;cursor:pointer;transition:all 0.15s;" onmouseover="this.style.color='var(--danger)';this.style.borderColor='rgba(239,68,68,0.3)'" onmouseout="this.style.color='var(--text-muted)';this.style.borderColor='var(--border)'">Clear all</button>
-                <div id="statusBadge" class="status-badge stopped">
-                    <span id="statusDot" class="status-dot"></span>
-                    <span id="statusText">Stopped</span>
+                <div style="text-align:right;">
+                    <div id="statusBadge" class="status-badge stopped">
+                        <span id="statusDot" class="status-dot"></span>
+                        <span id="statusText">Stopped</span>
+                    </div>
+                    <div id="statusMeta" style="display:none;margin-top:5px;font-size:10px;color:var(--text-muted);line-height:1.4;max-width:320px;"></div>
                 </div>
             </div>
         </div>
@@ -896,12 +899,13 @@
         // log buffer again on the next poll.
     }
 
-    function updateStatus(running) {
+    function updateStatus(running, loop) {
         isRunning = running;
         const badge = document.getElementById('statusBadge');
         const dot = document.getElementById('statusDot');
         const text = document.getElementById('statusText');
         const startBtn = document.getElementById('startBtn');
+        const meta = document.getElementById('statusMeta');
 
         if (running) {
             badge.className = 'status-badge running';
@@ -909,12 +913,36 @@
             text.textContent = 'Running';
             startBtn.disabled = true;
             startBtn.style.opacity = '0.5';
+            if (meta) {
+                // Name the loop that actually owns the single slot, so a second
+                // browser with another OCI key can see why starting is refused.
+                const bits = [];
+                if (loop) {
+                    if (loop.run_id) bits.push('run #' + loop.run_id);
+                    if (loop.shape) bits.push(loop.shape);
+                    if (loop.region) bits.push(loop.region);
+                    if (loop.fingerprint) bits.push('key ' + loop.fingerprint);
+                    if (loop.attempts) bits.push('attempt ' + loop.attempts);
+                    if (loop.current_ad) bits.push('AD ' + loop.current_ad);
+                    if (loop.started_at_local) bits.push('since ' + loop.started_at_local);
+                }
+                meta.textContent = bits.length ? bits.join(' · ') : '';
+                meta.style.display = bits.length ? 'block' : 'none';
+            }
         } else {
             badge.className = 'status-badge stopped';
             dot.className = 'status-dot';
             text.textContent = 'Stopped';
             startBtn.disabled = false;
             startBtn.style.opacity = '1';
+            if (meta) {
+                if (loop && loop.stop_reason) {
+                    meta.textContent = 'Last loop run #' + (loop.run_id || '-') + ' exited: ' + loop.stop_reason;
+                    meta.style.display = 'block';
+                } else {
+                    meta.style.display = 'none';
+                }
+            }
         }
     }
 
@@ -1657,11 +1685,13 @@
             const data = await res.json();
 
             if (data.success) {
-                updateStatus(true);
+                updateStatus(true, data.loop);
                 addLog('Provisioning loop started', 'success');
                 startPolling();
             } else {
                 addLog('Failed: ' + data.error, 'error');
+                if (data.loop) updateStatus(data.loop.running, data.loop);
+                if (data.running) startPolling();
             }
         } catch (err) {
             addLog('Request error: ' + err.message, 'error');
@@ -1673,8 +1703,14 @@
             const res = await fetch('/api/stop-loop', { method: 'POST' });
             const data = await res.json();
             addLog(data.message, 'warn');
-            updateStatus(false);
-            stopPolling();
+            if (data.running) {
+                // The loop is still finishing its current attempt: keep showing
+                // "Running" until the live log confirms the exit.
+                startPolling();
+            } else {
+                updateStatus(false, data.loop);
+                stopPolling();
+            }
         } catch (err) {
             addLog('Stop error: ' + err.message, 'error');
         }
@@ -1703,7 +1739,7 @@
             const res = await fetch('/api/status');
             const data = await res.json();
             if (data.success) {
-                updateStatus(data.running);
+                updateStatus(data.running, data.loop);
                 renderKeepalive(data.keepalive);
                 renderBvJob(data.boot_volume_job);
                 if (data.running && !pollInterval) startPolling();

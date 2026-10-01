@@ -11,6 +11,8 @@ A small Flask web UI for launching OCI Always Free instances with optional Teleg
 
 The container uses one worker and two threads. This is deliberate: the provisioning loop is process-local, and multiple workers would create separate status/log stores and could make the UI misleading. The OCI SDK is imported only when an OCI API operation is first used.
 
+There is **exactly one provisioning-loop slot per service**. A second start request is refused while a loop is running in the background — even when it arrives from another browser with a *different* OCI key, region or shape — and the refusal is written to the live log so the reason is visible in the UI terminal and on Telegram. See [One loop at a time](#one-loop-at-a-time).
+
 ## Staying awake 24/7 (Railway sleeping)
 
 Railway's **Serverless** feature (formerly *App Sleeping*) pauses a service when it stops
@@ -47,6 +49,45 @@ Notes and honest limits:
   (up to 100000) for long unattended hunts.
 - Ping targets are redacted of query strings in logs/status responses so private
   ping-token URLs (e.g. healthchecks.io style UUIDs) are not quoted in full.
+
+## One loop at a time
+
+The provisioning loop runs in one background thread with one owner: the service.
+Every start request has to reserve that single slot before any OCI client is
+created, and the slot is released only when the loop actually exits (success,
+retry limit, stop request, or a fatal setup/pre-flight error).
+
+What that means in practice:
+
+- Starting a second loop while one is running is refused, no matter what the
+  request carries. A different OCI key, tenancy, region or shape does not open a
+  second loop — OCI keys are not loop owners, the service is.
+- Each refusal is answered with the loop that already owns the slot
+  (`run #2: shape VM.Standard.A1.Flex · region ap-kulai-1 · key aa:bb`) **and**
+  written to the live log, so the UI terminal and the Telegram live log both say
+  what is running and why nothing new started.
+- A refused request cannot change the running loop's settings. (Before, a second
+  start with "live log" unticked silently switched off the running loop's
+  Telegram live log.)
+- **Stop** is confirmed in the live log twice: `Stop requested for run #N …`
+  when the button is pressed, then `Provisioning loop exited (stopped by user).`
+  once the in-flight OCI call returns and the thread leaves the loop. The exit
+  line still reaches Telegram; the live log is switched off right after it.
+- Every exit is recorded with a reason (`success — instance created on attempt 3`,
+  `stopped by user`, `retry limit reached (100 attempts)`, `pre-flight check failed`,
+  …) and is visible in `/api/status` under `loop.stop_reason`.
+- Each run gets a fresh stop event and a run id. A slow/stale thread can never
+  clear the state of a newer run, and a Stop click can only ever affect the loop
+  that is running now.
+- `/api/status` reports the loop that owns the slot — `run_id`, `shape`,
+  `region`, `fingerprint`, `attempts`, `current_ad`, `started_at_local`,
+  `finished_at_local`, `stop_reason` — never the private key. The header badge in
+  the UI shows the same summary while a loop is hunting.
+
+This is still process-local: running more than one Gunicorn worker or more than
+one replica means more than one loop slot. Keep the deployment at one worker
+(the shipped `gunicorn.conf.py` and Docker command do) unless process state is
+moved to a shared store.
 
 ## Boot volume manager
 
@@ -101,6 +142,7 @@ With the 24/7 keep-alive enabled (see below), the host no longer pauses the serv
 - Free-tier storage, Micro, and Ampere A1 usage checks
 - Boot volume manager: create empty or backup-restored boot volumes, attach, detach, re-attach, replace and delete boot disks, plus instance stop/start — all as one logged background job with rollback on a failed replace
 - Bounded retry loop with fixed or randomized delays and availability-domain rotation
+- Single-loop guarantee: one provisioning loop per service, refused start requests logged live (UI + Telegram) with the OCI key/region that already holds the slot, and an exit line with a reason for every stop
 - Launch pre-flight check: before the first attempt the loop resolves the image, subnet and ADs against the configured region, so a truly fatal config (e.g. an image/subnet OCID copied from a different region) is reported with an exact cause instead of silently burning attempts on an ambiguous OCI `404 NotAuthorizedOrNotFound`
 - Shape-availability gate: if Oracle has not yet offered the selected shape in the region, the loop logs it live and **waits** — re-checking each attempt and launching automatically the moment the shape appears — instead of exiting or hammering a guaranteed 404
 - Telegram attempt updates with attempt number, OCI email, region/AD, and safe key fingerprint (never the private key)
@@ -119,10 +161,10 @@ With the 24/7 keep-alive enabled (see below), the host no longer pauses the serv
 | `/api/list-subnets` | POST | List available subnets |
 | `/api/free-tier-status` | POST | Check quota usage |
 | `/api/test-launch` | POST | Validate launch inputs without creating an instance |
-| `/api/auto-launch-loop` | POST | Start the bounded provisioning loop |
-| `/api/stop-loop` | POST | Stop the loop |
+| `/api/auto-launch-loop` | POST | Start the bounded provisioning loop; refused (with a live-log line) while another loop owns the single slot |
+| `/api/stop-loop` | POST | Ask the one running loop to exit; logs `Stop requested …` and returns `running` so the UI can wait for the exit line |
 | `/api/logs` | GET | Fetch bounded live logs |
-| `/api/status` | GET | Check loop status |
+| `/api/status` | GET | Check loop status; `loop` carries run id, shape, region, key fingerprint, attempts, AD and exit reason |
 | `/api/keepalive` | GET/POST | Inspect or toggle the 24/7 keep-alive pinger |
 | `/api/boot-volumes/list` | POST | Inventory instances, boot volumes, backups and availability domains with attachment state and storage totals |
 | `/api/boot-volumes/action` | POST | Queue a boot disk job: `create` (empty or from `backup_id`), `detach`, `attach` (also re-attach), `delete`, `instance-action` (start/stop) or `replace` |
