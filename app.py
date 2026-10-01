@@ -2612,13 +2612,10 @@ def run_automated_creation(config, account_config, compute_client, network_clien
         shape_confirmed = shape_available is not False
         if shape_available is False:
             add_log(
-                f"No shape availability: '{account_config['shape']}' is not offered in "
-                f"region '{target_region}' yet (ADs: {', '.join(ad_list)})."
-            )
-            add_log(
-                f"Waiting for Oracle Cloud to add '{account_config['shape']}' to this region — "
-                f"re-checking every attempt and launching as soon as it appears. "
-                f"Stop the loop anytime to cancel."
+                f"WARNING: No shape availability — Currently, shape '{account_config['shape']}' "
+                f"is not available in your Oracle Cloud region '{target_region}' "
+                f"(ADs: {', '.join(ad_list)}). Please wait for Oracle Cloud to offer it there; "
+                f"the loop will re-check and launch as soon as it appears."
             )
 
         # Never leave a daemon thread retrying forever. This is especially
@@ -2660,7 +2657,7 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                         add_log(
                             f"Attempt {attempts}: no shape availability — "
                             f"'{account_config['shape']}' still not offered in '{current_ad}'. "
-                            f"Waiting for Oracle Cloud to add it..."
+                            f"Waiting for Oracle Cloud to offer it in your region..."
                         )
                     if len(ad_list) > 1:
                         ad_index += 1

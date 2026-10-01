@@ -429,8 +429,13 @@ class LoopPreflightIntegrationTests(PreflightTestBase):
         )
         self.assertEqual(self.compute.launch_calls, [])  # never launched a 404
         logs = self.log_text()
-        self.assertIn('No shape availability', logs)
-        self.assertIn('Waiting for Oracle Cloud to add', logs)
+        self.assertIn('WARNING: No shape availability', logs)
+        self.assertIn(
+            "Currently, shape 'VM.Standard.E2.1.Micro' is not available in your Oracle Cloud region",
+            logs,
+        )
+        self.assertIn('Please wait for Oracle Cloud to offer it there', logs)
+        self.assertIn('Waiting for Oracle Cloud to offer it in your region', logs)
         self.assertIn('still not offered', logs)
         self.assertIn('Retry limit reached (4 attempts)', logs)
         self.assertNotIn('sending instance launch request', logs)
