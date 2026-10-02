@@ -146,7 +146,7 @@ For a systemd or reverse-proxy setup, point the proxy at `127.0.0.1:5000`. The a
 | --- | ---: | --- |
 | `APP_PASSWORD` | empty | Basic Auth password. Set this in production. |
 | `PORT` | `5000` | Supplied by Railway or used locally. |
-| `MAX_ATTEMPTS` | `100` | Hard cap for one provisioning loop; bounded to 1–100000. The high ceiling supports genuine 24/7 hunting (~69 days at a 60s delay); the default stays conservative. |
+| `MAX_ATTEMPTS` | `100` | Hard ceiling for one provisioning loop; bounded to 1–100000. The high ceiling supports genuine 24/7 hunting (~69 days at a 60s delay); the default stays conservative. Per-loop you can set **Max attempts** to any value from 1 up to `MAX_ATTEMPTS`, or flip the **Unlimited** toggle to hunt until success or a stop — never auto-exiting on a retry limit. |
 | `KEEPALIVE_ENABLED` | `true` | Send periodic outbound pings so Railway's Serverless/App-Sleeping never pauses the service. Set `false` to disable. |
 | `KEEPALIVE_URLS` | auto | Comma-separated http(s) URLs to ping. Auto-defaults to this app's own `https://$RAILWAY_PUBLIC_DOMAIN/healthz`, so on Railway it usually needs nothing. |
 | `KEEPALIVE_INTERVAL_SECONDS` | `240` | Seconds between pings; bounded to 30–295 so it always beats Railway's ≥5-minute idle window. |
@@ -191,7 +191,7 @@ With the 24/7 keep-alive enabled (see below), the host no longer pauses the serv
 | `/api/list-subnets` | POST | List available subnets |
 | `/api/free-tier-status` | POST | Check quota usage |
 | `/api/test-launch` | POST | Validate launch inputs without creating an instance |
-| `/api/auto-launch-loop` | POST | Start the bounded provisioning loop; refused (with a live-log line) while another loop owns the single slot |
+| `/api/auto-launch-loop` | POST | Start the bounded provisioning loop; refused (with a live-log line) while another loop owns the single slot. Accepts `max_attempts` (1–`MAX_ATTEMPTS`) and `unlimited_attempts` (true to hunt until success or stop); omitted → `MAX_ATTEMPTS` |
 | `/api/stop-loop` | POST | Ask the one running loop to exit; logs `Stop requested …` and returns `running` so the UI can wait for the exit line |
 | `/api/logs` | GET | Fetch bounded live logs |
 | `/api/status` | GET | Check loop status; `loop` carries run id, shape, region, key fingerprint, attempts, AD and exit reason |
