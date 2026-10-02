@@ -538,28 +538,28 @@
                 <div class="grid-2">
                     <div class="form-group">
                         <label class="form-label">Retry delay (s)</label>
-                        <input type="number" id="retryDelay" class="form-input" value="60" min="10" max="3600" onchange="validateDelay()">
+                        <input type="number" id="retryDelay" class="form-input" value="60" min="10" max="3600" onchange="validateDelay()" disabled style="opacity:0.4;">
                         <div id="delayWarning" class="warning-text">Delays under 30s risk rate limiting</div>
                     </div>
                     <div class="form-group">
                         <label class="form-label">Mode</label>
                         <div class="toggle-group">
-                            <button id="modeFixed" class="toggle-btn active" onclick="setDelayMode('fixed')">Fixed</button>
-                            <button id="modeRandom" class="toggle-btn" onclick="setDelayMode('random')">Random 25-60s</button>
+                            <button id="modeFixed" class="toggle-btn" onclick="setDelayMode('fixed')">Fixed</button>
+                            <button id="modeRandom" class="toggle-btn active" onclick="setDelayMode('random')">Random 25-60s</button>
                         </div>
                     </div>
                 </div>
                 <div class="grid-2">
                     <div class="form-group">
                         <label class="form-label">Max attempts</label>
-                        <input type="number" id="maxAttempts" class="form-input" value="100" min="1" max="100000" onchange="validateAttempts()">
+                        <input type="number" id="maxAttempts" class="form-input" value="100" min="1" max="100000" onchange="validateAttempts()" disabled style="opacity:0.4;">
                         <div id="attemptsWarning" class="warning-text" style="display:none;">1–100000, or enable Unlimited below</div>
                     </div>
                     <div class="form-group">
                         <label class="form-label">Attempt limit</label>
                         <div class="toggle-group">
-                            <button id="limitBounded" class="toggle-btn active" onclick="setAttemptLimit('bounded')">Bounded</button>
-                            <button id="limitUnlimited" class="toggle-btn" onclick="setAttemptLimit('unlimited')">Unlimited</button>
+                            <button id="limitBounded" class="toggle-btn" onclick="setAttemptLimit('bounded')">Bounded</button>
+                            <button id="limitUnlimited" class="toggle-btn active" onclick="setAttemptLimit('unlimited')">Unlimited</button>
                         </div>
                     </div>
                 </div>
@@ -760,8 +760,8 @@
     <script>
     const DEMO = document.body.getAttribute('data-demo') === '1';
     let isRunning = false;
-    let delayMode = 'fixed';
-    let attemptLimit = 'bounded';
+    let delayMode = 'random';
+    let attemptLimit = 'unlimited';
     let logOffset = 0;
     let pollInterval = null;
     let statusInterval = null;
@@ -2069,6 +2069,8 @@
         document.getElementById('bvResult').style.display = 'none';
         document.getElementById('bvDeleteOld').checked = false;
 
+        setDelayMode('random');
+        setAttemptLimit('unlimited');
         clearLogs();
         addLog('All fields cleared', 'success');
     }
