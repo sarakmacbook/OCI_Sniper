@@ -2575,8 +2575,27 @@ def run_automated_creation(config, account_config, compute_client, network_clien
         attempts = 0
         success = False
         ad_index = 0
-        max_attempts = max(1, min(int(max_attempts), 100000))
-        add_log(f"Retry limit: {max_attempts} attempts")
+
+        # Resolve the attempt cap. MAX_ATTEMPTS is the hard ceiling; the caller
+        # may ask for fewer attempts, or for an *unbounded* hunt that runs until
+        # success or a user stop. Unlimited is signalled by the request flag
+        # ``unlimited_attempts`` (true), a non-positive ``max_attempts`` (0/-1),
+        # or the literal string "unlimited".
+        unlimited_attempts = False
+        try:
+            _ma = int(max_attempts)
+        except (TypeError, ValueError):
+            _ma = MAX_ATTEMPTS
+        if _ma <= 0 or str(max_attempts).strip().lower() == 'unlimited':
+            unlimited_attempts = True
+            # Keep a real ceiling for the counter; the loop ignores it below.
+            max_attempts = 100000
+        else:
+            max_attempts = max(1, min(_ma, 100000))
+        if unlimited_attempts:
+            add_log("Retry limit: unlimited (runs until success or stopped)")
+        else:
+            add_log(f"Retry limit: {max_attempts} attempts")
 
         # Shuffle AD list for random order (speeds up finding capacity)
         import random as _random
@@ -2620,7 +2639,7 @@ def run_automated_creation(config, account_config, compute_client, network_clien
 
         # Never leave a daemon thread retrying forever. This is especially
         # important on Railway/VPS instances with limited CPU and memory.
-        while attempts < max_attempts:
+        while unlimited_attempts or attempts < max_attempts:
             attempts += 1
 
             if stop_evt.is_set():
@@ -2791,9 +2810,9 @@ def run_automated_creation(config, account_config, compute_client, network_clien
         if not success:
             if stop_evt.is_set():
                 exit_reason = 'stopped by user'
-            elif attempts >= max_attempts:
+            elif not unlimited_attempts and attempts >= max_attempts:
                 exit_reason = f'retry limit reached ({max_attempts} attempts)'
-            if attempts >= max_attempts and not stop_evt.is_set():
+            if not unlimited_attempts and attempts >= max_attempts and not stop_evt.is_set():
                 add_log(f"Retry limit reached ({max_attempts} attempts).")
             add_log("Provisioning loop ended without success.")
             if telegram_bot_token and telegram_chat_id:
@@ -2982,22 +3001,42 @@ def auto_launch():
         except (TypeError, ValueError):
             random_max = max(random_min, 60)
 
+        # Resolve the per-loop attempt cap. MAX_ATTEMPTS stays the hard ceiling,
+        # but a request may ask for fewer attempts or for an unbounded hunt by
+        # sending ``unlimited_attempts: true`` or a non-positive ``max_attempts``
+        # (0 / -1). The UI exposes both a numeric field (1..MAX_ATTEMPTS) and an
+        # "Unlimited" toggle.
+        unlimited_attempts = bool(data.get('unlimited_attempts', False))
+        raw_max = data.get('max_attempts', MAX_ATTEMPTS)
+        try:
+            effective_max = int(raw_max) if raw_max not in (None, '') else MAX_ATTEMPTS
+        except (TypeError, ValueError):
+            effective_max = MAX_ATTEMPTS
+        if unlimited_attempts or effective_max <= 0:
+            unlimited_attempts = True
+            effective_max = 0  # sentinel: run until success or a user stop
+
         thread = threading.Thread(
             target=run_automated_creation,
             args=(config, data, compute_client, network_client, identity_client,
                   retry_delay, randomize_delay, random_min, random_max,
                   bot_token or None, chat_id or None,
-                  MAX_ATTEMPTS),
+                  effective_max),
             kwargs={'run_id': run_id, 'stop_evt': run_stop_event},
             daemon=True
         )
         thread.start()
 
+        # Surface the chosen cap in /api/status so the UI badge can show it.
+        automation_info['max_attempts'] = None if unlimited_attempts else effective_max
+        automation_info['unlimited_attempts'] = unlimited_attempts
+
+        attempts_label = 'unlimited' if unlimited_attempts else str(effective_max)
         add_log(
             f"Provisioning loop started — {_loop_ref(automation_snapshot())} · "
             f"retry {retry_delay}s"
             + (f" (random {random_min}-{random_max}s)" if randomize_delay else "")
-            + f" · max {MAX_ATTEMPTS} attempts · Telegram live log "
+            + f" · max {attempts_label} attempts · Telegram live log "
             + ("on" if tg_live_enabled else "off")
             + ". Only this one loop can run until it exits."
         )

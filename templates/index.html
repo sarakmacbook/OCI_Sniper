@@ -549,6 +549,20 @@
                         </div>
                     </div>
                 </div>
+                <div class="grid-2">
+                    <div class="form-group">
+                        <label class="form-label">Max attempts</label>
+                        <input type="number" id="maxAttempts" class="form-input" value="100" min="1" max="100000" onchange="validateAttempts()">
+                        <div id="attemptsWarning" class="warning-text" style="display:none;">1–100000, or enable Unlimited below</div>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Attempt limit</label>
+                        <div class="toggle-group">
+                            <button id="limitBounded" class="toggle-btn active" onclick="setAttemptLimit('bounded')">Bounded</button>
+                            <button id="limitUnlimited" class="toggle-btn" onclick="setAttemptLimit('unlimited')">Unlimited</button>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -747,6 +761,7 @@
     const DEMO = document.body.getAttribute('data-demo') === '1';
     let isRunning = false;
     let delayMode = 'fixed';
+    let attemptLimit = 'bounded';
     let logOffset = 0;
     let pollInterval = null;
     let statusInterval = null;
@@ -785,6 +800,8 @@
 
         document.getElementById('vmName').value = 'AlwaysFree-Bot';
         document.getElementById('retryDelay').value = '10';
+        document.getElementById('maxAttempts').value = '100';
+        setAttemptLimit('bounded');
         addLog('DEMO MODE ready — fake credentials are prefilled, nothing to type.', 'success');
         addLog('Try it: (1) Scan OS images, (2) pick a subnet, (3) Start provisioning loop.', 'warn');
         addLog('The demo cloud is out of capacity for 2 attempts, then succeeds — watch the retries in this terminal.', 'warn');
@@ -1025,6 +1042,26 @@
         input.style.opacity = mode === 'random' ? '0.4' : '1';
     }
 
+    function validateAttempts() {
+        const input = document.getElementById('maxAttempts');
+        const val = parseInt(input.value);
+        const ok = !attemptLimit || attemptLimit === 'bounded'
+            ? (val >= 1 && val <= 100000)
+            : true;
+        document.getElementById('attemptsWarning').style.display = ok ? 'none' : 'block';
+        if (attemptLimit === 'bounded' && (val < 1 || isNaN(val))) input.value = 100;
+    }
+
+    function setAttemptLimit(mode) {
+        attemptLimit = mode;
+        document.getElementById('limitBounded').classList.toggle('active', mode === 'bounded');
+        document.getElementById('limitUnlimited').classList.toggle('active', mode === 'unlimited');
+        const input = document.getElementById('maxAttempts');
+        input.disabled = mode === 'unlimited';
+        input.style.opacity = mode === 'unlimited' ? '0.4' : '1';
+        validateAttempts();
+    }
+
     function addLog(msg, type) {
         const now = new Date().toLocaleTimeString();
         const term = document.getElementById('terminalBody');
@@ -1075,6 +1112,8 @@
                     if (loop.region) bits.push(loop.region);
                     if (loop.fingerprint) bits.push('key ' + loop.fingerprint);
                     if (loop.attempts) bits.push('attempt ' + loop.attempts);
+                    if (loop.unlimited_attempts) bits.push('max unlimited');
+                    else if (loop.max_attempts) bits.push('max ' + loop.max_attempts);
                     if (loop.current_ad) bits.push('AD ' + loop.current_ad);
                     if (loop.started_at_local) bits.push('since ' + loop.started_at_local);
                 }
@@ -1852,7 +1891,9 @@
             retry_delay: parseInt(document.getElementById('retryDelay').value) || 60,
             randomize_delay: delayMode === 'random',
             random_min: 25,
-            random_max: 60
+            random_max: 60,
+            max_attempts: parseInt(document.getElementById('maxAttempts').value) || 100,
+            unlimited_attempts: attemptLimit === 'unlimited'
         };
 
         try {
